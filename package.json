@@ -1,0 +1,15 @@
+{
+  "name": "chatgpt-local-codex-tunnel",
+  "version": "1.1.0",
+  "description": "Run local Codex from ChatGPT through OpenAI Secure MCP Tunnel.",
+  "private": true,
+  "type": "module",
+  "license": "MIT",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "test": "node --test adapter.test.mjs selection.test.mjs scripts/render-profile.test.mjs bin/local-codex-secure.test.mjs",
+    "check": "node --check adapter.mjs && node --check bin/local-codex-secure.mjs && node --check scripts/render-profile.mjs && zsh -n bin/local-codex-tunnel && zsh -n scripts/install.sh"
+  }
+}

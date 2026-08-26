@@ -1,0 +1,68 @@
+#!/bin/zsh
+set -euo pipefail
+
+readonly USER_HOME="${HOME}"
+readonly CONFIG_FILE="${LOCAL_CODEX_CONFIG_FILE:-${USER_HOME}/Library/Application Support/local-codex-tunnel/config.env}"
+
+if [[ ! -r "${CONFIG_FILE}" ]]; then
+  print -u2 "Local Codex configuration is missing: ${CONFIG_FILE}"
+  print -u2 "Run scripts/install.sh first."
+  exit 1
+fi
+
+source "${CONFIG_FILE}"
+
+: "${LOCAL_CODEX_ROOT:?LOCAL_CODEX_ROOT is missing from ${CONFIG_FILE}}"
+: "${LOCAL_CODEX_TOKEN_FILE:?LOCAL_CODEX_TOKEN_FILE is missing from ${CONFIG_FILE}}"
+: "${LOCAL_CODEX_STATE_FILE:?LOCAL_CODEX_STATE_FILE is missing from ${CONFIG_FILE}}"
+: "${LOCAL_CODEX_ADAPTER:?LOCAL_CODEX_ADAPTER is missing from ${CONFIG_FILE}}"
+: "${TUNNEL_CLIENT_PROFILE:?TUNNEL_CLIENT_PROFILE is missing from ${CONFIG_FILE}}"
+
+readonly ADAPTER_URL="http://${LOCAL_CODEX_HOST:-127.0.0.1}:${LOCAL_CODEX_PORT:-8765}"
+
+if [[ ! -x "${LOCAL_CODEX_ADAPTER}" ]]; then
+  print -u2 "Local Codex adapter is not installed: ${LOCAL_CODEX_ADAPTER}"
+  exit 1
+fi
+if [[ ! -r "${LOCAL_CODEX_TOKEN_FILE}" ]]; then
+  print -u2 "Local Codex adapter token is missing: ${LOCAL_CODEX_TOKEN_FILE}"
+  exit 1
+fi
+if ! command -v tunnel-client >/dev/null 2>&1; then
+  print -u2 "tunnel-client is not available on PATH"
+  exit 1
+fi
+
+LOCAL_CODEX_ROOT="${LOCAL_CODEX_ROOT}" \
+LOCAL_CODEX_TOKEN_FILE="${LOCAL_CODEX_TOKEN_FILE}" \
+LOCAL_CODEX_STATE_FILE="${LOCAL_CODEX_STATE_FILE}" \
+LOCAL_CODEX_LOG_FILE="${LOCAL_CODEX_LOG_FILE:-${USER_HOME}/Library/Application Support/tunnel-client/logs/local-codex.log}" \
+LOCAL_CODEX_HOST="${LOCAL_CODEX_HOST:-127.0.0.1}" \
+LOCAL_CODEX_PORT="${LOCAL_CODEX_PORT:-8765}" \
+LOCAL_CODEX_BIN="${LOCAL_CODEX_BIN:-codex}" \
+"${LOCAL_CODEX_ADAPTER}" &
+adapter_pid=$!
+
+cleanup() {
+  kill "${adapter_pid}" 2>/dev/null || true
+  wait "${adapter_pid}" 2>/dev/null || true
+}
+trap cleanup EXIT INT TERM HUP
+
+for _ in {1..50}; do
+  if /usr/bin/curl -fsS "${ADAPTER_URL}/readyz" >/dev/null 2>&1; then
+    break
+  fi
+  if ! kill -0 "${adapter_pid}" 2>/dev/null; then
+    print -u2 "Local Codex adapter stopped during startup"
+    exit 1
+  fi
+  sleep 0.1
+done
+
+if ! /usr/bin/curl -fsS "${ADAPTER_URL}/readyz" >/dev/null; then
+  print -u2 "Local Codex adapter did not become ready"
+  exit 1
+fi
+
+tunnel-client run --profile "${TUNNEL_CLIENT_PROFILE}"
