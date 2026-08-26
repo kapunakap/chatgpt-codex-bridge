@@ -78,6 +78,31 @@ Official setup references:
 - [Codex app server](https://learn.chatgpt.com/docs/app-server)
 - [Codex permissions](https://learn.chatgpt.com/docs/permissions)
 
+## Provision the OpenAI tunnel
+
+Do this once before installing the local bridge:
+
+1. In the target OpenAI Platform organization, make sure you have **Tunnels Read + Manage** to create or edit a tunnel. Running `tunnel-client` and selecting the tunnel while creating the ChatGPT app require **Tunnels Read + Use**. ChatGPT developer mode is a separate workspace permission.
+2. Open [OpenAI Platform → Tunnels](https://platform.openai.com/settings/organization/tunnels), create a tunnel, and copy its `tunnel_...` ID.
+3. Associate the tunnel with both:
+   - the Platform organization that owns or manages it; and
+   - the ChatGPT workspace where you will create the **Local Codex** app.
+4. Create or use a runtime API key for a principal with **Tunnels Read + Use**. Store the key in a local file outside the repository and restrict the file to your user, for example:
+
+   ```bash
+   chmod 600 /absolute/path/to/runtime-api-key
+   ```
+
+5. Keep the tunnel ID and runtime-key file path handy for the installer below.
+
+The end-to-end sequence is:
+
+```text
+Create tunnel → associate ChatGPT workspace → create runtime key → install → start → connect in ChatGPT
+```
+
+If the tunnel does not appear when you create the ChatGPT app, first check the ChatGPT workspace association and that the app creator has **Tunnels Read + Use**. `tunnel-client` only needs outbound HTTPS to OpenAI; this project does not require a public inbound port.
+
 ## Install
 
 Clone the repository, then run:
