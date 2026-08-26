@@ -1,10 +1,8 @@
 # ChatGPT Local Codex Tunnel
 
-Run Codex on your Mac from ChatGPT through OpenAI Secure MCP Tunnel:
+![ChatGPT.com → OpenAI Secure MCP Tunnel → Your laptop or server running Codex CLI](docs/chatgpt-local-codex-tunnel.svg)
 
-```text
-ChatGPT → custom app → Secure MCP Tunnel → local adapter → codex app-server
-```
+Run Codex on your Mac from ChatGPT through OpenAI Secure MCP Tunnel.
 
 This is an unofficial local bridge. It keeps the MCP backend private and opens only outbound HTTPS through OpenAI's official `tunnel-client`.
 
