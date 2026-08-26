@@ -91,6 +91,7 @@ test("Luna/max is explicit; real responses confirm it; logs contain only metadat
   const response = await h.call({});
   assert.equal(response.isError, undefined);
   assert.equal(response.structuredContent.content, "MOCK_OUTPUT_SECRET");
+  assert.equal(response.structuredContent.networkAccess, false);
   const trace = await h.trace();
   const start = trace.find(x => x.method === "thread/start").params;
   const turn = trace.find(x => x.method === "turn/start").params;
@@ -100,6 +101,7 @@ test("Luna/max is explicit; real responses confirm it; logs contain only metadat
   assert.equal(start.approvalPolicy, "never");
   assert.equal(turn.model, "gpt-5.6-luna");
   assert.equal(turn.effort, "max");
+  assert.equal(turn.permissions, "local-codex-tunnel");
   assert.equal(trace.filter(x => x.method === "model/list").length, 2);
   const logs = await h.logs();
   assert.deepEqual(logs[0], { existing: "tunnel-line" });
@@ -153,6 +155,25 @@ test("reply overrides persist through app-server and adapter restarts", async t 
   assert.equal(turn.effort, "low");
 });
 
+test("network opt-in and reply inheritance persist through adapter restarts", async t => {
+  const h = await setup(t);
+  const first = await h.call({ networkAccess: true });
+  assert.equal(first.structuredContent.networkAccess, true);
+  const threadId = first.structuredContent.threadId;
+  await h.stop(); await h.start();
+  const inherited = await h.call({ threadId }, "codex-reply");
+  assert.equal(inherited.structuredContent.networkAccess, true);
+  const overridden = await h.call({ threadId, networkAccess: false }, "codex-reply");
+  assert.equal(overridden.structuredContent.networkAccess, false);
+  await h.stop(); await h.start();
+  const inheritedDisabled = await h.call({ threadId }, "codex-reply");
+  assert.equal(inheritedDisabled.structuredContent.networkAccess, false);
+  const trace = await h.trace();
+  for (const request of trace.filter(x => ["thread/start", "thread/resume", "turn/start"].includes(x.method))) {
+    assert.equal(request.params.permissions, "local-codex-tunnel");
+  }
+});
+
 test("legacy threadIds-only state preserves existing Sol/high threads", async t => {
   const h = await setup(t);
   await h.stop();
@@ -163,6 +184,8 @@ test("legacy threadIds-only state preserves existing Sol/high threads", async t 
   const turn = (await h.trace()).find(x => x.method === "turn/start").params;
   assert.equal(turn.model, "gpt-5.6-sol");
   assert.equal(turn.effort, "high");
+  const state = JSON.parse(await readFile(h.stateFile, "utf8"));
+  assert.equal(state.threadNetworkAccess["legacy-thread"], false);
 });
 
 test("unsupported or malformed selections never start a turn or leak supplied strings", async t => {

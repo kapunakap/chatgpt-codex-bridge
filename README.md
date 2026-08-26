@@ -10,8 +10,8 @@ This is an unofficial local bridge. It keeps the MCP backend private and opens o
 
 ## What it exposes
 
-- `codex(requestId, cwd, prompt, model?, reasoningEffort?)` starts a background job in any existing folder.
-- `codex-reply(requestId, threadId, prompt, model?, reasoningEffort?)` starts a background reply on an adapter-owned thread.
+- `codex(requestId, cwd, prompt, networkAccess?, model?, reasoningEffort?)` starts a background job in any existing folder.
+- `codex-reply(requestId, threadId, prompt, networkAccess?, model?, reasoningEffort?)` starts a background reply on an adapter-owned thread.
 - `codex-status(jobId, waitMs?)` reads progress and the saved result. Use `waitMs: 20000` while running.
 - `codex-cancel(jobId)` explicitly stops work. It does not undo file changes.
 - `codex-folders(path?, cursor?)` lists up to 100 child directory names per page. It defaults to your home directory and never reads file contents.
@@ -21,6 +21,8 @@ ChatGPT chooses an existing absolute `cwd` for each new thread, with **no direct
 Replies always use their thread's saved folder and cannot accept a different `cwd`. Start a new thread to change folders. If a saved folder disappears or resolves elsewhere, replies fail without widening access. The caller cannot change the sandbox or permission level.
 
 New jobs default to **gpt-5.6-luna / max**. Optional model IDs or aliases (`luna`, `terra`, `sol`) and reasoning levels are checked against Codex's model catalog. Unsupported combinations fail without fallback. Replies inherit the thread's last settings unless overridden.
+
+Command network access is also thread-scoped. New threads default to **disabled**. ChatGPT chooses the setting from the task: requests that inherently need outbound access—such as `git fetch`, `git clone`, installing dependencies, `curl`, API calls, or downloads—should automatically opt in even when the user does not mention network access. Fully local work stays disabled. Replies inherit the thread's last setting when omitted, and an explicit reply value persists for later replies. The adapter uses Codex's native permission profile and does not proxy individual commands.
 
 ### Background job flow (v2)
 
@@ -41,7 +43,7 @@ Job metadata and final results are saved atomically under `LOCAL_CODEX_JOBS_DIR`
 - Each Codex job receives system read access and write access only to its chosen canonical folder. On macOS, other user folders, mounted volumes, and temporary trees are denied unless they are inside the chosen folder.
 - The macOS profile deliberately avoids Codex 0.147's `:minimal` preset, which grants unconditional system-temp writes. Tools that need writable scratch space must use the chosen folder.
 - The authenticated folder lookup tool can list directory names elsewhere; it does not grant the running job access to those folders.
-- Commands run without network access.
+- Commands run without network access by default. `networkAccess: true` enables broad direct command network access without a domain allowlist. A network-enabled job can send readable workspace or system data to external services, so enable it only for tasks and folders you trust.
 - Thread replies are accepted only for thread IDs created by this adapter.
 - No inbound public port is required.
 
@@ -112,15 +114,33 @@ Test it with:
 Use Local Codex's codex-folders tool to find the relevant project folder. Call codex with its absolute cwd, requestId: smoke-001, and prompt: Reply with exactly TEST_OK. Then poll codex-status for the returned jobId using waitMs: 20000 until it completes. Do not submit the prompt again with a new requestId.
 ```
 
+Normal network-dependent prompts do not need permission boilerplate. For example:
+
+```text
+Use Local Codex in /path/to/project to fetch PR #123 and run its tests.
+
+Use Local Codex in /private/tmp/local-codex-intent-e2e to curl https://github.com and report the first HTTP status line. Do not modify files.
+```
+
+Purely local prompts keep command networking disabled:
+
+```text
+Use Local Codex in /path/to/project to run the tests from the current checkout without fetching or installing anything.
+```
+
 After upgrading from v1, refresh Local Codex's tool definitions in ChatGPT (or reconnect the app if needed). v2 requires `requestId` and changes submission responses from final answers to job handles. A cached v1 call without `requestId` is rejected without starting work.
 
 v3 additionally requires `cwd` for `codex` and adds `codex-folders`. Refresh tools after upgrading from v2; cached submissions without `cwd` are rejected with a clear error. Existing jobs and threads are migrated to their original folder using the old `LOCAL_CODEX_ROOT`. Their results and request fingerprints are preserved. The migration source is saved once in thread state, so later configuration changes cannot retarget old threads. `LOCAL_CODEX_ROOT` (and the installer's optional `--root`) is only a legacy migration input, not a default or limit for new jobs. Keep it set until legacy records have been migrated; fresh installations do not need it.
+
+v3.1 adds optional `networkAccess` to `codex` and `codex-reply`. Existing callers remain network-disabled, legacy threads migrate with network disabled, and saved request fingerprints remain valid when the field was omitted. Refresh Local Codex's tools and start a fresh conversation before using the new option.
+
+v3.1.1 clarifies the MCP contract so ChatGPT chooses `networkAccess` from the user's task intent. Runtime defaults and sandbox behavior are unchanged. Refresh Local Codex's tools and use a fresh conversation so ChatGPT receives the new descriptions.
 
 ### If ChatGPT reports missing `requestId` or `cwd`
 
 Missing required submission fields return `schema_outdated`, the adapter version, and its `schemaFingerprint`. No job is started. In ChatGPT, open **Local Codex → Manage → Refresh**, then use a **fresh conversation**. Existing conversations can retain older tool definitions even when the connection's settings show the new schema. Do not work around this by dropping required fields, inventing a working directory, or retrying with new IDs.
 
-The adapter's `/readyz` response includes the same fingerprint. Safe `schema_served` and `call_rejected` log events identify which schema was served and why a request was rejected, without logging caller IDs, prompts, or argument values. The static plugin description/version in ChatGPT is separate from the live tool schema; inspect its **Actions → Input schema** to verify `requestId` and `cwd`.
+The adapter's `/readyz` response includes the same fingerprint. Safe `schema_served` and `call_rejected` log events identify which schema was served and why a request was rejected, without logging caller IDs, prompts, or argument values. The static plugin description/version in ChatGPT is separate from the live tool schema; inspect its **Actions → Input schema** to verify `requestId`, `cwd`, and `networkAccess`.
 
 Treat a successful no-file-changes job submitted and polled from ChatGPT as the end-to-end check. A healthy local endpoint alone does not prove that ChatGPT has the updated tools.
 
@@ -164,7 +184,7 @@ npm run check
 LOCAL_CODEX_NATIVE_TEST=1 npm test
 ```
 
-Tests use a fake Codex process, temporary state, and loopback HTTP. They cover per-job folders, directory pagination, symlinks, legacy migration, replies after restart, retries, busy handling, cancellation, timeout, model settings, permissions, and private logging. They do not require OpenAI or GitHub credentials.
+Tests use a fake Codex process, temporary state, and loopback HTTP. They cover per-job folders, directory pagination, symlinks, legacy migration, replies after restart, retries, busy handling, cancellation, timeout, model and network settings, permissions, and private logging. They do not require OpenAI or GitHub credentials.
 
 ## License
 

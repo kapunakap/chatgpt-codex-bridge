@@ -6,6 +6,7 @@ import { homedir, tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { join } from "node:path";
 import { once } from "node:events";
+import { createServer } from "node:net";
 import test from "node:test";
 
 const repo = fileURLToPath(new URL(".", import.meta.url));
@@ -94,12 +95,36 @@ test("discovery, authentication, schemas, and validation", async t => {
   assert.equal(discover.error.code, -32601);
   const initialized = await f.rpc({ jsonrpc: "2.0", id: "i", method: "initialize", params: { protocolVersion: "2025-11-25" } });
   assert.equal(initialized.result.protocolVersion, "2025-11-25");
-  assert.equal(initialized.result.serverInfo.version, "3.0.1");
+  assert.equal(initialized.result.serverInfo.version, "3.1.1");
   const listed = await f.rpc({ jsonrpc: "2.0", id: "l", method: "tools/list" });
   assert.deepEqual(listed.result.tools.map(t => t.name), ["codex", "codex-reply", "codex-status", "codex-cancel", "codex-folders"]);
   assert.deepEqual(listed.result.tools[0].inputSchema.required, ["requestId", "cwd", "prompt"]);
+  const codex = listed.result.tools[0];
+  const reply = listed.result.tools[1];
+  assert.equal(codex.inputSchema.properties.networkAccess.type, "boolean");
+  assert.equal(codex.inputSchema.properties.networkAccess.default, false);
+  for (const text of [codex.description, codex.inputSchema.properties.networkAccess.description]) {
+    assert.match(text, /task intent/i);
+    assert.match(text, /even if.*(?:did not|never).*network access/i);
+    assert.match(text, /git fetch.*git pull.*git clone.*(?:dependencies|package).*curl.*HTTP\/API.*downloads/i);
+    assert.match(text, /(?:omit|false).*fully local/i);
+  }
+  assert.equal(reply.inputSchema.properties.networkAccess.type, "boolean");
+  assert.equal(reply.inputSchema.properties.networkAccess.default, undefined);
+  for (const text of [reply.description, reply.inputSchema.properties.networkAccess.description]) {
+    assert.match(text, /omit.*inherit/i);
+    assert.match(text, /enabled.*stays enabled.*disabled.*stays disabled/i);
+    assert.match(text, /set true.*newly requires outbound/i);
+    assert.match(text, /even if.*(?:implies it|never mentions network access)/i);
+    assert.match(text, /set false.*disabled again/i);
+  }
+  assert.equal(listed.result.tools[0].annotations.openWorldHint, true);
+  assert.equal(listed.result.tools[1].annotations.openWorldHint, true);
   assert.equal((await f.call("codex", { prompt: "hello" })).errorCode, "schema_outdated");
   assert.equal((await f.call("codex", { requestId: "r", prompt: "hello", permissions: "all" })).errorCode, "invalid_request");
+  for (const networkAccess of [null, 1, "true", {}]) {
+    assert.equal((await f.call("codex", { requestId: `network-${JSON.stringify(networkAccess)}`, prompt: "hello", networkAccess })).errorCode, "invalid_request");
+  }
   const missing = await f.call("codex", { requestId: "r", prompt: "hello", cwd: undefined });
   assert.equal(missing.errorCode, "schema_outdated"); assert.match(missing.message, /cwd/);
   assert.equal((await f.call("codex-reply", { requestId: "r", threadId: "unknown", prompt: "hello" })).errorCode, "unknown_thread");
@@ -124,16 +149,19 @@ test("durable immediate acceptance, duplicate retries, busy, and final answer", 
   const result = await f.finished(jobId);
   assert.equal(result.content, "FINAL_OK"); assert.equal(result.status, "completed");
   assert.equal(result.model, "gpt-5.6-luna"); assert.equal(result.reasoningEffort, "max");
+  assert.equal(result.networkAccess, false);
   assert.equal((await f.call("codex", args)).jobId, jobId);
   const records = await f.records();
   assert.equal(records.filter(r => r.method === "turn/start").length, 1);
   const start = records.find(r => r.method === "thread/start");
   assert.equal(start.params.permissions, "local-codex-tunnel");
   assert.equal(start.params.approvalPolicy, "never"); assert.equal(start.params.cwd, f.root);
+  assert.equal(records.find(r => r.method === "turn/start").params.permissions, "local-codex-tunnel");
   const argv = records.find(r => r.event === "spawn").args.join(" ");
   assert.match(argv, /network=\{enabled=false\}/);
   const state = JSON.parse(await readFile(join(f.root, "threads.json"), "utf8"));
   assert.ok(state.threadIds.includes(result.threadId));
+  assert.equal(state.schemaVersion, 4); assert.equal(state.threadNetworkAccess[result.threadId], false);
   const jobFile = join(f.root, "jobs", `${jobId}.json`);
   assert.equal((await stat(jobFile)).mode & 0o777, 0o600);
   assert.equal((await stat(join(f.root, "jobs"))).mode & 0o777, 0o700);
@@ -190,6 +218,38 @@ test("defaults, overrides, resumed settings, unsupported settings, and safe logs
   assert.equal(failed.status, "failed"); assert.ok(!JSON.stringify(failed).includes("UPSTREAM_SECRET"));
   const audit = await readFile(join(f.root, "audit.log"), "utf8");
   for (const secret of ["test-secret", "UPSTREAM_SECRET", "upstream-error-secret", "PRIVATE_REASONING", "FINAL_OK"]) assert.ok(!audit.includes(secret));
+});
+
+test("network access is opt-in; replies inherit and persist explicit overrides", async t => {
+  const f = await fixture(t);
+  const defaultArgs = { requestId: "network-default", prompt: "hello" };
+  const disabled = await f.finished((await f.call("codex", defaultArgs)).jobId);
+  assert.equal(disabled.networkAccess, false);
+  assert.equal((await f.call("codex", defaultArgs)).jobId, disabled.jobId);
+  assert.equal((await f.call("codex", { ...defaultArgs, networkAccess: false })).errorCode, "request_conflict");
+
+  const enabled = await f.finished((await f.call("codex", { requestId: "network-enabled", prompt: "hello", networkAccess: true })).jobId);
+  assert.equal(enabled.networkAccess, true);
+  await f.stop(); await f.start();
+  const inherited = await f.finished((await f.call("codex-reply", { requestId: "network-inherited", threadId: enabled.threadId, prompt: "hello" })).jobId);
+  assert.equal(inherited.networkAccess, true);
+  const overridden = await f.finished((await f.call("codex-reply", { requestId: "network-disabled-reply", threadId: enabled.threadId, prompt: "hello", networkAccess: false })).jobId);
+  assert.equal(overridden.networkAccess, false);
+  await f.stop(); await f.start();
+  const inheritedDisabled = await f.finished((await f.call("codex-reply", { requestId: "network-inherited-disabled", threadId: enabled.threadId, prompt: "hello" })).jobId);
+  assert.equal(inheritedDisabled.networkAccess, false);
+
+  const calls = await f.records();
+  const configs = calls.filter(r => r.event === "spawn").map(r => r.args[r.args.indexOf("-c") + 1]);
+  assert.deepEqual(configs.map(config => /network=\{enabled=true\}/.test(config)), [false, true, true, false, false]);
+  for (const request of calls.filter(r => ["thread/start", "thread/resume", "turn/start"].includes(r.method))) {
+    assert.equal(request.params.permissions, "local-codex-tunnel");
+  }
+  const state = JSON.parse(await readFile(join(f.root, "threads.json"), "utf8"));
+  assert.equal(state.threadNetworkAccess[disabled.threadId], false);
+  assert.equal(state.threadNetworkAccess[enabled.threadId], false);
+  const audit = await readFile(join(f.root, "audit.log"), "utf8");
+  assert.match(audit, /"networkAccess":true/); assert.match(audit, /"networkAccess":false/);
 });
 
 test("status cancellation and disconnect do not cancel accepted work", async t => {
@@ -350,7 +410,8 @@ test("legacy migration pins old folders and preserves fingerprints and results",
   assert.deepEqual(migrated, { ...oldJob, cwd: f.root });
   assert.equal((await f.call("codex", args)).jobId, done.jobId);
   const state = JSON.parse(await readFile(join(f.root, "threads.json"), "utf8"));
-  assert.equal(state.threadCwds[done.threadId], f.root); assert.equal(state.retainedMetadata, "keep");
+  assert.equal(state.threadCwds[done.threadId], f.root); assert.equal(state.threadNetworkAccess[done.threadId], false);
+  assert.equal(state.schemaVersion, 4); assert.equal(state.retainedMetadata, "keep");
   assert.equal((await stat(join(f.root, "threads.json"))).mode & 0o777, 0o600);
   await f.stop(); f.env.LOCAL_CODEX_ROOT = "/missing-old-config-root"; await f.start();
   const reply = await f.finished((await f.call("codex-reply", { requestId: "legacy-reply", threadId: done.threadId, prompt: "hello" })).jobId);
@@ -376,6 +437,30 @@ test("native macOS sandbox blocks sibling and symlink writes, including system t
     await assert.rejects(stat(join(other, "outside")), { code: "ENOENT" });
     await assert.rejects(stat(join(other, "escaped")), { code: "ENOENT" });
   }
+});
+
+test("native macOS sandbox enforces the command network toggle", {
+  skip: process.platform !== "darwin" || process.env.LOCAL_CODEX_NATIVE_TEST !== "1",
+}, async t => {
+  const f = await fixture(t);
+  const disabled = await f.finished((await f.call("codex", { requestId: "native-network-off", prompt: "hello" })).jobId);
+  const enabled = await f.finished((await f.call("codex", { requestId: "native-network-on", prompt: "hello", networkAccess: true })).jobId);
+  const records = await f.records();
+  const configFor = job => {
+    const startIndex = records.findIndex(r => r.method === "thread/start" && r.params.cwd === job.cwd && r.params.developerInstructions.includes(job.networkAccess ? "enabled" : "disabled"));
+    const spawns = records.slice(0, startIndex + 1).filter(r => r.event === "spawn");
+    return spawns.at(-1).args[spawns.at(-1).args.indexOf("-c") + 1];
+  };
+  const listener = createServer(socket => socket.end("HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n"));
+  listener.listen(0, "127.0.0.1"); await once(listener, "listening");
+  t.after(() => listener.close());
+  const endpoint = `http://127.0.0.1:${listener.address().port}`;
+  const probe = config => new Promise(resolve => {
+    const child = spawn("codex", ["sandbox", "-P", "local-codex-tunnel", "-C", f.root, "-c", config, "--", "/usr/bin/curl", "--fail", "--silent", "--output", "/dev/null", endpoint], { stdio: "ignore" });
+    child.once("exit", code => resolve(code));
+  });
+  assert.notEqual(await probe(configFor(disabled)), 0);
+  assert.equal(await probe(configFor(enabled)), 0);
 });
 
 const fakeSource = String.raw`#!/usr/bin/env node

@@ -20,7 +20,7 @@ const STATE_FILE = process.env.LOCAL_CODEX_STATE_FILE ||
 const LOG_FILE = process.env.LOCAL_CODEX_LOG_FILE ||
   resolve(homedir(), "Library/Application Support/tunnel-client/logs/local-codex.log");
 const JOBS_DIR = process.env.LOCAL_CODEX_JOBS_DIR || resolve(dirname(STATE_FILE), "jobs");
-const VERSION = "3.0.1";
+const VERSION = "3.1.1";
 const DEFAULT_SETTINGS = { model: "gpt-5.6-luna", reasoningEffort: "max" };
 const MODEL_ALIASES = new Map([
   ["luna", "gpt-5.6-luna"], ["terra", "gpt-5.6-terra"], ["sol", "gpt-5.6-sol"],
@@ -37,7 +37,7 @@ const selectionProperties = {
 };
 const MAX_BODY = 1024 * 1024;
 const CALL_TIMEOUT_MS = Number(process.env.LOCAL_CODEX_CALL_TIMEOUT_MS || "1800000");
-function permissionConfig(cwd) {
+function permissionConfig(cwd, networkAccess) {
   // Codex 0.147's macOS :minimal preset includes unconditional temp writes.
   // Use system reads without that preset; keep other user/data/temp trees
   // denied. The more specific selected workspace reopens only its own tree.
@@ -49,7 +49,7 @@ function permissionConfig(cwd) {
       return !inside(path) && !inside(canonical);
     }).map(path => `${JSON.stringify(path)}="deny"`)].join(", ")
     : '":minimal"="read"';
-  return `permissions.local-codex-tunnel={description="Local Codex", workspace_roots={${JSON.stringify(cwd)}=true}, filesystem={${reads}, ":workspace_roots"={"."="write"}}, network={enabled=false}}`;
+  return `permissions.local-codex-tunnel={description="Local Codex", workspace_roots={${JSON.stringify(cwd)}=true}, filesystem={${reads}, ":workspace_roots"={"."="write"}}, network={enabled=${networkAccess}}}`;
 }
 
 if (!Number.isInteger(PORT) || PORT < 1 || PORT > 65535) {
@@ -70,6 +70,7 @@ if (!expectedAuthorization) {
 }
 
 const threadFolders = new Map();
+const threadNetworkAccess = new Map();
 let threadState = {};
 await mkdir(dirname(LOG_FILE), { recursive: true, mode: 0o700 });
 appendFileSync(LOG_FILE, "", { mode: 0o600 });
@@ -87,12 +88,20 @@ const requestIdProperty = {
   type: "string", minLength: 1, maxLength: 200,
   description: "Generate a unique ID for new work. Reuse this exact ID and arguments on retries; never retry with a new ID.",
 };
+const newThreadNetworkProperty = {
+  type: "boolean", default: false,
+  description: "Choose from the user's task intent. Set true whenever completing the request requires outbound command network access, even if the user did not explicitly ask for network access—for example git fetch, git pull, git clone, installing dependencies or packages, curl, HTTP/API access, or downloads. Omit or set false for fully local work. Defaults to false and does not change filesystem access.",
+};
+const replyNetworkProperty = {
+  type: "boolean",
+  description: "Choose from the current task and saved thread state. Omit to inherit: an enabled thread stays enabled and a disabled or legacy thread stays disabled. Set true when this reply newly requires outbound command network access, even if the user only implies it—for example git fetch, git pull, git clone, installing dependencies or packages, curl, HTTP/API access, or downloads. Set false when networking must be disabled again. This does not change filesystem access.",
+};
 
 const tools = [
   {
     name: "codex",
     title: "Local Codex",
-    description: "Start a background Codex job in cwd, any existing absolute folder you choose. No directory allowlist or per-folder approval. Use codex-folders to locate the narrowest folder relevant to the user's task. Writes stay inside its canonical path; command network disabled. Returns jobId immediately; poll codex-status with waitMs=20000, never resubmit to check progress. Default Luna/max. One active job, no queue.",
+    description: "Start a background Codex job in cwd, any existing absolute folder you choose. Choose networkAccess from the user's task intent, not only explicit wording: set true when completing the request requires outbound access such as git fetch, git pull, git clone, dependency or package installation, curl, HTTP/API access, or downloads, even if the user never mentions network access; omit or use false for fully local work. No directory allowlist or per-folder approval. Use codex-folders to locate the narrowest folder relevant to the user's task. Writes stay inside its canonical path. Returns jobId immediately; poll codex-status with waitMs=20000, never resubmit to check progress. Default Luna/max. One active job, no queue.",
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -100,6 +109,7 @@ const tools = [
         requestId: requestIdProperty,
         cwd: { type: "string", minLength: 1, maxLength: 4096, description: "Absolute path to an existing working folder. Symlinks resolve to their target; the returned canonical cwd is the write boundary." },
         prompt: { type: "string", minLength: 1, maxLength: 100000 },
+        networkAccess: newThreadNetworkProperty,
         ...selectionProperties,
       },
       required: ["requestId", "cwd", "prompt"],
@@ -109,13 +119,13 @@ const tools = [
       readOnlyHint: false,
       destructiveHint: true,
       idempotentHint: true,
-      openWorldHint: false,
+      openWorldHint: true,
     },
   },
   {
     name: "codex-reply",
     title: "Local Codex Reply",
-    description: "Start a background reply on an adapter-owned thread, using its saved folder. Folder changes are not allowed; use codex for a new folder. Returns jobId; poll codex-status with waitMs=20000. Omitted model/reasoningEffort retain thread settings; overrides persist. Reuse requestId on retries.",
+    description: "Start a background reply on an adapter-owned thread, using its saved folder. Omit networkAccess to inherit: enabled stays enabled and disabled stays disabled. Set true when this reply newly requires outbound access such as git fetch, git pull, git clone, dependency or package installation, curl, HTTP/API access, or downloads, even if the user never mentions network access; set false when networking must be disabled again. Folder changes are not allowed; use codex for a new folder. Returns jobId; poll codex-status with waitMs=20000. Omitted model/reasoningEffort retain thread settings; overrides persist. Reuse requestId on retries.",
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -123,6 +133,7 @@ const tools = [
         requestId: requestIdProperty,
         threadId: { type: "string", minLength: 1, maxLength: 200 },
         prompt: { type: "string", minLength: 1, maxLength: 100000 },
+        networkAccess: replyNetworkProperty,
         ...selectionProperties,
       },
       required: ["requestId", "threadId", "prompt"],
@@ -132,7 +143,7 @@ const tools = [
       readOnlyHint: false,
       destructiveHint: true,
       idempotentHint: true,
-      openWorldHint: false,
+      openWorldHint: true,
     },
   },
   {
@@ -215,7 +226,7 @@ const server = createServer(async (req, res) => {
 
 server.listen(PORT, HOST, async () => {
   try {
-    await loadThreadFolders();
+    await loadThreadState();
     await loadJobs();
     ready = true;
     process.stderr.write(`local-codex-adapter ready on http://${HOST}:${PORT}/mcp; scope=per_job\n`);
@@ -274,8 +285,8 @@ async function callTool(message, signal) {
       return toolResult(message.id, await listFolders(args));
     }
     if (name === "codex" || name === "codex-reply") {
-      validateArguments(args, name === "codex" ? ["requestId", "cwd", "prompt", "model", "reasoningEffort"]
-        : ["requestId", "threadId", "prompt", "model", "reasoningEffort"]);
+      validateArguments(args, name === "codex" ? ["requestId", "cwd", "prompt", "networkAccess", "model", "reasoningEffort"]
+        : ["requestId", "threadId", "prompt", "networkAccess", "model", "reasoningEffort"]);
       const missing = tools.find(tool => tool.name === name).inputSchema.required.filter(field => args[field] === undefined);
       if (missing.length) {
         throw callError("schema_outdated", `Local Codex ${VERSION} is missing required fields: ${missing.join(", ")}. In ChatGPT, open Local Codex > Manage > Refresh, then start a fresh chat. No job was started.`);
@@ -283,13 +294,21 @@ async function callTool(message, signal) {
       assertIdentifier(args.requestId, "requestId");
       assertPrompt(args.prompt);
       assertSelectionArguments(args);
+      if (args.networkAccess !== undefined && typeof args.networkAccess !== "boolean") {
+        throw callError("invalid_request", "networkAccess must be true or false when provided");
+      }
       if (name === "codex-reply" && !threadFolders.has(args.threadId)) {
         throw callError("unknown_thread", "threadId was not created by this Local Codex adapter");
       }
       const cwd = name === "codex" ? await canonicalDirectory(args.cwd, "cwd") : threadFolders.get(args.threadId);
+      const networkAccess = args.networkAccess ?? (name === "codex-reply" ? threadNetworkAccess.get(args.threadId) : false) ?? false;
       const key = digest(args.requestId);
-      const fingerprint = digest(JSON.stringify([cwd, name, args.prompt, args.threadId ?? null,
-        MODEL_ALIASES.get(args.model) || args.model || null, args.reasoningEffort ?? null]));
+      const fingerprintInput = [cwd, name, args.prompt, args.threadId ?? null,
+        MODEL_ALIASES.get(args.model) || args.model || null, args.reasoningEffort ?? null];
+      // Keep omitted-field fingerprints byte-for-byte compatible with pre-v3.1
+      // saved jobs. Explicit false is still a different request from omission.
+      if (args.networkAccess !== undefined) fingerprintInput.push(args.networkAccess);
+      const fingerprint = digest(JSON.stringify(fingerprintInput));
       const prior = requests.get(key);
       if (prior) {
         if (prior.fingerprint !== fingerprint) throw callError("request_conflict", "requestId already belongs to different arguments");
@@ -305,7 +324,7 @@ async function callTool(message, signal) {
       const job = {
         jobId: randomUUID(), requestKey: key, fingerprint, tool: name, cwd,
         status: "starting", threadId: args.threadId ?? null, turnId: null,
-        model: null, reasoningEffort: null, settingsStatus: "pending",
+        model: null, reasoningEffort: null, networkAccess, settingsStatus: "pending",
         startedAt: Date.now(), updatedAt: Date.now(),
       };
       // Synchronous durable acceptance is also the single-worker admission lock.
@@ -382,7 +401,7 @@ function cancelJob(job, reason) {
 function snapshot(job) {
   return {
     jobId: job.jobId, status: job.status, cwd: job.cwd, threadId: job.threadId, turnId: job.turnId,
-    model: job.model, reasoningEffort: job.reasoningEffort,
+    model: job.model, reasoningEffort: job.reasoningEffort, networkAccess: job.networkAccess ?? false,
     startedAt: job.startedAt, updatedAt: job.updatedAt,
     elapsedMs: (job.finishedAt ?? Date.now()) - job.startedAt,
     ...(job.finishedAt ? { finishedAt: job.finishedAt } : {}),
@@ -431,6 +450,8 @@ async function loadJobs() {
       writePrivateJson(resolve(JOBS_DIR, file), job); // Keep original fingerprint, answer, and timestamps.
     }
     if (typeof job.cwd !== "string" || !isAbsolute(job.cwd)) throw new Error("Invalid job folder");
+    if (job.networkAccess === undefined) job.networkAccess = false;
+    if (typeof job.networkAccess !== "boolean") throw new Error("Invalid job network setting");
     if (job.threadId && threadFolders.has(job.threadId) && threadFolders.get(job.threadId) !== job.cwd) {
       throw new Error("Job and thread folder mismatch");
     }
@@ -558,7 +579,7 @@ function validateArguments(args, keys) {
 function runCodex(args, existingThreadId, audit) {
   return new Promise((resolvePromise, rejectPromise) => {
     const cwd = audit.cwd;
-    const child = spawn(CODEX_BIN, ["app-server", "--listen", "stdio://", "-c", permissionConfig(cwd)], {
+    const child = spawn(CODEX_BIN, ["app-server", "--listen", "stdio://", "-c", permissionConfig(cwd, audit.networkAccess)], {
       cwd,
       detached: process.platform !== "win32",
       // Do not forward raw app-server stderr to the shared audit log.
@@ -630,10 +651,11 @@ function runCodex(args, existingThreadId, audit) {
         });
         send({ method: "initialized", params: {} });
         const models = await listModels();
-        // Existing Codex history, not the global config or an adapter settings cache,
-        // owns reply defaults. This also supports the original threadIds-only state.
+        // Existing Codex history owns model/reasoning reply defaults. The
+        // adapter separately pins command-network state because each app-server
+        // process receives a job-scoped permission profile definition.
         const prior = existingThreadId
-          ? await request("thread/resume", threadParams(cwd, existingThreadId))
+          ? await request("thread/resume", threadParams(cwd, audit.networkAccess, existingThreadId))
           : DEFAULT_SETTINGS;
         selected = selectSettings(args, prior, models);
         Object.assign(audit, selected, { settingsStatus: "requested" });
@@ -641,7 +663,7 @@ function runCodex(args, existingThreadId, audit) {
 
         const threadResponse = existingThreadId
           ? prior
-          : await request("thread/start", threadParams(cwd, null, selected));
+          : await request("thread/start", threadParams(cwd, audit.networkAccess, null, selected));
         if (threadResponse?.thread?.cwd && threadResponse.thread.cwd !== cwd) {
           throw callError("folder_mismatch", "Codex returned a different thread folder; no turn was started");
         }
@@ -649,7 +671,8 @@ function runCodex(args, existingThreadId, audit) {
         if (!threadId) throw new Error("Codex did not return a thread id");
         audit.threadId = threadId;
         threadFolders.set(threadId, cwd);
-        saveThreadFolders();
+        threadNetworkAccess.set(threadId, audit.networkAccess);
+        saveThreadState();
         persistJob(audit);
         if (!existingThreadId) confirmSettings(threadResponse.model, threadResponse.reasoningEffort);
         turnSubmitted = true;
@@ -662,7 +685,7 @@ function runCodex(args, existingThreadId, audit) {
         // A fresh rollout may not yet be flushed to disk and cannot be resumed
         // immediately. Its thread/start response already confirmed both fields.
         if (existingThreadId) {
-          const effective = await request("thread/resume", threadParams(cwd, threadId));
+          const effective = await request("thread/resume", threadParams(cwd, audit.networkAccess, threadId));
           confirmSettings(effective.model, effective.reasoningEffort);
         }
         turnConfirmed = true;
@@ -819,12 +842,12 @@ function runCodex(args, existingThreadId, audit) {
   });
 }
 
-function threadParams(cwd, threadId, settings) {
+function threadParams(cwd, networkAccess, threadId, settings) {
   const params = {
     cwd,
     approvalPolicy: "never",
     permissions: "local-codex-tunnel",
-    developerInstructions: `Operate only inside ${cwd}. Network access is disabled. Do not request broader access.`,
+    developerInstructions: `Operate only inside ${cwd}. Command network access is ${networkAccess ? "enabled" : "disabled"}. Do not request broader access.`,
   };
   if (threadId) params.threadId = threadId;
   if (settings) {
@@ -840,6 +863,7 @@ function turnParams(cwd, threadId, prompt, settings) {
     input: [{ type: "text", text: prompt }],
     cwd,
     approvalPolicy: "never",
+    permissions: "local-codex-tunnel",
     model: settings.model,
     effort: settings.reasoningEffort,
   };
@@ -940,6 +964,7 @@ function logCall(event, audit, errorCode) {
     jobId: audit.jobId, tool: audit.tool, status: audit.status,
     threadId: audit.threadId, turnId: audit.turnId,
     model: audit.model, reasoningEffort: audit.reasoningEffort,
+    networkAccess: audit.networkAccess ?? false,
     settingsStatus: audit.settingsStatus,
     durationMs: Date.now() - audit.startedAt,
     ...(errorCode ? { errorCode } : {}),
@@ -972,6 +997,7 @@ function resultSchema() {
       turnId: { type: ["string", "null"] },
       model: { type: ["string", "null"] },
       reasoningEffort: { type: ["string", "null"] },
+      networkAccess: { type: "boolean" },
       startedAt: { type: "number" },
       updatedAt: { type: "number" },
       finishedAt: { type: "number" },
@@ -986,28 +1012,32 @@ function resultSchema() {
   };
 }
 
-async function loadThreadFolders() {
+async function loadThreadState() {
   try {
     threadState = JSON.parse(await readFile(STATE_FILE, "utf8"));
   } catch (error) {
     if (error?.code !== "ENOENT") throw error;
     return;
   }
-  if (!Array.isArray(threadState.threadIds) || (threadState.schemaVersion ?? 1) > 3) throw new Error("Invalid thread state");
+  if (!Array.isArray(threadState.threadIds) || (threadState.schemaVersion ?? 1) > 4) throw new Error("Invalid thread state");
   let migrated = false;
   for (const id of threadState.threadIds) {
     if (typeof id !== "string" || !id) throw new Error("Invalid thread id");
     const saved = threadState.threadCwds?.[id];
     const cwd = saved ?? await legacyCwd();
     if (typeof cwd !== "string" || !isAbsolute(cwd)) throw new Error("Invalid thread folder");
+    const networkAccess = threadState.threadNetworkAccess?.[id] ?? false;
+    if (typeof networkAccess !== "boolean") throw new Error("Invalid thread network setting");
     threadFolders.set(id, cwd);
-    if (saved === undefined) migrated = true;
+    threadNetworkAccess.set(id, networkAccess);
+    if (saved === undefined || threadState.threadNetworkAccess?.[id] === undefined) migrated = true;
   }
-  if (migrated) saveThreadFolders();
+  if (migrated) saveThreadState();
 }
 
-function saveThreadFolders() {
-  threadState = { ...threadState, schemaVersion: 3, threadIds: [...threadFolders.keys()], threadCwds: Object.fromEntries(threadFolders) };
+function saveThreadState() {
+  threadState = { ...threadState, schemaVersion: 4, threadIds: [...threadFolders.keys()],
+    threadCwds: Object.fromEntries(threadFolders), threadNetworkAccess: Object.fromEntries(threadNetworkAccess) };
   writePrivateJson(STATE_FILE, threadState);
 }
 
