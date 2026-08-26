@@ -1,11 +1,17 @@
 # ChatGPT Local Codex Tunnel
-
+## Overview
 ![ChatGPT.com → OpenAI Secure MCP Tunnel → Your laptop or server running Codex CLI](docs/chatgpt-local-codex-tunnel.svg)
-
 Run Codex on your Mac from ChatGPT through OpenAI Secure MCP Tunnel.
 
 This is an unofficial local bridge. It keeps the MCP backend private and opens only outbound HTTPS through OpenAI's official `tunnel-client`.
 
+## ChatGPT side
+<img width="603" height="630" alt="Screenshot 2026-08-27 at 12 48 51 AM" src="https://github.com/user-attachments/assets/4c05b31e-9207-41fc-9fb2-3966ff4b60e3" />
+
+## Local side
+<img width="876" height="186" alt="Screenshot 2026-08-27 at 1 05 59 AM" src="https://github.com/user-attachments/assets/57e65d51-061e-42b3-a5b5-c352958d5074" />
+
+(not the same request as on ChatGPT side)
 ## Watch it working
 
 Want to see ChatGPT reaching your Mac? In another terminal, follow the shared tunnel/adapter log:
