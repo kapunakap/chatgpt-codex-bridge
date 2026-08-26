@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -10,23 +10,33 @@ const repoRoot = fileURLToPath(new URL("..", import.meta.url));
 const wrapper = join(repoRoot, "bin/local-codex-secure.mjs");
 const fixture = join(repoRoot, "test/fixtures/record-codex-env.mjs");
 
-test("secure wrapper replaces permissions and strips ambient credentials", async t => {
+function permissionConfig(cwd, networkAccess) {
+  const denied = ["/Users", "/System/Volumes/Data/Users", "/Volumes", "/private/tmp", "/tmp", "/private/var/tmp", "/var/tmp", "/private/var/folders", "/var/folders"];
+  const inside = path => cwd === "/" || path === cwd || path.startsWith(`${cwd}/`);
+  const reads = process.platform === "darwin"
+    ? ['":root"="read"', ...denied.filter(path => {
+      const canonical = path.replace(/^\/System\/Volumes\/Data(?=\/)/, "").replace(/^\/tmp$/, "/private/tmp").replace(/^\/var(?=\/)/, "/private/var");
+      return !inside(path) && !inside(canonical);
+    }).map(path => `${JSON.stringify(path)}="deny"`)].join(", ")
+    : '":minimal"="read"';
+  const workspace = ['"."="write"', '".git"="write"', '".codex"="read"', '".env"="deny"', '".env.*"="deny"',
+    '"**/.env"="deny"', '"**/.env.*"="deny"', '"*.env"="deny"', '"**/*.env"="deny"',
+    '".npmrc"="deny"', '"**/.npmrc"="deny"', '".pypirc"="deny"', '"**/.pypirc"="deny"'].join(", ");
+  return `permissions.local-codex-tunnel={description="Local Codex", workspace_roots={${JSON.stringify(cwd)}=true}, filesystem={${reads}, ":workspace_roots"={${workspace}}}, network={enabled=${networkAccess}}}`;
+}
+
+async function runWrapper(t, configs, extraArgs = [], cwd = repoRoot) {
   const root = await mkdtemp(join(tmpdir(), "local-codex-secure-"));
   const recordFile = join(root, "record.json");
   t.after(() => rm(root, { recursive: true, force: true }));
-
-  const originalPermission = `permissions.local-codex-tunnel={description="old",workspace_roots={${JSON.stringify(root)}=true},filesystem={":workspace_roots"={"."="write"}},network={enabled=false}}`;
-  const child = spawn(process.execPath, [
-    wrapper,
-    "app-server", "--listen", "stdio://",
-    "-c", originalPermission,
-    "--test-record-file", recordFile,
-  ], {
-    cwd: repoRoot,
+  const args = [wrapper, "app-server", "--listen", "stdio://"];
+  for (const config of configs) args.push("-c", config);
+  args.push(...extraArgs, "--test-record-file", recordFile);
+  const child = spawn(process.execPath, args, {
+    cwd,
     stdio: "ignore",
     env: {
       ...process.env,
-      LOCAL_CODEX_ROOT: root,
       LOCAL_CODEX_REAL_BIN: fixture,
       OPENAI_API_KEY: "SHOULD_NOT_PASS",
       DATABASE_URL: "postgres://user:password@example.invalid/db",
@@ -39,28 +49,53 @@ test("secure wrapper replaces permissions and strips ambient credentials", async
     child.once("error", reject);
     child.once("exit", resolve);
   });
-  assert.equal(exitCode, 0);
+  let record;
+  try { record = JSON.parse(await readFile(recordFile, "utf8")); }
+  catch (error) { if (error.code !== "ENOENT") throw error; }
+  return { exitCode, record };
+}
 
-  const record = JSON.parse(await readFile(recordFile, "utf8"));
-  const configs = record.args
-    .map((value, index) => record.args[index - 1] === "-c" ? value : null)
-    .filter(Boolean);
-  const permission = configs.find(value => value.startsWith("permissions.local-codex-tunnel="));
-  assert.ok(permission);
-  assert.match(permission, /extends=":workspace"/);
-  assert.match(permission, /"\.env"="deny"/);
-  assert.match(permission, /"\*\*\/\.env\.\*"="deny"/);
-  assert.match(permission, /"\.npmrc"="deny"/);
-  assert.match(permission, /network=\{enabled=false\}/);
-  assert.equal(configs.includes('shell_environment_policy.inherit="core"'), true);
-  assert.equal(configs.includes("shell_environment_policy.ignore_default_excludes=false"), true);
-  assert.ok(configs.some(value => value.startsWith("shell_environment_policy.filters=")));
+for (const networkAccess of [false, true]) {
+  test(`secure wrapper preserves dynamic network=${networkAccess} profile and strips ambient credentials`, async t => {
+    const workspace = await realpath(await mkdtemp(join(tmpdir(), "local-codex-profile-")));
+    t.after(() => rm(workspace, { recursive: true, force: true }));
+    const permission = permissionConfig(workspace, networkAccess);
+    const result = await runWrapper(t, [permission], [], workspace);
+    assert.equal(result.exitCode, 0);
+    const configs = result.record.args
+      .map((value, index) => result.record.args[index - 1] === "-c" ? value : null)
+      .filter(Boolean);
+    assert.equal(configs.filter(value => value.startsWith("permissions.local-codex-tunnel=")).length, 1);
+    assert.equal(configs.find(value => value.startsWith("permissions.local-codex-tunnel=")), permission);
+    assert.match(permission, new RegExp(`network=\\{enabled=${networkAccess}\\}`));
+    assert.equal(configs.includes('shell_environment_policy.inherit="core"'), true);
+    assert.equal(configs.includes("shell_environment_policy.ignore_default_excludes=false"), true);
+    assert.ok(configs.some(value => value.startsWith("shell_environment_policy.filters=")));
 
-  assert.equal(record.env.pathPresent, true);
-  assert.equal(record.env.homePresent, true);
-  assert.equal(record.env.openaiApiKeyPresent, false);
-  assert.equal(record.env.databaseUrlPresent, false);
-  assert.equal(record.env.localTokenFilePresent, false);
-  assert.equal(record.env.runtimeApiKeyPresent, false);
-  assert.equal(record.env.passwordPresent, false);
+    assert.equal(result.record.env.pathPresent, true);
+    assert.equal(result.record.env.homePresent, true);
+    assert.equal(result.record.env.openaiApiKeyPresent, false);
+    assert.equal(result.record.env.databaseUrlPresent, false);
+    assert.equal(result.record.env.localTokenFilePresent, false);
+    assert.equal(result.record.env.runtimeApiKeyPresent, false);
+    assert.equal(result.record.env.passwordPresent, false);
+  });
+}
+
+test("secure wrapper fails closed on missing, duplicate, malformed, or unsafe permission profiles", async t => {
+  const workspace = await realpath(await mkdtemp(join(tmpdir(), "local-codex-invalid-profile-")));
+  t.after(() => rm(workspace, { recursive: true, force: true }));
+  const valid = permissionConfig(workspace, false);
+  const cases = [
+    { configs: [] },
+    { configs: [valid, valid] },
+    { configs: [valid.replace('".npmrc"="deny",', "")] },
+    { configs: [valid.replace("network={enabled=false}", "network={enabled=maybe}")] },
+    { configs: [valid], extraArgs: ["--sandbox", "danger-full-access"] },
+  ];
+  for (const entry of cases) {
+    const result = await runWrapper(t, entry.configs, entry.extraArgs, workspace);
+    assert.notEqual(result.exitCode, 0);
+    assert.equal(result.record, undefined);
+  }
 });

@@ -32,9 +32,13 @@ jobs:
         with:
           node-version: 22
       - run: npm run check
-      - name: Installer dry run
+      - name: Fresh and legacy installer dry runs
         run: |
           key_file="$(mktemp)"
+          ./scripts/install.sh \
+            --tunnel-id tunnel_example \
+            --runtime-api-key-file "$key_file" \
+            --dry-run
           ./scripts/install.sh \
             --root "$PWD" \
             --tunnel-id tunnel_example \
