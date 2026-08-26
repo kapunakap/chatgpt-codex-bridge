@@ -8,6 +8,16 @@ ChatGPT → custom app → Secure MCP Tunnel → local adapter → codex app-ser
 
 This is an unofficial local bridge. It keeps the MCP backend private and opens only outbound HTTPS through OpenAI's official `tunnel-client`.
 
+## Watch it working
+
+Want to see ChatGPT reaching your Mac? In another terminal, follow the shared tunnel/adapter log:
+
+```bash
+tail -f "$HOME/Library/Application Support/tunnel-client/logs/local-codex.log"
+```
+
+Requests and adapter events appear here as ChatGPT uses Local Codex. See [Monitor from the Mac](#monitor-from-the-mac) for filtering, event details, and health checks.
+
 ## What it exposes
 
 - `codex(prompt, model?, reasoningEffort?)` starts a Codex thread.
