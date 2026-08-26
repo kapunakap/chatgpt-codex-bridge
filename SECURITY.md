@@ -11,14 +11,13 @@ This project deliberately lets a ChatGPT tool ask a local Codex worker to inspec
 - the MCP adapter binds only to loopback and requires a generated bearer token;
 - OpenAI Secure MCP Tunnel makes the outbound connection; no inbound public port is opened;
 - each new thread pins one canonical working directory selected through the authenticated MCP tool; replies cannot change it;
-- the Codex permission profile allows writes only inside that directory, denies sibling user trees, mounted volumes, and temporary trees, keeps `.codex` read-only, denies common credential files, and disables command network access by default;
+- network-disabled jobs keep the hardened Codex permission profile: writes stay inside the selected directory, sibling user trees, mounted volumes, and temporary trees are denied, `.codex` stays read-only, and common credential files are denied;
 - `.git` is writable inside the selected directory because Git fetch, clone, commit, and related operations require metadata writes;
-- `networkAccess: true` is an explicit per-thread opt-in to broad direct command network access without a domain allowlist; replies inherit until explicitly disabled;
-- the Codex app-server receives a small environment allowlist instead of the launcher's ambient environment;
-- Codex command subprocesses inherit only the core environment with secret-name filtering enabled;
+- `networkAccess: true` is an explicit per-thread opt-in to broad direct command network access and terminal-like host developer access. Network-enabled jobs may read host user files and inherit ordinary developer authentication such as `gh` configuration, Keychain-backed Git credentials, `SSH_AUTH_SOCK`, and ambient developer environment variables;
+- even for network-enabled jobs, `LOCAL_CODEX_*` and `TUNNEL_CLIENT_*` variables are stripped before the real Codex process starts so the bridge's own adapter/tunnel control credentials are not exposed;
 - prompts, responses, raw stderr, credentials, and reasoning content are excluded from the adapter audit log.
 
-The selected folder itself is intentionally available to Codex except for explicit deny rules. Do not put secrets there under arbitrary filenames and assume the adapter will discover them automatically. Network-enabled jobs can transmit any readable data, so use the narrowest relevant folder and enable networking only when the task requires it.
+The selected folder remains the write boundary. For network-disabled jobs, the additional read and environment restrictions reduce accidental credential exposure. For network-enabled jobs, treat Local Codex like the Codex/terminal session you already trust on that machine: it can use readable host data and developer credentials while carrying out the requested network task. Do not enable networking for repositories or prompts you do not trust.
 
 ## Reporting a vulnerability
 
