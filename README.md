@@ -38,6 +38,8 @@ New jobs default to **gpt-5.6-luna / max**. Optional model IDs or aliases (`luna
 
 Command network access is also thread-scoped. New threads default to **disabled**. ChatGPT chooses the setting from the task: requests that inherently need outbound access—such as `git fetch`, `git clone`, installing dependencies, `curl`, API calls, or downloads—should automatically opt in even when the user does not mention network access. Fully local work stays disabled. Replies inherit the thread's last setting when omitted, and an explicit reply value persists for later replies. The adapter uses Codex's native permission profile and does not proxy individual commands.
 
+When `networkAccess: true`, Local Codex intentionally behaves like the user's normal trusted local Codex/terminal session for reads and developer authentication: commands can use host user files and ambient developer auth such as `gh` config/Keychain credentials, `SSH_AUTH_SOCK`, `GH_TOKEN`, and `GITHUB_TOKEN`. Writes still stay inside the selected workspace. The bridge's own `LOCAL_CODEX_*` and `TUNNEL_CLIENT_*` variables remain stripped.
+
 ### Background job flow (v2)
 
 1. Choose `cwd`, generate a unique `requestId`, and submit once. The response contains a `jobId` and canonical `cwd`, not the answer.
@@ -54,19 +56,21 @@ Job metadata and final results are saved atomically under `LOCAL_CODEX_JOBS_DIR`
 
 - The adapter listens only on `127.0.0.1`.
 - A generated bearer token protects the local MCP endpoint.
-- Each Codex job receives system read access and write access only to its chosen canonical folder. On macOS, other user folders, mounted volumes, and temporary trees are denied unless they are inside the chosen folder.
-- The macOS profile deliberately avoids Codex 0.147's `:minimal` preset, which grants unconditional system-temp writes. Tools that need writable scratch space must use the chosen folder.
+- The canonical `cwd` is always the write boundary.
+- With networking disabled, jobs receive system read access and write access only to the chosen canonical folder. On macOS, other user folders, mounted volumes, and temporary trees are denied unless they are inside the chosen folder.
+- With networking enabled, reads and developer-auth environment are intentionally terminal-like so normal `gh`, Git credential, Keychain, SSH-agent, and developer environment workflows work. This is a broader trust mode; use it only for tasks and repositories you trust.
+- The macOS hardened profile deliberately avoids Codex 0.147's `:minimal` preset, which grants unconditional system-temp writes. Tools that need writable scratch space must use the chosen folder.
 - `.codex` stays read-only. `.git` is writable inside the selected folder because fetch, clone, commit, and related Git operations require metadata writes.
 - Common credential files inside every selected folder are denied to sandboxed commands: `.env`, `.env.*`, `*.env`, `.npmrc`, and `.pypirc`, including nested copies.
-- The authenticated folder lookup tool can list directory names elsewhere; it does not grant the running job access to those folders.
-- Commands run without network access by default. `networkAccess: true` enables broad direct command network access without a domain allowlist. A network-enabled job can send readable workspace or system data to external services, so enable it only for tasks and folders you trust.
-- The hardened Codex wrapper gives app-server a small environment allowlist and enables secret-name filtering for command subprocesses. Ambient API keys, database URLs, adapter/tunnel variables, passwords, authentication values, cookies, and sessions are not forwarded.
+- The authenticated folder lookup tool can list directory names elsewhere; it does not grant a network-disabled running job access to those folders.
+- Commands run without network access by default. `networkAccess: true` enables broad direct command network access without a domain allowlist and also enables normal host developer authentication. A network-enabled job can send readable host/workspace data to external services and can act with credentials available to your normal developer session.
+- Network-disabled jobs use a small environment allowlist with secret-name filtering. Network-enabled jobs inherit the normal host developer environment, except `LOCAL_CODEX_*` and `TUNNEL_CLIENT_*` variables are removed so the bridge's own control/runtime credentials are not exposed.
 - Thread replies are accepted only for thread IDs created by this adapter.
 - No inbound public port is required.
 
 The adapter uses `codex app-server`, which OpenAI recommends in place of the deprecated `codex mcp-server` command.
 
-These controls reduce accidental credential exposure; they do not make arbitrary selected-folder contents non-sensitive. See [SECURITY.md](SECURITY.md) for the threat model and vulnerability-reporting guidance.
+These controls reduce accidental credential exposure for network-disabled jobs. A network-enabled job is deliberately closer to running Codex from your own terminal. See [SECURITY.md](SECURITY.md) for the threat model and vulnerability-reporting guidance.
 
 ## Requirements
 
@@ -180,6 +184,8 @@ v3.1 adds optional `networkAccess` to `codex` and `codex-reply`. Existing caller
 
 v3.1.1 clarifies the MCP contract so ChatGPT chooses `networkAccess` from the user's task intent. Runtime defaults and sandbox behavior are unchanged. Refresh Local Codex's tools and use a fresh conversation so ChatGPT receives the new descriptions.
 
+The current `main` behavior additionally makes `networkAccess: true` terminal-like for host reads and developer authentication, while leaving network-disabled jobs hardened and keeping the tunnel's own runtime/control variables filtered.
+
 ### If ChatGPT reports missing `requestId` or `cwd`
 
 Missing required submission fields return `schema_outdated`, the adapter version, and its `schemaFingerprint`. No job is started. In ChatGPT, open **Local Codex → Manage → Refresh**, then use a **fresh conversation**. Existing conversations can retain older tool definitions even when the connection's settings show the new schema. Do not work around this by dropping required fields, inventing a working directory, or retrying with new IDs.
@@ -228,7 +234,7 @@ npm run check
 LOCAL_CODEX_NATIVE_TEST=1 npm test
 ```
 
-Tests use fake Codex processes, temporary state, and loopback HTTP. They cover per-job folders, directory pagination, symlinks, legacy migration, replies after restart, retries, busy handling, cancellation, timeout, model and network settings, credential denies, wrapper environment filtering, permissions, and private logging. They do not require OpenAI or GitHub credentials.
+Tests use fake Codex processes, temporary state, and loopback HTTP. They cover per-job folders, directory pagination, symlinks, legacy migration, replies after restart, retries, busy handling, cancellation, timeout, model and network settings, credential denies, wrapper environment filtering, trusted network developer-auth inheritance, permissions, and private logging. They do not require OpenAI or GitHub credentials.
 
 ## License
 
