@@ -18,6 +18,7 @@ const child = spawn(process.execPath, ["adapter.mjs"], {
     LOCAL_CODEX_PORT: String(port),
     LOCAL_CODEX_TOKEN_FILE: tokenFile,
     LOCAL_CODEX_STATE_FILE: join(root, "threads.json"),
+    LOCAL_CODEX_LOG_FILE: join(root, "calls.log"),
     LOCAL_CODEX_ROOT: root,
   },
 });
@@ -63,8 +64,9 @@ test("discovery falls back and tools have constrained schemas", async () => {
 
   const listed = await rpc({ jsonrpc: "2.0", id: 2, method: "tools/list", params: {} });
   assert.deepEqual(listed.result.tools.map(tool => tool.name), ["codex", "codex-reply"]);
-  assert.deepEqual(Object.keys(listed.result.tools[0].inputSchema.properties), ["prompt"]);
-  assert.deepEqual(Object.keys(listed.result.tools[1].inputSchema.properties), ["threadId", "prompt"]);
+  assert.deepEqual(Object.keys(listed.result.tools[0].inputSchema.properties), ["prompt", "model", "reasoningEffort"]);
+  assert.deepEqual(Object.keys(listed.result.tools[1].inputSchema.properties), ["threadId", "prompt", "model", "reasoningEffort"]);
+  assert.equal(initialized.result.serverInfo.version, "1.1.0");
 });
 
 test("reply rejects threads not created by this adapter", async () => {

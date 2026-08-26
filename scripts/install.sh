@@ -129,6 +129,7 @@ config_tmp=$(mktemp "${STATE_DIR}/config.env.XXXXXX")
   printf 'LOCAL_CODEX_ROOT=%q\n' "${TARGET_ROOT}"
   printf 'LOCAL_CODEX_TOKEN_FILE=%q\n' "${TOKEN_FILE}"
   printf 'LOCAL_CODEX_STATE_FILE=%q\n' "${THREADS_FILE}"
+  printf 'LOCAL_CODEX_LOG_FILE=%q\n' "${LOG_FILE}"
   printf 'LOCAL_CODEX_HOST=%q\n' "127.0.0.1"
   printf 'LOCAL_CODEX_PORT=%q\n' "${PORT}"
   printf 'LOCAL_CODEX_ADAPTER=%q\n' "${ADAPTER_PATH}"
