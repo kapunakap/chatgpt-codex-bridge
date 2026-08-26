@@ -10,20 +10,37 @@ This is an unofficial local bridge. It keeps the MCP backend private and opens o
 
 ## What it exposes
 
-- `codex(prompt, model?, reasoningEffort?)` starts a Codex thread.
-- `codex-reply(threadId, prompt, model?, reasoningEffort?)` continues a thread created by this adapter.
+- `codex(requestId, cwd, prompt, model?, reasoningEffort?)` starts a background job in any existing folder.
+- `codex-reply(requestId, threadId, prompt, model?, reasoningEffort?)` starts a background reply on an adapter-owned thread.
+- `codex-status(jobId, waitMs?)` reads progress and the saved result. Use `waitMs: 20000` while running.
+- `codex-cancel(jobId)` explicitly stops work. It does not undo file changes.
+- `codex-folders(path?, cursor?)` lists up to 100 child directory names per page. It defaults to your home directory and never reads file contents.
 
-New threads default to **`gpt-5.6-luna` with `max` reasoning**, regardless of the model in your global Codex configuration. Accepts full model IDs and the aliases `luna`, `terra`, and `sol`. Both selections are checked against the installed app-server's model catalog; unavailable models and unsupported reasoning levels fail with supported choices, never silently fall back.
+ChatGPT chooses an existing absolute `cwd` for each new thread, with **no directory allowlist or per-folder approval**. It can use `codex-folders` to locate the narrowest folder relevant to your task. Symlinks resolve to their target; the canonical `cwd` is returned with the job and is its write boundary. Relative, missing, inaccessible, and file paths fail without starting work. Folder discovery includes directory symlinks but omits files and broken links; follow `nextCursor` with the same path to continue the alphabetical listing.
 
-Follow-ups keep the thread's last model and reasoning level for fields you omit. Overrides persist for later replies, including after an adapter restart. Existing threads keep their existing settings; the adapter does not replace those with Luna/max. If a legacy thread has no reported reasoning level, pass `reasoningEffort` explicitly.
+Replies always use their thread's saved folder and cannot accept a different `cwd`. Start a new thread to change folders. If a saved folder disappears or resolves elsewhere, replies fail without widening access. The caller cannot change the sandbox or permission level.
 
-The tool caller still cannot choose a working directory, sandbox, or permission level. The adapter fixes Codex to one configured repository root. These model settings control the **local Codex worker**, not the outer ChatGPT chat model. Other Codex settings remain unchanged.
+New jobs default to **gpt-5.6-luna / max**. Optional model IDs or aliases (`luna`, `terra`, `sol`) and reasoning levels are checked against Codex's model catalog. Unsupported combinations fail without fallback. Replies inherit the thread's last settings unless overridden.
+
+### Background job flow (v2)
+
+1. Choose `cwd`, generate a unique `requestId`, and submit once. The response contains a `jobId` and canonical `cwd`, not the answer.
+2. Poll `codex-status` until `completed`, `failed`, `cancelled`, `timed_out`, or `interrupted`. Only `completed` contains a successful final answer.
+3. If submission delivery is uncertain, retry with the **same requestId and arguments**. This returns the same saved job. Reusing an ID with different arguments or a different canonical folder fails.
+
+There is one active job and **no waiting queue**. A `busy` response contains `activeJobId`; it does not accept or queue the new request. Status checks never start work. Closing a status request or its connection does not cancel an accepted job; use `codex-cancel` explicitly.
+
+Jobs run independently of the tunnel's response deadline, with a 30-minute execution limit by default. Set `LOCAL_CODEX_CALL_TIMEOUT_MS` in the local config to change it. Cancellation first requests `turn/interrupt`, then terminates the job's process group if needed. A new job is not admitted until the old process has exited.
+
+Job metadata and final results are saved atomically under `LOCAL_CODEX_JOBS_DIR` (default: `jobs` next to `threads.json`), using mode `0700` directories and `0600` files. Request IDs and input fingerprints are hashed; job files do not contain prompts or reasoning. Codex's own session history is separate and may contain the original input. Saved results are retained until explicitly removed. On adapter restart, unfinished jobs become `interrupted` and are never replayed; inspect their threads before starting replacement work.
 
 ## Security boundary
 
 - The adapter listens only on `127.0.0.1`.
 - A generated bearer token protects the local MCP endpoint.
-- Codex receives minimal system read access and write access only to the configured repository.
+- Each Codex job receives system read access and write access only to its chosen canonical folder. On macOS, other user folders, mounted volumes, and temporary trees are denied unless they are inside the chosen folder.
+- The macOS profile deliberately avoids Codex 0.147's `:minimal` preset, which grants unconditional system-temp writes. Tools that need writable scratch space must use the chosen folder.
+- The authenticated folder lookup tool can list directory names elsewhere; it does not grant the running job access to those folders.
 - Commands run without network access.
 - Thread replies are accepted only for thread IDs created by this adapter.
 - No inbound public port is required.
@@ -52,7 +69,6 @@ Clone the repository, then run:
 
 ```bash
 ./scripts/install.sh \
-  --root /absolute/path/to/the/repository/codex-may-edit \
   --tunnel-id tunnel_... \
   --runtime-api-key-file /absolute/path/to/runtime-api-key
 ```
@@ -69,7 +85,6 @@ Preview paths and validation without changing anything:
 
 ```bash
 ./scripts/install.sh \
-  --root /absolute/path/to/repository \
   --tunnel-id tunnel_... \
   --runtime-api-key-file /absolute/path/to/runtime-api-key \
   --dry-run
@@ -94,22 +109,22 @@ Keep that terminal open while using Local Codex in ChatGPT.
 Test it with:
 
 ```text
-Use Local Codex to call the codex tool with prompt: Reply with exactly: TEST_OK
+Use Local Codex's codex-folders tool to find the relevant project folder. Call codex with its absolute cwd, requestId: smoke-001, and prompt: Reply with exactly TEST_OK. Then poll codex-status for the returned jobId using waitMs: 20000 until it completes. Do not submit the prompt again with a new requestId.
 ```
 
-To choose a model from ChatGPT:
+After upgrading from v1, refresh Local Codex's tool definitions in ChatGPT (or reconnect the app if needed). v2 requires `requestId` and changes submission responses from final answers to job handles. A cached v1 call without `requestId` is rejected without starting work.
 
-```text
-Use Local Codex with model terra and reasoningEffort high to review the repository. Do not edit files.
-```
+v3 additionally requires `cwd` for `codex` and adds `codex-folders`. Refresh tools after upgrading from v2; cached submissions without `cwd` are rejected with a clear error. Existing jobs and threads are migrated to their original folder using the old `LOCAL_CODEX_ROOT`. Their results and request fingerprints are preserved. The migration source is saved once in thread state, so later configuration changes cannot retarget old threads. `LOCAL_CODEX_ROOT` (and the installer's optional `--root`) is only a legacy migration input, not a default or limit for new jobs. Keep it set until legacy records have been migrated; fresh installations do not need it.
 
-The resulting MCP arguments look like:
+### If ChatGPT reports missing `requestId` or `cwd`
 
-```json
-{"prompt":"Review the repository. Do not edit files.","model":"terra","reasoningEffort":"high"}
-```
+Missing required submission fields return `schema_outdated`, the adapter version, and its `schemaFingerprint`. No job is started. In ChatGPT, open **Local Codex → Manage → Refresh**, then use a **fresh conversation**. Existing conversations can retain older tool definitions even when the connection's settings show the new schema. Do not work around this by dropping required fields, inventing a working directory, or retrying with new IDs.
 
-Continue with `codex-reply` and the returned `threadId`. Omit both settings to keep Terra/high, or pass `model: "luna", reasoningEffort: "max"` to switch back.
+The adapter's `/readyz` response includes the same fingerprint. Safe `schema_served` and `call_rejected` log events identify which schema was served and why a request was rejected, without logging caller IDs, prompts, or argument values. The static plugin description/version in ChatGPT is separate from the live tool schema; inspect its **Actions → Input schema** to verify `requestId` and `cwd`.
+
+Treat a successful no-file-changes job submitted and polled from ChatGPT as the end-to-end check. A healthy local endpoint alone does not prove that ChatGPT has the updated tools.
+
+For an existing installation, back up and replace only the adapter and launcher; keep the existing config, token, tunnel profile, and thread history. Stop the old bridge and its children before restarting. Do not rerun the full installer to upgrade an installation with customized configuration.
 
 ## Monitor from the Mac
 
@@ -117,21 +132,6 @@ Follow tunnel traffic:
 
 ```bash
 tail -f "$HOME/Library/Application Support/tunnel-client/logs/local-codex.log"
-```
-
-The adapter appends JSON records to the same file using `component: "local-codex-adapter"`. Events include `call_started`, `settings_requested`, `settings_confirmed`, `turn_started`, `call_completed`, `call_failed`, and `call_timed_out`, with a locally generated `requestId`, thread/turn IDs when available, and elapsed milliseconds.
-
-```json
-{"component":"local-codex-adapter","event":"settings_confirmed","model":"gpt-5.6-luna","reasoningEffort":"max","settingsStatus":"confirmed"}
-```
-
-`settings_requested` is only a selection; `settings_confirmed` means app-server reported the same values. Calls fail if app-server reports different or missing settings. Early failures have null settings/IDs. `LOCAL_CODEX_LOG_FILE` selects the adapter log path; the installer points it at the tunnel log above. The adapter never logs prompts, responses, credentials, raw stderr, or reasoning content. Normal Codex session history is separate and can contain task content.
-
-Filter adapter events only (requires `jq`):
-
-```bash
-tail -f "$HOME/Library/Application Support/tunnel-client/logs/local-codex.log" |
-  jq --unbuffered -c 'select(.component == "local-codex-adapter")'
 ```
 
 Check health and readiness:
@@ -151,7 +151,7 @@ jq -r '.threadIds[]' "$HOME/Library/Application Support/local-codex-tunnel/threa
 Open Codex history, including app-server sessions:
 
 ```bash
-cd /path/to/configured/repository
+cd /path/to/chosen/project
 codex resume --all --include-non-interactive
 ```
 
@@ -160,15 +160,11 @@ codex resume --all --include-non-interactive
 ```bash
 npm test
 npm run check
+# Optional macOS boundary checks using the installed Codex CLI (no model calls):
+LOCAL_CODEX_NATIVE_TEST=1 npm test
 ```
 
-Unit tests use only a loopback test server. They do not require OpenAI or GitHub credentials.
-
-## Upgrading an existing installation
-
-Stop accepting new work and wait for the active call to finish before stopping the launcher with Ctrl-C. Back up your installed adapter, launcher, and local configuration. Re-run the installer with the **same** repository root, tunnel ID, and runtime-key file; it preserves the existing adapter token and thread history. Start the launcher again.
-
-In ChatGPT, open the existing **Local Codex** plugin settings and select **Refresh** to load the new tool schema. Do not create another app or tunnel. Test an omitted-settings call, an explicit override, and a reply without overrides; compare the confirmed settings in the log. If an upgrade fails, restore the backed-up installation and restart it.
+Tests use a fake Codex process, temporary state, and loopback HTTP. They cover per-job folders, directory pagination, symlinks, legacy migration, replies after restart, retries, busy handling, cancellation, timeout, model settings, permissions, and private logging. They do not require OpenAI or GitHub credentials.
 
 ## License
 

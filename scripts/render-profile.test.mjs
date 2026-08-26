@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { mkdtemp, readFile } from "node:fs/promises";
+import { mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -34,19 +34,31 @@ test("renders a tunnel-client profile with file-backed secrets", async () => {
   assert.equal(profile.log.file, log);
 });
 
-function run(args) {
+test("fresh installation dry run does not require a fixed root", { skip: process.platform !== "darwin" }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), "local-codex-install-test-"));
+  const key = join(directory, "unused-test-key");
+  await writeFile(key, "not-a-real-key", { mode: 0o600 });
+  const output = await run(["scripts/install.sh", "--tunnel-id", "tunnel_example", "--runtime-api-key-file", key, "--dry-run"], "/bin/zsh");
+  assert.match(output, /DRY_RUN_OK/);
+  assert.match(output, /scope=per_job/);
+  assert.match(output, /legacy_root=\n/);
+});
+
+function run(args, executable = process.execPath) {
   return new Promise((resolve, reject) => {
-    const child = spawn(process.execPath, args, {
+    const child = spawn(executable, args, {
       cwd: fileURLToPath(new URL("..", import.meta.url)),
       stdio: ["ignore", "pipe", "pipe"],
     });
     let stderr = "";
+    let stdout = "";
+    child.stdout.on("data", chunk => { stdout += chunk.toString(); });
     child.stderr.on("data", chunk => {
       stderr += chunk.toString();
     });
     child.on("error", reject);
     child.on("exit", code => {
-      if (code === 0) resolve();
+      if (code === 0) resolve(stdout);
       else reject(new Error(`renderer exited with ${code}: ${stderr}`));
     });
   });
