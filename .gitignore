@@ -1,0 +1,11 @@
+.DS_Store
+node_modules/
+coverage/
+.env
+*.log
+
+# Never commit generated local profiles or runtime state.
+profiles/local-codex.yaml
+config.env
+adapter-token
+threads.json
