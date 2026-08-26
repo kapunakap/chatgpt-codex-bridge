@@ -4,18 +4,25 @@ import { realpathSync } from "node:fs";
 import { spawn } from "node:child_process";
 import process from "node:process";
 
-const rootInput = process.env.LOCAL_CODEX_ROOT;
-if (!rootInput) {
-  throw new Error("LOCAL_CODEX_ROOT is required");
-}
-
-const ROOT = realpathSync(rootInput);
 const REAL_CODEX_BIN = process.env.LOCAL_CODEX_REAL_BIN || "codex";
-const rootToml = JSON.stringify(ROOT);
 
-// Extend Codex's built-in workspace profile so its protected-path defaults
-// remain in force, then deny common credential files inside the workspace.
-const PERMISSION_CONFIG = `permissions.local-codex-tunnel={description="Local Codex",extends=":workspace",workspace_roots={${rootToml}=true},filesystem={":workspace_roots"={".env"="deny",".env.*"="deny","**/.env"="deny","**/.env.*"="deny","*.env"="deny","**/*.env"="deny",".npmrc"="deny","**/.npmrc"="deny",".pypirc"="deny","**/.pypirc"="deny"}},network={enabled=false}}`;
+// Keep this generator byte-for-byte aligned with adapter.mjs. The wrapper
+// recomputes the expected profile from its canonical working directory so a
+// malformed or weakened profile never reaches Codex.
+function permissionConfig(cwd, networkAccess) {
+  const denied = ["/Users", "/System/Volumes/Data/Users", "/Volumes", "/private/tmp", "/tmp", "/private/var/tmp", "/var/tmp", "/private/var/folders", "/var/folders"];
+  const inside = path => cwd === "/" || path === cwd || path.startsWith(`${cwd}/`);
+  const reads = process.platform === "darwin"
+    ? ['":root"="read"', ...denied.filter(path => {
+      const canonical = path.replace(/^\/System\/Volumes\/Data(?=\/)/, "").replace(/^\/tmp$/, "/private/tmp").replace(/^\/var(?=\/)/, "/private/var");
+      return !inside(path) && !inside(canonical);
+    }).map(path => `${JSON.stringify(path)}="deny"`)].join(", ")
+    : '":minimal"="read"';
+  const workspace = ['"."="write"', '".git"="write"', '".codex"="read"', '".env"="deny"', '".env.*"="deny"',
+    '"**/.env"="deny"', '"**/.env.*"="deny"', '"*.env"="deny"', '"**/*.env"="deny"',
+    '".npmrc"="deny"', '"**/.npmrc"="deny"', '".pypirc"="deny"', '"**/.pypirc"="deny"'].join(", ");
+  return `permissions.local-codex-tunnel={description="Local Codex", workspace_roots={${JSON.stringify(cwd)}=true}, filesystem={${reads}, ":workspace_roots"={${workspace}}}, network={enabled=${networkAccess}}}`;
+}
 
 // Commands launched by Codex inherit only the core environment. Codex's
 // automatic KEY/SECRET/TOKEN filtering is explicitly enabled, with extra
@@ -27,15 +34,26 @@ const SHELL_ENV_CONFIGS = [
 ];
 
 const args = process.argv.slice(2);
-let replacedPermissionConfig = false;
+const permissionIndexes = [];
 for (let index = 0; index < args.length - 1; index++) {
   if (args[index] === "-c" && args[index + 1].startsWith("permissions.local-codex-tunnel=")) {
-    args[index + 1] = PERMISSION_CONFIG;
-    replacedPermissionConfig = true;
+    permissionIndexes.push(index + 1);
   }
 }
-if (!replacedPermissionConfig) {
-  args.push("-c", PERMISSION_CONFIG);
+if (permissionIndexes.length !== 1) {
+  throw new Error("Exactly one Local Codex permission profile is required");
+}
+const permission = args[permissionIndexes[0]];
+const networkMatches = permission.match(/network=\{enabled=(true|false)\}/g) || [];
+if (networkMatches.length !== 1) {
+  throw new Error("Local Codex permission profile must select exactly one network state");
+}
+const networkAccess = networkMatches[0].includes("true");
+if (permission !== permissionConfig(realpathSync(process.cwd()), networkAccess)) {
+  throw new Error("Local Codex permission profile does not match the hardened workspace policy");
+}
+if (args.includes("--sandbox") || args.some(value => value.includes("sandbox_mode") || value.includes(":danger-full-access") || value.includes("dangerously_allow"))) {
+  throw new Error("Unsafe Codex sandbox configuration is not allowed");
 }
 for (const config of SHELL_ENV_CONFIGS) {
   args.push("-c", config);

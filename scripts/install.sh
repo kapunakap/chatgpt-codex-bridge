@@ -5,7 +5,7 @@ usage() {
   cat <<'EOF'
 Usage:
   scripts/install.sh \
-    --root /absolute/path/to/repository \
+    [--root /absolute/path/to/legacy/repository] \
     --tunnel-id tunnel_... \
     --runtime-api-key-file /absolute/path/to/runtime-api-key \
     [--dry-run]
@@ -47,7 +47,7 @@ while (( $# > 0 )); do
   esac
 done
 
-if [[ -z "${target_root}" || -z "${tunnel_id}" || -z "${runtime_api_key_file}" ]]; then
+if [[ -z "${tunnel_id}" || -z "${runtime_api_key_file}" ]]; then
   usage >&2
   exit 2
 fi
@@ -55,7 +55,7 @@ if [[ "${OSTYPE}" != darwin* ]]; then
   print -u2 "This installer currently supports macOS only."
   exit 1
 fi
-if [[ ! -d "${target_root}" ]]; then
+if [[ -n "${target_root}" && ! -d "${target_root}" ]]; then
   print -u2 "Repository root does not exist: ${target_root}"
   exit 1
 fi
@@ -69,7 +69,7 @@ if [[ ! "${tunnel_id}" =~ '^tunnel_[A-Za-z0-9]+$' ]]; then
 fi
 
 readonly SOURCE_ROOT="${0:A:h:h}"
-readonly TARGET_ROOT="${target_root:A}"
+readonly TARGET_ROOT="${target_root:+${target_root:A}}"
 readonly RUNTIME_API_KEY_FILE="${runtime_api_key_file:A}"
 readonly USER_HOME="${HOME}"
 readonly PROFILE_NAME="local-codex"
@@ -91,7 +91,8 @@ readonly LOG_FILE="${TUNNEL_STATE_DIR}/logs/${PROFILE_NAME}.log"
 
 if [[ "${dry_run}" == "true" ]]; then
   print "DRY_RUN_OK"
-  print "root=${TARGET_ROOT}"
+  print "scope=per_job"
+  print "legacy_root=${TARGET_ROOT}"
   print "launcher=${LAUNCHER_PATH}"
   print "codex_wrapper=${CODEX_WRAPPER_PATH}"
   print "profile=${PROFILE_FILE}"
@@ -129,14 +130,19 @@ chmod 600 "${TOKEN_FILE}"
 
 config_tmp=$(mktemp "${STATE_DIR}/config.env.XXXXXX")
 {
-  printf 'LOCAL_CODEX_ROOT=%q\n' "${TARGET_ROOT}"
+  if [[ -n "${TARGET_ROOT}" ]]; then
+    printf 'LOCAL_CODEX_ROOT=%q\n' "${TARGET_ROOT}"
+  fi
   printf 'LOCAL_CODEX_TOKEN_FILE=%q\n' "${TOKEN_FILE}"
   printf 'LOCAL_CODEX_STATE_FILE=%q\n' "${THREADS_FILE}"
   printf 'LOCAL_CODEX_LOG_FILE=%q\n' "${LOG_FILE}"
+  printf 'LOCAL_CODEX_JOBS_DIR=%q\n' "${STATE_DIR}/jobs"
+  printf 'LOCAL_CODEX_CALL_TIMEOUT_MS=%q\n' "1800000"
   printf 'LOCAL_CODEX_HOST=%q\n' "127.0.0.1"
   printf 'LOCAL_CODEX_PORT=%q\n' "${PORT}"
   printf 'LOCAL_CODEX_ADAPTER=%q\n' "${ADAPTER_PATH}"
   printf 'LOCAL_CODEX_BIN=%q\n' "${CODEX_WRAPPER_PATH}"
+  printf 'LOCAL_CODEX_REAL_BIN=%q\n' "codex"
   printf 'TUNNEL_CLIENT_PROFILE=%q\n' "${PROFILE_NAME}"
 } > "${config_tmp}"
 chmod 600 "${config_tmp}"
