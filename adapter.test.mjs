@@ -32,6 +32,7 @@ async function fixture(t, options = {}) {
     LOCAL_CODEX_TOKEN_FILE: tokenFile, LOCAL_CODEX_STATE_FILE: join(root, "threads.json"),
     LOCAL_CODEX_LOG_FILE: join(root, "audit.log"), LOCAL_CODEX_JOBS_DIR: join(root, "jobs"),
     LOCAL_CODEX_BIN: options.missingBin ? join(root, "missing") : fake, LOCAL_CODEX_CALL_TIMEOUT_MS: String(options.timeout || 10000),
+    LOCAL_CODEX_MAX_CONCURRENCY: String(options.maxConcurrency ?? 4), LOCAL_CODEX_MAX_QUEUE: String(options.maxQueue ?? 100),
     FAKE_ROOT: root,
   };
   async function start() {
@@ -95,7 +96,7 @@ test("discovery, authentication, schemas, and validation", async t => {
   assert.equal(discover.error.code, -32601);
   const initialized = await f.rpc({ jsonrpc: "2.0", id: "i", method: "initialize", params: { protocolVersion: "2025-11-25" } });
   assert.equal(initialized.result.protocolVersion, "2025-11-25");
-  assert.equal(initialized.result.serverInfo.version, "3.1.1");
+  assert.equal(initialized.result.serverInfo.version, "3.2.0");
   const listed = await f.rpc({ jsonrpc: "2.0", id: "l", method: "tools/list" });
   assert.deepEqual(listed.result.tools.map(t => t.name), ["codex", "codex-reply", "codex-status", "codex-cancel", "codex-folders"]);
   assert.deepEqual(listed.result.tools[0].inputSchema.required, ["requestId", "cwd", "prompt"]);
@@ -103,6 +104,8 @@ test("discovery, authentication, schemas, and validation", async t => {
   const reply = listed.result.tools[1];
   assert.equal(codex.inputSchema.properties.networkAccess.type, "boolean");
   assert.equal(codex.inputSchema.properties.networkAccess.default, false);
+  assert.match(codex.description, /different canonical folders can run concurrently/i);
+  assert.match(codex.description, /serialized through the queue/i);
   for (const text of [codex.description, codex.inputSchema.properties.networkAccess.description]) {
     assert.match(text, /task intent/i);
     assert.match(text, /even if.*(?:did not|never).*network access/i);
@@ -132,7 +135,7 @@ test("discovery, authentication, schemas, and validation", async t => {
   assert.equal((await f.records()).length, 0);
 });
 
-test("durable immediate acceptance, duplicate retries, busy, and final answer", async t => {
+test("durable immediate acceptance, duplicate retries, same-folder queueing, and final answer", async t => {
   const f = await fixture(t);
   const args = { requestId: "same", prompt: "delay:500" };
   const before = Date.now();
@@ -141,18 +144,23 @@ test("durable immediate acceptance, duplicate retries, busy, and final answer", 
   assert.equal(new Set(results.map(r => r.jobId)).size, 1);
   const { jobId } = results[0];
   assert.equal((await f.call("codex", { ...args, prompt: "different" })).errorCode, "request_conflict");
-  const busy = await f.call("codex", { requestId: "other", prompt: "hello" });
-  assert.equal(busy.status, "busy"); assert.equal(busy.activeJobId, jobId);
+  const queued = await f.call("codex", { requestId: "other", prompt: "hello" });
+  assert.equal(queued.status, "queued"); assert.ok(queued.jobId);
+  assert.equal((await f.call("codex", { requestId: "other", prompt: "hello" })).jobId, queued.jobId);
   const ready = await (await fetch(`http://127.0.0.1:${f.port}/readyz`)).json();
-  assert.equal(ready.activeCalls, 1); assert.equal(ready.queuedCalls, 0);
+  assert.equal(ready.activeCalls, 1); assert.equal(ready.queuedCalls, 1);
+  assert.equal(ready.maxConcurrency, 4); assert.equal(ready.maxQueue, 100);
+  assert.deepEqual(ready.queuedJobIds, [queued.jobId]);
   assert.equal((await f.call("codex-status", { jobId, waitMs: 20001 })).errorCode, "invalid_wait");
   const result = await f.finished(jobId);
   assert.equal(result.content, "FINAL_OK"); assert.equal(result.status, "completed");
   assert.equal(result.model, "gpt-5.6-luna"); assert.equal(result.reasoningEffort, "max");
   assert.equal(result.networkAccess, false);
   assert.equal((await f.call("codex", args)).jobId, jobId);
+  const queuedResult = await f.finished(queued.jobId);
+  assert.equal(queuedResult.status, "completed"); assert.equal(queuedResult.content, "FINAL_OK");
   const records = await f.records();
-  assert.equal(records.filter(r => r.method === "turn/start").length, 1);
+  assert.equal(records.filter(r => r.method === "turn/start").length, 2);
   const start = records.find(r => r.method === "thread/start");
   assert.equal(start.params.permissions, "local-codex-tunnel");
   assert.equal(start.params.approvalPolicy, "never"); assert.equal(start.params.cwd, f.root);
@@ -171,6 +179,72 @@ test("durable immediate acceptance, duplicate retries, busy, and final answer", 
   assert.equal((await stat(jobFile)).mode & 0o777, 0o600);
   assert.equal((await stat(join(f.root, "jobs"))).mode & 0o777, 0o700);
   assert.ok(!(await readFile(jobFile, "utf8")).includes(args.prompt));
+});
+
+test("different folders run concurrently while same-folder jobs serialize", async t => {
+  const f = await fixture(t, { maxConcurrency: 2 });
+  const first = await realpath(await mkdtemp(join(tmpdir(), "codex-concurrency-a-")));
+  const second = await realpath(await mkdtemp(join(tmpdir(), "codex-concurrency-b-")));
+  const a1 = await f.call("codex", { requestId: "a1", cwd: first, prompt: "hold" });
+  await f.started(a1.jobId);
+  const a2 = await f.call("codex", { requestId: "a2", cwd: first, prompt: "hello" });
+  assert.equal(a2.status, "queued");
+  const b1 = await f.call("codex", { requestId: "b1", cwd: second, prompt: "hold" });
+  await f.started(b1.jobId);
+  const ready = await (await fetch(`http://127.0.0.1:${f.port}/readyz`)).json();
+  assert.equal(ready.activeCalls, 2); assert.equal(ready.queuedCalls, 1);
+  assert.deepEqual(new Set(ready.activeCwds), new Set([first, second]));
+  assert.deepEqual(ready.queuedCwds, [first]);
+  assert.equal(ready.scheduling, "fifo-runnable-per-folder");
+  await f.call("codex-cancel", { jobId: a1.jobId });
+  assert.equal((await f.finished(a1.jobId)).status, "cancelled");
+  const startedA2 = await f.started(a2.jobId);
+  assert.ok(startedA2.turnId, "same-folder queued job starts after the folder lock is released");
+  assert.equal((await f.finished(a2.jobId)).status, "completed");
+  await f.call("codex-cancel", { jobId: b1.jobId });
+  assert.equal((await f.finished(b1.jobId)).status, "cancelled");
+});
+
+test("bounded queue is FIFO among runnable jobs and returns queue_full", async t => {
+  const f = await fixture(t, { maxConcurrency: 1, maxQueue: 2 });
+  const folders = [];
+  for (const name of ["a", "b", "c", "d"]) folders.push(await realpath(await mkdtemp(join(tmpdir(), `codex-queue-${name}-`))));
+  const active = await f.call("codex", { requestId: "queue-a", cwd: folders[0], prompt: "hold" });
+  await f.started(active.jobId);
+  const b = await f.call("codex", { requestId: "queue-b", cwd: folders[1], prompt: "delay:80" });
+  const c = await f.call("codex", { requestId: "queue-c", cwd: folders[2], prompt: "hello" });
+  assert.equal(b.status, "queued"); assert.equal(c.status, "queued");
+  const full = await f.call("codex", { requestId: "queue-d", cwd: folders[3], prompt: "hello" });
+  assert.equal(full.status, "error"); assert.equal(full.errorCode, "queue_full");
+  await f.call("codex-cancel", { jobId: active.jobId });
+  assert.equal((await f.finished(active.jobId)).status, "cancelled");
+  assert.equal((await f.finished(b.jobId)).status, "completed");
+  assert.equal((await f.finished(c.jobId)).status, "completed");
+  const starts = (await f.records()).filter(r => r.method === "thread/start").map(r => r.params.cwd);
+  assert.deepEqual(starts, [folders[0], folders[1], folders[2]]);
+  const retried = await f.call("codex", { requestId: "queue-d", cwd: folders[3], prompt: "hello" });
+  assert.notEqual(retried.status, "error");
+  assert.equal((await f.finished(retried.jobId)).status, "completed");
+});
+
+test("queued jobs can be cancelled and are interrupted without replay after restart", async t => {
+  const f = await fixture(t, { maxConcurrency: 1, maxQueue: 3 });
+  const first = await realpath(await mkdtemp(join(tmpdir(), "codex-recovery-a-")));
+  const second = await realpath(await mkdtemp(join(tmpdir(), "codex-recovery-b-")));
+  const third = await realpath(await mkdtemp(join(tmpdir(), "codex-recovery-c-")));
+  const active = await f.call("codex", { requestId: "recovery-active", cwd: first, prompt: "hold" });
+  await f.started(active.jobId);
+  const cancelled = await f.call("codex", { requestId: "recovery-cancelled", cwd: second, prompt: "hello" });
+  assert.equal(cancelled.status, "queued");
+  assert.equal((await f.call("codex-cancel", { jobId: cancelled.jobId })).status, "cancelled");
+  assert.equal((await f.call("codex-status", { jobId: cancelled.jobId })).status, "cancelled");
+  const queued = await f.call("codex", { requestId: "recovery-queued", cwd: third, prompt: "hello" });
+  assert.equal(queued.status, "queued");
+  await f.stop("SIGKILL"); await f.start();
+  assert.equal((await f.call("codex-status", { jobId: active.jobId })).status, "interrupted");
+  assert.equal((await f.call("codex-status", { jobId: queued.jobId })).status, "interrupted");
+  assert.equal((await f.call("codex-status", { jobId: cancelled.jobId })).status, "cancelled");
+  assert.equal((await f.records()).filter(r => r.method === "turn/start").length, 1);
 });
 
 test("stale schemas return actionable errors, never start work, and log only schema metadata", async t => {
@@ -303,12 +377,19 @@ test("acceptance fails closed when job storage cannot be written", async t => {
   assert.equal((await fetch(`http://127.0.0.1:${f.port}/readyz`)).status, 503);
 });
 
-test("graceful shutdown cancels the active child without replaying it", async t => {
-  const f = await fixture(t);
-  const job = await f.call("codex", { requestId: "shutdown", prompt: "hold" });
-  await f.started(job.jobId); await f.stop(); await f.start();
+test("graceful shutdown cancels all active and queued work without replaying it", async t => {
+  const f = await fixture(t, { maxConcurrency: 2 });
+  const first = await realpath(await mkdtemp(join(tmpdir(), "shutdown-a-")));
+  const second = await realpath(await mkdtemp(join(tmpdir(), "shutdown-b-")));
+  const job = await f.call("codex", { requestId: "shutdown", cwd: first, prompt: "hold" });
+  const other = await f.call("codex", { requestId: "shutdown-other", cwd: second, prompt: "hold" });
+  const queued = await f.call("codex", { requestId: "shutdown-queued", cwd: first, prompt: "hello" });
+  await f.started(job.jobId); await f.started(other.jobId); assert.equal(queued.status, "queued");
+  await f.stop(); await f.start();
   assert.equal((await f.call("codex-status", { jobId: job.jobId })).status, "interrupted");
-  assert.equal((await f.records()).filter(r => r.method === "turn/start").length, 1);
+  assert.equal((await f.call("codex-status", { jobId: other.jobId })).status, "interrupted");
+  assert.equal((await f.call("codex-status", { jobId: queued.jobId })).status, "interrupted");
+  assert.equal((await f.records()).filter(r => r.method === "turn/start").length, 2);
   for (const r of (await f.records()).filter(r => r.event === "spawn")) assert.throws(() => process.kill(r.pid, 0), /ESRCH/);
 });
 
