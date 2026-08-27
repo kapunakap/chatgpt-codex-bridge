@@ -20,7 +20,7 @@ const STATE_FILE = process.env.LOCAL_CODEX_STATE_FILE ||
 const LOG_FILE = process.env.LOCAL_CODEX_LOG_FILE ||
   resolve(homedir(), "Library/Application Support/tunnel-client/logs/local-codex.log");
 const JOBS_DIR = process.env.LOCAL_CODEX_JOBS_DIR || resolve(dirname(STATE_FILE), "jobs");
-const VERSION = "3.1.1";
+const VERSION = "3.2.0";
 const DEFAULT_SETTINGS = { model: "gpt-5.6-luna", reasoningEffort: "max" };
 const MODEL_ALIASES = new Map([
   ["luna", "gpt-5.6-luna"], ["terra", "gpt-5.6-terra"], ["sol", "gpt-5.6-sol"],
@@ -37,6 +37,8 @@ const selectionProperties = {
 };
 const MAX_BODY = 1024 * 1024;
 const CALL_TIMEOUT_MS = Number(process.env.LOCAL_CODEX_CALL_TIMEOUT_MS || "1800000");
+const MAX_CONCURRENCY = Number(process.env.LOCAL_CODEX_MAX_CONCURRENCY || "4");
+const MAX_QUEUE = Number(process.env.LOCAL_CODEX_MAX_QUEUE || "100");
 function permissionConfig(cwd, networkAccess) {
   // Codex 0.147's macOS :minimal preset includes unconditional temp writes.
   // Use system reads without that preset; keep other user/data/temp trees
@@ -64,6 +66,12 @@ if (HOST !== "127.0.0.1" && HOST !== "::1") throw new Error("LOCAL_CODEX_HOST mu
 if (!Number.isSafeInteger(CALL_TIMEOUT_MS) || CALL_TIMEOUT_MS <= 0 || CALL_TIMEOUT_MS > 2147483647) {
   throw new Error("LOCAL_CODEX_CALL_TIMEOUT_MS must be a positive timer-safe integer");
 }
+if (!Number.isSafeInteger(MAX_CONCURRENCY) || MAX_CONCURRENCY < 1 || MAX_CONCURRENCY > 1024) {
+  throw new Error("LOCAL_CODEX_MAX_CONCURRENCY must be an integer between 1 and 1024");
+}
+if (!Number.isSafeInteger(MAX_QUEUE) || MAX_QUEUE < 0 || MAX_QUEUE > 100000) {
+  throw new Error("LOCAL_CODEX_MAX_QUEUE must be an integer between 0 and 100000");
+}
 
 if (!TOKEN_FILE) {
   throw new Error("LOCAL_CODEX_TOKEN_FILE is required");
@@ -85,7 +93,9 @@ const jobs = new Map();
 const requests = new Map();
 const waiters = new Map();
 const terminalStatuses = new Set(["completed", "failed", "cancelled", "timed_out", "interrupted"]);
-let activeJob = null;
+const activeJobs = new Map();
+const activeFolders = new Set();
+const jobQueue = [];
 let ready = false;
 let shuttingDown = false;
 let storageHealthy = true;
@@ -106,7 +116,7 @@ const tools = [
   {
     name: "codex",
     title: "Local Codex",
-    description: "Start a background Codex job in cwd, any existing absolute folder you choose. Choose networkAccess from the user's task intent, not only explicit wording: set true when completing the request requires outbound access such as git fetch, git pull, git clone, dependency or package installation, curl, HTTP/API access, or downloads, even if the user never mentions network access; omit or use false for fully local work. No directory allowlist or per-folder approval. Use codex-folders to locate the narrowest folder relevant to the user's task. Writes stay inside its canonical path. Returns jobId immediately; poll codex-status with waitMs=20000, never resubmit to check progress. Default Luna/max. One active job, no queue.",
+    description: "Start a background Codex job in cwd, any existing absolute folder you choose. Choose networkAccess from the user's task intent, not only explicit wording: set true when completing the request requires outbound access such as git fetch, git pull, git clone, dependency or package installation, curl, HTTP/API access, or downloads, even if the user never mentions network access; omit or use false for fully local work. No directory allowlist or per-folder approval. Use codex-folders to locate the narrowest folder relevant to the user's task. Writes stay inside its canonical path. Jobs in different canonical folders can run concurrently up to the configured limit; jobs for an already-active folder are serialized through the queue. Returns jobId immediately; poll codex-status with waitMs=20000, never resubmit to check progress. Default Luna/max.",
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -130,7 +140,7 @@ const tools = [
   {
     name: "codex-reply",
     title: "Local Codex Reply",
-    description: "Start a background reply on an adapter-owned thread, using its saved folder. Omit networkAccess to inherit: enabled stays enabled and disabled stays disabled. Set true when this reply newly requires outbound access such as git fetch, git pull, git clone, dependency or package installation, curl, HTTP/API access, or downloads, even if the user never mentions network access; set false when networking must be disabled again. Folder changes are not allowed; use codex for a new folder. Returns jobId; poll codex-status with waitMs=20000. Omitted model/reasoningEffort retain thread settings; overrides persist. Reuse requestId on retries.",
+    description: "Start a background reply on an adapter-owned thread, using its saved folder. Omit networkAccess to inherit: enabled stays enabled and disabled stays disabled. Set true when this reply newly requires outbound access such as git fetch, git pull, git clone, dependency or package installation, curl, HTTP/API access, or downloads, even if the user only implies it; set false when networking must be disabled again. Folder changes are not allowed; use codex for a new folder. Replies use the same per-folder serialization and bounded queue as new jobs. Returns jobId; poll codex-status with waitMs=20000. Omitted model/reasoningEffort retain thread settings; overrides persist. Reuse requestId on retries.",
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -153,7 +163,7 @@ const tools = [
   },
   {
     name: "codex-status", title: "Local Codex Job Status",
-    description: "Read a saved job, optionally waiting up to 20 seconds. Use waitMs=20000 while running. Returns the final answer on completed, or a safe error on failure. Never starts or retries work.",
+    description: "Read a saved job, optionally waiting up to 20 seconds. Use waitMs=20000 while queued or running. Returns the final answer on completed, or a safe error on failure. Never starts or retries work.",
     inputSchema: { type: "object", additionalProperties: false, properties: {
       jobId: { type: "string", minLength: 1, maxLength: 200 },
       waitMs: { type: "integer", minimum: 0, maximum: 20000, default: 0 },
@@ -163,7 +173,7 @@ const tools = [
   },
   {
     name: "codex-cancel", title: "Cancel Local Codex Job",
-    description: "Cancel a background job explicitly. Does not undo file changes. Poll codex-status until cancelled; cancelling an already terminal job returns its saved result.",
+    description: "Cancel a queued or running background job explicitly. Does not undo file changes. Poll codex-status until cancelled for running work; queued work cancels immediately. Cancelling an already terminal job returns its saved result.",
     inputSchema: { type: "object", additionalProperties: false, properties: {
       jobId: { type: "string", minLength: 1, maxLength: 200 },
     }, required: ["jobId"] },
@@ -192,8 +202,15 @@ const server = createServer(async (req, res) => {
     }
     if (req.method === "GET" && req.url === "/readyz") {
       const healthy = ready && storageHealthy && !shuttingDown;
-      return json(res, healthy ? 200 : 503, { status: healthy ? "ready" : "unavailable", scope: "per_job", version: VERSION, schemaFingerprint: SCHEMA_FINGERPRINT,
-        activeCalls: activeJob ? 1 : 0, queuedCalls: 0, activeJobId: activeJob?.jobId ?? null, activeCwd: activeJob?.cwd ?? null });
+      const active = [...activeJobs.values()];
+      return json(res, healthy ? 200 : 503, {
+        status: healthy ? "ready" : "unavailable", scope: "per_job", version: VERSION, schemaFingerprint: SCHEMA_FINGERPRINT,
+        activeCalls: active.length, queuedCalls: jobQueue.length,
+        activeJobId: active[0]?.jobId ?? null, activeCwd: active[0]?.cwd ?? null,
+        activeJobIds: active.map(job => job.jobId), activeCwds: active.map(job => job.cwd),
+        queuedJobIds: jobQueue.map(job => job.jobId), queuedCwds: jobQueue.map(job => job.cwd),
+        maxConcurrency: MAX_CONCURRENCY, maxQueue: MAX_QUEUE, scheduling: "fifo-runnable-per-folder",
+      });
     }
     if (req.url?.startsWith("/.well-known/")) {
       return json(res, 404, { error: "not found" });
@@ -321,27 +338,31 @@ async function callTool(message, signal) {
       }
       if (!storageHealthy) throw callError("storage_error", "Job storage unavailable; refusing new work");
       if (shuttingDown) throw callError("unavailable", "Adapter is shutting down; no work was started");
-      if (activeJob) return toolResult(message.id, {
-        status: "busy", activeJobId: activeJob.jobId,
-        message: "Another job is active. Poll codex-status for activeJobId; no work was queued.",
-      }, true);
       if (signal?.aborted) throw callError("request_cancelled", "Request disconnected before acceptance");
+      const startNow = canRunFolder(cwd);
+      if (!startNow && jobQueue.length >= MAX_QUEUE) {
+        throw callError("queue_full", `Local Codex queue is full (${MAX_QUEUE}); retry with the same requestId after another job finishes`);
+      }
       const job = {
         jobId: randomUUID(), requestKey: key, fingerprint, tool: name, cwd,
-        status: "starting", threadId: args.threadId ?? null, turnId: null,
+        status: startNow ? "starting" : "queued", threadId: args.threadId ?? null, turnId: null,
         model: null, reasoningEffort: null, networkAccess, settingsStatus: "pending",
         startedAt: Date.now(), updatedAt: Date.now(),
       };
-      // Synchronous durable acceptance is also the single-worker admission lock.
-      // Nothing is spawned until both the record and retry mapping are committed.
+      // Acceptance is durable before work is started or queued. Prompts stay
+      // only in memory; restart recovery marks queued/running work interrupted.
       persistJob(job);
       jobs.set(job.jobId, job);
       requests.set(key, job);
-      activeJob = job;
-      logCall("job_accepted", job);
       job.done = new Promise(resolve => { job.resolveDone = resolve; });
       job.waiting = new Set();
-      setImmediate(() => { void executeJob(job, args); });
+      job.runtimeArgs = args;
+      logCall("job_accepted", job);
+      if (startNow) activateJob(job, false);
+      else {
+        jobQueue.push(job);
+        logCall("job_queued", job);
+      }
       return toolResult(message.id, snapshot(job));
     }
     if (name === "codex-status" || name === "codex-cancel") {
@@ -370,6 +391,53 @@ async function callTool(message, signal) {
   }
 }
 
+function canRunFolder(cwd) {
+  return activeJobs.size < MAX_CONCURRENCY && !activeFolders.has(cwd);
+}
+
+function activateJob(job, updatePersistentStatus = true) {
+  if (shuttingDown || terminalStatuses.has(job.status) || job.stopReason) return;
+  if (!canRunFolder(job.cwd)) {
+    if (!jobQueue.includes(job)) jobQueue.push(job);
+    if (job.status !== "queued") {
+      job.status = "queued";
+      persistJob(job);
+      logCall("job_queued", job);
+    }
+    return;
+  }
+  if (updatePersistentStatus) {
+    job.status = "starting";
+    persistJob(job);
+  }
+  activeJobs.set(job.jobId, job);
+  activeFolders.add(job.cwd);
+  logCall("job_started", job);
+  setImmediate(() => { void executeJob(job, job.runtimeArgs); });
+}
+
+function scheduleJobs() {
+  if (shuttingDown || !storageHealthy) return;
+  while (activeJobs.size < MAX_CONCURRENCY) {
+    const index = jobQueue.findIndex(job => job.status === "queued" && !activeFolders.has(job.cwd));
+    if (index < 0) return;
+    const [job] = jobQueue.splice(index, 1);
+    if (terminalStatuses.has(job.status) || job.stopReason) continue;
+    try {
+      activateJob(job, true);
+    } catch (error) {
+      storageHealthy = false;
+      job.status = "failed";
+      job.errorCode = error.callCode || "storage_error";
+      job.message = safeError(error);
+      job.finishedAt = Date.now();
+      logCall("job_failed", job, job.errorCode);
+      settleJob(job);
+      return;
+    }
+  }
+}
+
 async function executeJob(job, args) {
   try {
     if (job.stopReason) throw callError(job.stopReason, "Job stopped before execution");
@@ -388,19 +456,41 @@ async function executeJob(job, args) {
     job.finishedAt = Date.now();
     try { persistJob(job); } catch { storageHealthy = false; }
     logCall(`job_${job.status}`, job, job.errorCode);
-    activeJob = null;
-    for (const finish of job.waiting) finish();
-    job.resolveDone();
+    activeJobs.delete(job.jobId);
+    activeFolders.delete(job.cwd);
+    settleJob(job);
+    scheduleJobs();
   }
 }
 
 function cancelJob(job, reason) {
   if (terminalStatuses.has(job.status) || job.stopReason) return;
+  if (job.status === "queued") {
+    job.stopReason = reason;
+    job.status = reason;
+    job.errorCode = reason;
+    job.message = reason === "cancelled" ? "Job cancelled before execution" : "Job interrupted before execution";
+    job.finishedAt = Date.now();
+    const index = jobQueue.indexOf(job);
+    if (index >= 0) jobQueue.splice(index, 1);
+    try { persistJob(job); }
+    finally {
+      logCall(`job_${job.status}`, job, job.errorCode);
+      settleJob(job);
+      scheduleJobs();
+    }
+    return;
+  }
   job.stopReason = reason;
   job.status = "cancelling";
   // Cancellation must still stop the child if the disk is full.
   try { persistJob(job); } finally { job.stop?.(reason); }
   logCall("job_cancelling", job);
+}
+
+function settleJob(job) {
+  for (const finish of job.waiting || []) finish();
+  job.resolveDone?.();
 }
 
 function snapshot(job) {
@@ -501,11 +591,14 @@ async function shutdown() {
   shuttingDown = true;
   const closed = new Promise(resolve => server.close(resolve));
   for (const group of waiters.values()) for (const waiter of group) waiter.abort();
-  const job = activeJob;
-  if (job) {
-    try { cancelJob(job, "interrupted"); } catch { /* stop is called even on storage failure */ }
-    await job.done;
+  for (const job of [...jobQueue]) {
+    try { cancelJob(job, "interrupted"); } catch { /* best effort; shutdown still proceeds */ }
   }
+  const active = [...activeJobs.values()];
+  for (const job of active) {
+    try { cancelJob(job, "interrupted"); } catch { /* stop is called even on storage failure */ }
+  }
+  await Promise.all(active.map(job => job.done));
   server.closeAllConnections();
   await closed;
   process.exit(storageHealthy ? 0 : 1);
@@ -814,7 +907,7 @@ function runCodex(args, existingThreadId, audit) {
       pending.clear();
       const resolveAfterExit = () => {
         clearTimeout(killTimer);
-        signalChild("SIGKILL"); // Remove any remaining children before admitting new work.
+        signalChild("SIGKILL"); // Remove any remaining children before releasing this folder lock.
         if (error) rejectPromise(error);
         else resolvePromise(value);
       };
@@ -996,7 +1089,7 @@ function resultSchema() {
     properties: {
       jobId: { type: "string" },
       cwd: { type: "string" },
-      status: { type: "string", enum: ["starting", "running", "cancelling", "completed", "failed", "cancelled", "timed_out", "interrupted", "busy", "error"] },
+      status: { type: "string", enum: ["queued", "starting", "running", "cancelling", "completed", "failed", "cancelled", "timed_out", "interrupted", "busy", "error"] },
       activeJobId: { type: "string" },
       threadId: { type: ["string", "null"] },
       turnId: { type: ["string", "null"] },

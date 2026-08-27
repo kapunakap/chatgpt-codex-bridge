@@ -26,8 +26,8 @@ Requests and adapter events appear here as ChatGPT uses Local Codex. See [Monito
 
 - `codex(requestId, cwd, prompt, networkAccess?, model?, reasoningEffort?)` starts a background job in any existing folder.
 - `codex-reply(requestId, threadId, prompt, networkAccess?, model?, reasoningEffort?)` starts a background reply on an adapter-owned thread.
-- `codex-status(jobId, waitMs?)` reads progress and the saved result. Use `waitMs: 20000` while running.
-- `codex-cancel(jobId)` explicitly stops work. It does not undo file changes.
+- `codex-status(jobId, waitMs?)` reads progress and the saved result. Use `waitMs: 20000` while queued or running.
+- `codex-cancel(jobId)` explicitly stops queued or running work. It does not undo file changes.
 - `codex-folders(path?, cursor?)` lists up to 100 child directory names per page. It defaults to your home directory and never reads file contents.
 
 ChatGPT chooses an existing absolute `cwd` for each new thread, with **no directory allowlist or per-folder approval**. It can use `codex-folders` to locate the narrowest folder relevant to your task. Symlinks resolve to their target; the canonical `cwd` is returned with the job and is its write boundary. Relative, missing, inaccessible, and file paths fail without starting work. Folder discovery includes directory symlinks but omits files and broken links; follow `nextCursor` with the same path to continue the alphabetical listing.
@@ -43,14 +43,16 @@ When `networkAccess: true`, Local Codex intentionally behaves like the user's no
 ### Background job flow (v2)
 
 1. Choose `cwd`, generate a unique `requestId`, and submit once. The response contains a `jobId` and canonical `cwd`, not the answer.
-2. Poll `codex-status` until `completed`, `failed`, `cancelled`, `timed_out`, or `interrupted`. Only `completed` contains a successful final answer.
+2. Poll `codex-status` until `completed`, `failed`, `cancelled`, `timed_out`, or `interrupted`. A job may report `queued` before it starts. Only `completed` contains a successful final answer.
 3. If submission delivery is uncertain, retry with the **same requestId and arguments**. This returns the same saved job. Reusing an ID with different arguments or a different canonical folder fails.
 
-There is one active job and **no waiting queue**. A `busy` response contains `activeJobId`; it does not accept or queue the new request. Status checks never start work. Closing a status request or its connection does not cancel an accepted job; use `codex-cancel` explicitly.
+Jobs targeting different canonical folders can run concurrently. `LOCAL_CODEX_MAX_CONCURRENCY` controls the global active-job limit and defaults to **4**. A canonical folder has at most one active job, so work targeting the same folder is serialized. When a job cannot start immediately, it is accepted into a bounded queue instead of returning `busy`; `LOCAL_CODEX_MAX_QUEUE` defaults to **100**. If the queue is full, the request returns `queue_full` without being accepted, so retry later with the same `requestId` and arguments.
 
-Jobs run independently of the tunnel's response deadline, with a 30-minute execution limit by default. Set `LOCAL_CODEX_CALL_TIMEOUT_MS` in the local config to change it. Cancellation first requests `turn/interrupt`, then terminates the job's process group if needed. A new job is not admitted until the old process has exited.
+The scheduling policy is **FIFO among runnable jobs**: the oldest queued job whose folder is not currently locked starts when capacity is available. A queued job blocked by its folder does not unnecessarily block older independent work behind it. `codex-status` and `codex-cancel` work for queued jobs; cancelling a queued job makes it `cancelled` without spawning Codex. `/readyz` reports active/queued counts, job IDs, folders, configured limits, and the scheduling policy.
 
-Job metadata and final results are saved atomically under `LOCAL_CODEX_JOBS_DIR` (default: `jobs` next to `threads.json`), using mode `0700` directories and `0600` files. Request IDs and input fingerprints are hashed; job files do not contain prompts or reasoning. Codex's own session history is separate and may contain the original input. Saved results are retained until explicitly removed. On adapter restart, unfinished jobs become `interrupted` and are never replayed; inspect their threads before starting replacement work.
+Jobs run independently of the tunnel's response deadline, with a 30-minute execution limit by default. Set `LOCAL_CODEX_CALL_TIMEOUT_MS` in the local config to change it. Queue wait time does not consume this execution limit. Cancellation first requests `turn/interrupt`, then terminates the job's process group if needed. A folder lock is not released until the old process has exited, so a same-folder successor cannot overlap it.
+
+Job metadata and final results are saved atomically under `LOCAL_CODEX_JOBS_DIR` (default: `jobs` next to `threads.json`), using mode `0700` directories and `0600` files. Request IDs and input fingerprints are hashed; job files do not contain prompts or reasoning. Codex's own session history is separate and may contain the original input. Saved results are retained until explicitly removed. On adapter restart, unfinished active **and queued** jobs become `interrupted` and are never replayed; inspect their threads before starting replacement work.
 
 ## Security boundary
 
@@ -184,6 +186,8 @@ v3.1 adds optional `networkAccess` to `codex` and `codex-reply`. Existing caller
 
 v3.1.1 clarifies the MCP contract so ChatGPT chooses `networkAccess` from the user's task intent. Runtime defaults and sandbox behavior are unchanged. Refresh Local Codex's tools and use a fresh conversation so ChatGPT receives the new descriptions.
 
+v3.2 adds concurrent jobs across different canonical folders, same-folder serialization, bounded queueing, and configurable concurrency/queue limits. Existing saved request fingerprints and completed results remain compatible. Restart recovery does not replay queued or active work; unfinished jobs become `interrupted`.
+
 The current `main` behavior additionally makes `networkAccess: true` terminal-like for host reads and developer authentication, while leaving network-disabled jobs hardened and keeping the tunnel's own runtime/control variables filtered.
 
 ### If ChatGPT reports missing `requestId` or `cwd`
@@ -194,7 +198,7 @@ The adapter's `/readyz` response includes the same fingerprint. Safe `schema_ser
 
 Treat a successful no-file-changes job submitted and polled from ChatGPT as the end-to-end check. A healthy local endpoint alone does not prove that ChatGPT has the updated tools.
 
-For an existing installation, stop new work and wait for the active job to finish. Back up the adapter, wrapper, launcher, config, token, tunnel profile, jobs, and thread history. Upgrade the adapter, wrapper, and launcher together; keep the existing private state and tunnel credentials. Ensure `LOCAL_CODEX_BIN` points to the installed wrapper and `LOCAL_CODEX_REAL_BIN` points to `codex`, then restart and refresh ChatGPT's tools.
+For an existing installation, stop new work and wait for active jobs to finish. Back up the adapter, wrapper, launcher, config, token, tunnel profile, jobs, and thread history. Upgrade the adapter, wrapper, and launcher together; keep the existing private state and tunnel credentials. Ensure `LOCAL_CODEX_BIN` points to the installed wrapper and `LOCAL_CODEX_REAL_BIN` points to `codex`, then restart and refresh ChatGPT's tools.
 
 ## Monitor from the Mac
 
@@ -234,7 +238,7 @@ npm run check
 LOCAL_CODEX_NATIVE_TEST=1 npm test
 ```
 
-Tests use fake Codex processes, temporary state, and loopback HTTP. They cover per-job folders, directory pagination, symlinks, legacy migration, replies after restart, retries, busy handling, cancellation, timeout, model and network settings, credential denies, wrapper environment filtering, trusted network developer-auth inheritance, permissions, and private logging. They do not require OpenAI or GitHub credentials.
+Tests use fake Codex processes, temporary state, and loopback HTTP. They cover per-job folders, concurrency, same-folder serialization, bounded queueing, queue cancellation/recovery, directory pagination, symlinks, legacy migration, replies after restart, retries, cancellation, timeout, model and network settings, credential denies, wrapper environment filtering, trusted network developer-auth inheritance, permissions, and private logging. They do not require OpenAI or GitHub credentials.
 
 ## License
 
