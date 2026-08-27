@@ -1,4 +1,4 @@
-# ChatGPT Local Codex Tunnel
+# ChatGPT Codex Bridge
 ## Overview
 ![ChatGPT.com → OpenAI Secure MCP Tunnel → Your laptop or server running Codex CLI](docs/chatgpt-local-codex-tunnel.svg)
 Run Codex on your Mac from ChatGPT through OpenAI Secure MCP Tunnel.
