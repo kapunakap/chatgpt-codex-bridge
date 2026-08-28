@@ -131,7 +131,8 @@ test("watch exposes sanitized approval details on d", async t => {
   assert.match(detailed, /DETAILS/);
   assert.match(detailed, /item\/commandExecution\/requestApproval/);
   assert.match(detailed, /request-1/);
-  assert.match(detailed, /availableDecisions/);
+  assert.match(detailed, /Decisions/);
+  assert.match(detailed, /acceptForSession/);
   child.stdin.write("q");
   await new Promise((resolve, reject) => { child.once("error", reject); child.once("exit", resolve); });
 });
