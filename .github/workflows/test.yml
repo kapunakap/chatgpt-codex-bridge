@@ -16,6 +16,12 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
+      - name: Capture adapter test source
+        uses: actions/upload-artifact@v4
+        with:
+          name: adapter-test-source
+          path: adapter.test.mjs
+          if-no-files-found: error
       - run: npm test
       - name: JavaScript syntax checks
         run: |
