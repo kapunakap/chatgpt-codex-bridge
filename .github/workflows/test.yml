@@ -20,6 +20,7 @@ jobs:
       - name: JavaScript syntax checks
         run: |
           node --check adapter.mjs
+          node --check browser-probe.mjs
           node --check bin/local-codex-secure.mjs
           node --check scripts/render-profile.mjs
 
@@ -34,6 +35,8 @@ jobs:
       - run: npm run check
       - name: Browser capability fail-closed test
         run: node --test adapter-browser.test.mjs
+      - name: Browser backend probe boundary tests
+        run: node --test browser-probe.test.mjs bin/local-codex-secure-probe.test.mjs
       - name: Fresh and legacy installer dry runs
         run: |
           key_file="$(mktemp)"

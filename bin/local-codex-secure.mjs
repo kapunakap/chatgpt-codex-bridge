@@ -12,6 +12,7 @@ import { fileURLToPath } from "node:url";
 import process from "node:process";
 
 const REAL_CODEX_BIN = process.env.LOCAL_CODEX_REAL_BIN || "codex";
+const PROBE_MODE = process.env.LOCAL_CODEX_PROBE_MODE || null;
 const STATE_FILE = process.env.LOCAL_CODEX_STATE_FILE ||
   resolve(homedir(), "Library/Application Support/local-codex-tunnel/threads.json");
 const LOG_FILE = process.env.LOCAL_CODEX_LOG_FILE ||
@@ -51,6 +52,23 @@ function permissionConfig(cwd, networkAccess, trustedHostAccess = false, protect
   return `permissions.local-codex-tunnel={description="Local Codex", workspace_roots={${JSON.stringify(cwd)}=true}, filesystem={${reads}, ":workspace_roots"={${workspace}}}, network={enabled=${networkAccess}}}`;
 }
 
+function probePermissionConfig(cwd, protectedControlDir = null) {
+  const denied = ["/Users", "/System/Volumes/Data/Users", "/Volumes", "/private/tmp", "/tmp", "/private/var/tmp", "/var/tmp", "/private/var/folders", "/var/folders"];
+  const inside = path => cwd === "/" || path === cwd || path.startsWith(`${cwd}/`);
+  const readRules = process.platform === "darwin"
+    ? ['":root"="read"', ...denied.filter(path => {
+      const canonical = path.replace(/^\/System\/Volumes\/Data(?=\/)/, "").replace(/^\/tmp$/, "/private/tmp").replace(/^\/var(?=\/)/, "/private/var");
+      return !inside(path) && !inside(canonical);
+    }).map(path => `${JSON.stringify(path)}="deny"`)]
+    : ['":minimal"="read"'];
+  if (protectedControlDir) readRules.push(`${JSON.stringify(protectedControlDir)}="deny"`);
+  const reads = readRules.join(", ");
+  const workspace = ['"."="read"', '".git"="read"', '".codex"="read"', '".env"="deny"', '".env.*"="deny"',
+    '"**/.env"="deny"', '"**/.env.*"="deny"', '"*.env"="deny"', '"**/*.env"="deny"',
+    '".npmrc"="deny"', '"**/.npmrc"="deny"', '".pypirc"="deny"', '"**/.pypirc"="deny"'].join(", ");
+  return `permissions.local-codex-tunnel={description="Local Codex Browser Probe", workspace_roots={${JSON.stringify(cwd)}=true}, filesystem={${reads}, ":workspace_roots"={${workspace}}}, network={enabled=false}}`;
+}
+
 const HARDENED_SHELL_ENV_CONFIGS = [
   'shell_environment_policy.inherit="core"',
   "shell_environment_policy.ignore_default_excludes=false",
@@ -67,6 +85,10 @@ const TRUSTED_SHELL_ENV_CONFIGS = [
   "shell_environment_policy.ignore_default_excludes=true",
   'shell_environment_policy.filters={"LOCAL_CODEX_*"="exclude","TUNNEL_CLIENT_*"="exclude"}',
 ];
+
+if (PROBE_MODE !== null && PROBE_MODE !== "browser-status") {
+  throw new Error("Unknown Local Codex probe mode");
+}
 
 const args = process.argv.slice(2);
 const permissionIndexes = [];
@@ -86,20 +108,28 @@ if (networkMatches.length !== 1) {
 }
 const networkAccess = networkMatches[0].includes("true");
 const cwd = realpathSync(process.cwd());
+if (PROBE_MODE && networkAccess) {
+  throw new Error("Local Codex probe mode cannot enable command network access");
+}
 // Validate only the adapter-owned input profile. The wrapper-owned CONTROL_DIR
 // deny and host capability gate are applied after this exact validation and
 // cannot be supplied, removed, or redirected by the caller.
-if (permission !== permissionConfig(cwd, networkAccess)) {
-  throw new Error("Local Codex permission profile does not match the hardened workspace policy");
+const expectedPermission = PROBE_MODE ? probePermissionConfig(cwd) : permissionConfig(cwd, networkAccess);
+if (permission !== expectedPermission) {
+  throw new Error(PROBE_MODE
+    ? "Local Codex probe profile does not match the read-only browser diagnostic policy"
+    : "Local Codex permission profile does not match the hardened workspace policy");
 }
 if (args.includes("--sandbox") || args.some(value => value.includes("sandbox_mode") || value.includes(":danger-full-access") || value.includes("dangerously_allow"))) {
   throw new Error("Unsafe Codex sandbox configuration is not allowed");
 }
 
 // Always replace the validated input profile with the effective profile that
-// denies host-authority state. This also prevents a broad cwd such as HOME from
-// turning Guard decision files into workspace-writable files.
-args[permissionIndex] = permissionConfig(cwd, networkAccess, networkAccess, CONTROL_DIR);
+// denies host-authority state. Probe mode additionally keeps the entire selected
+// workspace read-only, so App Server/plugin startup behavior cannot mutate it.
+args[permissionIndex] = PROBE_MODE
+  ? probePermissionConfig(cwd, CONTROL_DIR)
+  : permissionConfig(cwd, networkAccess, networkAccess, CONTROL_DIR);
 if (networkAccess) {
   for (const config of TRUSTED_SHELL_ENV_CONFIGS) args.push("-c", config);
 } else {
@@ -146,48 +176,64 @@ for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"]) {
   });
 }
 
-// The network-enabled profile exposes ordinary developer credentials to the
-// eventual Codex process, so the capability itself must be host-approved before
-// that process exists. The pending decision lives in CONTROL_DIR, which the
-// eventual sandbox explicitly denies, preventing self-approval.
-let sequenceOffset = 0;
-if (networkAccess) {
-  const decision = await waitForNetworkCapabilityApproval();
-  sequenceOffset = 2; // approval.requested + approval.resolved precede proxy events.
-  if (decision !== "accept" && decision !== "acceptForSession") {
-    process.exitCode = decision === "cancel" ? 130 : 77;
-  }
-}
-
-if (!process.exitCode) {
-  // The guard proxy is deliberately below the wrapper and above the real Codex
-  // app-server. It forces native Codex approval policy and holds command/file
-  // approval requests. The TUI is only a controller/view; enforcement continues
-  // if the TUI disconnects.
-  child = spawn(process.execPath, [
-    GUARD_PROXY,
-    "--real-bin", REAL_CODEX_BIN,
-    "--guard-dir", GUARD_DIR,
-    "--network-access", String(networkAccess),
-    "--sequence-offset", String(sequenceOffset),
-    "--",
-    ...args,
-  ], {
-    stdio: "inherit",
-    env: childEnv,
-  });
-
+// Probe mode never starts a Guard session or a Codex thread. It only exposes
+// the real App Server's stdio to the adapter under the validated read-only
+// profile. LOCAL_CODEX_* / TUNNEL_CLIENT_* are not passed to the child.
+if (PROBE_MODE) {
+  const command = REAL_CODEX_BIN.endsWith(".mjs") ? process.execPath : REAL_CODEX_BIN;
+  const commandArgs = REAL_CODEX_BIN.endsWith(".mjs") ? [REAL_CODEX_BIN, ...args] : args;
+  child = spawn(command, commandArgs, { stdio: "inherit", env: childEnv });
   child.on("error", error => {
-    process.stderr.write(`Unable to start guarded Codex: ${error.message}\n`);
+    process.stderr.write(`Unable to start Local Codex probe: ${error.message}\n`);
     process.exitCode = 1;
   });
   child.on("exit", (code, signal) => {
-    if (signal) {
-      process.exitCode = 1;
-      return;
-    }
-    process.exitCode = code ?? 1;
+    process.exitCode = signal ? 1 : (code ?? 1);
   });
+} else {
+  // The network-enabled profile exposes ordinary developer credentials to the
+  // eventual Codex process, so the capability itself must be host-approved before
+  // that process exists. The pending decision lives in CONTROL_DIR, which the
+  // eventual sandbox explicitly denies, preventing self-approval.
+  let sequenceOffset = 0;
+  if (networkAccess) {
+    const decision = await waitForNetworkCapabilityApproval();
+    sequenceOffset = 2; // approval.requested + approval.resolved precede proxy events.
+    if (decision !== "accept" && decision !== "acceptForSession") {
+      process.exitCode = decision === "cancel" ? 130 : 77;
+    }
+  }
+
+  if (!process.exitCode) {
+    // The guard proxy is deliberately below the wrapper and above the real Codex
+    // app-server. It forces native Codex approval policy and holds command/file
+    // approval requests. The TUI is only a controller/view; enforcement continues
+    // if the TUI disconnects.
+    child = spawn(process.execPath, [
+      GUARD_PROXY,
+      "--real-bin", REAL_CODEX_BIN,
+      "--guard-dir", GUARD_DIR,
+      "--network-access", String(networkAccess),
+      "--sequence-offset", String(sequenceOffset),
+      "--",
+      ...args,
+    ], {
+      stdio: "inherit",
+      env: childEnv,
+    });
+
+    child.on("error", error => {
+      process.stderr.write(`Unable to start guarded Codex: ${error.message}\n`);
+      process.exitCode = 1;
+    });
+    child.on("exit", (code, signal) => {
+      if (signal) {
+        process.exitCode = 1;
+        return;
+      }
+      process.exitCode = code ?? 1;
+    });
+  }
 }
 
 async function waitForNetworkCapabilityApproval() {

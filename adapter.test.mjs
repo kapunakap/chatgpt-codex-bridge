@@ -98,7 +98,10 @@ test("discovery, authentication, schemas, and validation", async t => {
   assert.equal(initialized.result.protocolVersion, "2025-11-25");
   assert.equal(initialized.result.serverInfo.version, "3.2.0");
   const listed = await f.rpc({ jsonrpc: "2.0", id: "l", method: "tools/list" });
-  assert.deepEqual(listed.result.tools.map(t => t.name), ["codex", "codex-reply", "codex-status", "codex-cancel", "codex-folders"]);
+  assert.deepEqual(listed.result.tools.map(t => t.name), ["codex", "codex-reply", "codex-status", "codex-cancel", "codex-browser-status", "codex-folders"]);
+  const browserStatus = listed.result.tools.find(t => t.name === "codex-browser-status");
+  assert.equal(browserStatus.annotations.readOnlyHint, true);
+  assert.deepEqual(browserStatus.inputSchema.required, ["cwd"]);
   assert.deepEqual(listed.result.tools[0].inputSchema.required, ["requestId", "cwd", "prompt"]);
   const codex = listed.result.tools[0];
   const reply = listed.result.tools[1];

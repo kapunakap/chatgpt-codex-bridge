@@ -8,6 +8,7 @@ import { mkdir, readFile, readdir, realpath, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, resolve } from "node:path";
 import process from "node:process";
+import { browserStatusTool, probeBrowserBackend } from "./browser-probe.mjs";
 
 // Only used to migrate pre-v3 records; never used as a new job's default.
 const legacyRootInput = process.env.LOCAL_CODEX_ROOT;
@@ -202,6 +203,7 @@ const tools = [
     outputSchema: resultSchema(),
     annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
   },
+  browserStatusTool,
   {
     name: "codex-folders", title: "Find Local Codex Folders",
     description: "List up to 100 child directory names, including directory symlinks, without reading file contents or starting work. Defaults to your home directory; pass an absolute path to browse elsewhere. Follow nextCursor with the same path for another page. Choose a task's folder automatically; no preapproved list is required.",
@@ -325,6 +327,11 @@ async function callTool(message, signal) {
   const name = message.params?.name;
   const args = message.params?.arguments || {};
   try {
+    if (name === "codex-browser-status") {
+      validateArguments(args, ["cwd"]);
+      const cwd = await canonicalDirectory(args.cwd, "cwd");
+      return toolResult(message.id, await probeBrowserBackend({ cwd, codexBin: CODEX_BIN, adapterVersion: VERSION, signal }));
+    }
     if (name === "codex-folders") {
       validateArguments(args, ["path", "cursor"]);
       return toolResult(message.id, await listFolders(args));
@@ -353,7 +360,7 @@ async function callTool(message, signal) {
       const browserAccess = args.browserAccess ?? (name === "codex-reply" ? threadBrowserAccess.get(args.threadId) : false) ?? false;
       if (browserAccess && process.platform === "darwin") {
         throw callError("browser_access_unavailable",
-          "browserAccess is not safely available on macOS with current upstream Codex. Chromium/Playwright requires global Mach port permissions that the scoped Codex permission profile cannot grant. No job was started and the sandbox was not weakened. Use a browser-capable Linux/Docker environment until upstream Codex adds scoped browser support.");
+          "browserAccess is not safely available on macOS with current upstream Codex. Chromium/Playwright requires global Mach port permissions that the scoped Codex permission profile cannot grant. No job was started and the sandbox was not weakened. Use codex-browser-status to check whether the official Codex Browser Use backend is available on this host, or use a browser-capable Linux/Docker environment.");
       }
       const key = digest(args.requestId);
       const fingerprintInput = [cwd, name, args.prompt, args.threadId ?? null,
