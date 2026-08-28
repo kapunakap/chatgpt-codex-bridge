@@ -1,0 +1,26 @@
+#!/bin/zsh
+set -euo pipefail
+
+readonly USER_HOME="${HOME}"
+readonly CONFIG_FILE="${LOCAL_CODEX_CONFIG_FILE:-${USER_HOME}/Library/Application Support/local-codex-tunnel/config.env}"
+readonly WATCH_BIN="${USER_HOME}/.local/libexec/local-codex-tunnel/local-codex-watch.mjs"
+
+if [[ ! -r "${CONFIG_FILE}" ]]; then
+  print -u2 "Local Codex configuration is missing: ${CONFIG_FILE}"
+  print -u2 "Run scripts/install.sh first."
+  exit 1
+fi
+if [[ ! -r "${WATCH_BIN}" ]]; then
+  print -u2 "Local Codex watch is not installed: ${WATCH_BIN}"
+  exit 1
+fi
+source "${CONFIG_FILE}"
+: "${LOCAL_CODEX_TOKEN_FILE:?LOCAL_CODEX_TOKEN_FILE is missing from ${CONFIG_FILE}}"
+: "${LOCAL_CODEX_STATE_FILE:?LOCAL_CODEX_STATE_FILE is missing from ${CONFIG_FILE}}"
+
+LOCAL_CODEX_TOKEN_FILE="${LOCAL_CODEX_TOKEN_FILE}" \
+LOCAL_CODEX_STATE_FILE="${LOCAL_CODEX_STATE_FILE}" \
+LOCAL_CODEX_JOBS_DIR="${LOCAL_CODEX_JOBS_DIR:-${LOCAL_CODEX_STATE_FILE:h}/jobs}" \
+LOCAL_CODEX_HOST="${LOCAL_CODEX_HOST:-127.0.0.1}" \
+LOCAL_CODEX_PORT="${LOCAL_CODEX_PORT:-8765}" \
+exec node "${WATCH_BIN}"
