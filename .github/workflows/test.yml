@@ -32,6 +32,8 @@ jobs:
         with:
           node-version: 22
       - run: npm run check
+      - name: Browser capability fail-closed test
+        run: node --test adapter-browser.test.mjs
       - name: Fresh and legacy installer dry runs
         run: |
           key_file="$(mktemp)"
