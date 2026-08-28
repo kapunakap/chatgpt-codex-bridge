@@ -75,6 +75,9 @@ codexOutput.on("line", line => {
   let message;
   try { message = JSON.parse(line); }
   catch { process.stdout.write(`${line}\n`); return; }
+  // This method is reserved for proxy -> adapter observability. Never allow a
+  // child app-server to spoof one of these notifications.
+  if (message?.method === "localCodex/visibleEvent") return;
   if (isApprovalRequest(message)) {
     holdApproval(message);
     return;
@@ -256,6 +259,12 @@ function emit(type, data) {
   };
   try { appendFileSync(eventsFile, `${JSON.stringify(event)}\n`, { mode: 0o600 }); }
   catch { /* monitoring must never widen or break the execution boundary */ }
+  // Mirror the exact same sanitized public event into the app-server stream.
+  // The adapter reserves this notification and can expose it incrementally to
+  // ChatGPT without independently parsing raw logs or private reasoning.
+  try {
+    process.stdout.write(`${JSON.stringify({ method: "localCodex/visibleEvent", params: { event } })}\n`);
+  } catch { /* the local JSONL stream remains authoritative for the host TUI */ }
 }
 
 function persistSession() {
