@@ -47,6 +47,23 @@ Reasoning events and reasoning/encrypted fields are explicitly excluded from the
 
 Guard state directories and files are created with user-only permissions (directories `0700`, files `0600`).
 
+The proxy also mirrors that **same sanitized event object** into a reserved local app-server notification. The adapter associates it with the current job, filters it again, and persists a job-indexed mirror under `job-events/`. It does not independently parse raw Codex logs.
+
+## Incremental events from ChatGPT
+
+`codex-status` can now be used for either ordinary completion polling or incremental visible activity.
+
+For incremental mode:
+
+1. Call `codex-status` with `afterEventSeq: 0` and normally `waitMs: 20000`.
+2. The call returns when a new visible event arrives, the job becomes terminal, or the wait expires.
+3. Read `events` and save `nextEventSeq`.
+4. Pass that value back as `afterEventSeq` on the next call.
+
+`eventLimit` defaults to 50 and is bounded to 100. `eventsDone: true` means the job is terminal and the returned cursor has consumed every saved visible event.
+
+This keeps the normal Local Codex background-job contract: ChatGPT starts work once, then polls the same job ID. It no longer has to wait for the final answer to understand visible progress.
+
 ## Current security scope
 
 This first Guard slice uses Codex's native `untrusted` approval policy, so commands that Codex classifies as requiring user approval are physically held before execution. Workspace writes still follow the existing bridge permission profile.
