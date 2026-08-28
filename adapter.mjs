@@ -20,6 +20,7 @@ const STATE_FILE = process.env.LOCAL_CODEX_STATE_FILE ||
 const LOG_FILE = process.env.LOCAL_CODEX_LOG_FILE ||
   resolve(homedir(), "Library/Application Support/tunnel-client/logs/local-codex.log");
 const JOBS_DIR = process.env.LOCAL_CODEX_JOBS_DIR || resolve(dirname(STATE_FILE), "jobs");
+const JOB_EVENTS_DIR = process.env.LOCAL_CODEX_JOB_EVENTS_DIR || resolve(dirname(STATE_FILE), "job-events");
 const VERSION = "3.2.0";
 const DEFAULT_SETTINGS = { model: "gpt-5.6-luna", reasoningEffort: "max" };
 const MODEL_ALIASES = new Map([
@@ -39,6 +40,12 @@ const MAX_BODY = 1024 * 1024;
 const CALL_TIMEOUT_MS = Number(process.env.LOCAL_CODEX_CALL_TIMEOUT_MS || "1800000");
 const MAX_CONCURRENCY = Number(process.env.LOCAL_CODEX_MAX_CONCURRENCY || "4");
 const MAX_QUEUE = Number(process.env.LOCAL_CODEX_MAX_QUEUE || "100");
+const VISIBLE_EVENT_TYPES = new Set([
+  "session.started", "session.error", "session.ended",
+  "chatgpt.prompt", "thread.started", "turn.requested", "turn.started", "turn.completed", "turn.interrupt_requested",
+  "settings.updated", "assistant.delta", "item.started", "item.completed",
+  "approval.requested", "approval.resolved", "approval.server_resolved",
+]);
 function permissionConfig(cwd, networkAccess) {
   // Codex 0.147's macOS :minimal preset includes unconditional temp writes.
   // Use system reads without that preset; keep other user/data/temp trees
@@ -88,6 +95,7 @@ let threadState = {};
 await mkdir(dirname(LOG_FILE), { recursive: true, mode: 0o700 });
 appendFileSync(LOG_FILE, "", { mode: 0o600 });
 await mkdir(JOBS_DIR, { recursive: true, mode: 0o700 });
+await mkdir(JOB_EVENTS_DIR, { recursive: true, mode: 0o700 });
 await mkdir(dirname(STATE_FILE), { recursive: true, mode: 0o700 });
 const jobs = new Map();
 const requests = new Map();
@@ -163,10 +171,12 @@ const tools = [
   },
   {
     name: "codex-status", title: "Local Codex Job Status",
-    description: "Read a saved job, optionally waiting up to 20 seconds. Use waitMs=20000 while queued or running. Returns the final answer on completed, or a safe error on failure. Never starts or retries work.",
+    description: "Read a saved job. For normal completion polling, optionally wait up to 20 seconds with waitMs=20000. For incremental visible activity, start with afterEventSeq=0 and waitMs=20000; the call returns as soon as a new event arrives or the job becomes terminal. Pass nextEventSeq back as afterEventSeq on the next poll. Events include externally visible prompts/messages/commands/results/approval state and never hidden reasoning.",
     inputSchema: { type: "object", additionalProperties: false, properties: {
       jobId: { type: "string", minLength: 1, maxLength: 200 },
       waitMs: { type: "integer", minimum: 0, maximum: 20000, default: 0 },
+      afterEventSeq: { type: "integer", minimum: 0, description: "Incremental event cursor. Start at 0, then reuse nextEventSeq." },
+      eventLimit: { type: "integer", minimum: 1, maximum: 100, default: 50 },
     }, required: ["jobId"] },
     outputSchema: resultSchema(),
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
@@ -347,7 +357,7 @@ async function callTool(message, signal) {
         jobId: randomUUID(), requestKey: key, fingerprint, tool: name, cwd,
         status: startNow ? "starting" : "queued", threadId: args.threadId ?? null, turnId: null,
         model: null, reasoningEffort: null, networkAccess, settingsStatus: "pending",
-        startedAt: Date.now(), updatedAt: Date.now(),
+        startedAt: Date.now(), updatedAt: Date.now(), eventSeq: 0,
       };
       // Acceptance is durable before work is started or queued. Prompts stay
       // only in memory; restart recovery marks queued/running work interrupted.
@@ -356,6 +366,7 @@ async function callTool(message, signal) {
       requests.set(key, job);
       job.done = new Promise(resolve => { job.resolveDone = resolve; });
       job.waiting = new Set();
+      job.eventWaiting = new Set();
       job.runtimeArgs = args;
       logCall("job_accepted", job);
       if (startNow) activateJob(job, false);
@@ -366,19 +377,32 @@ async function callTool(message, signal) {
       return toolResult(message.id, snapshot(job));
     }
     if (name === "codex-status" || name === "codex-cancel") {
-      validateArguments(args, name === "codex-status" ? ["jobId", "waitMs"] : ["jobId"]);
+      validateArguments(args, name === "codex-status" ? ["jobId", "waitMs", "afterEventSeq", "eventLimit"] : ["jobId"]);
       assertIdentifier(args.jobId, "jobId");
       const job = jobs.get(args.jobId);
       if (!job) throw callError("unknown_job", "Unknown jobId; no work was started");
       if (name === "codex-cancel") {
         cancelJob(job, "cancelled");
-      } else {
-        const waitMs = args.waitMs ?? 0;
-        if (!Number.isInteger(waitMs) || waitMs < 0 || waitMs > 20000) {
-          throw callError("invalid_wait", "waitMs must be an integer between 0 and 20000");
-        }
-        await waitForJob(job, waitMs, message.id, signal);
+        return toolResult(message.id, snapshot(job));
       }
+      const waitMs = args.waitMs ?? 0;
+      if (!Number.isInteger(waitMs) || waitMs < 0 || waitMs > 20000) {
+        throw callError("invalid_wait", "waitMs must be an integer between 0 and 20000");
+      }
+      const wantsEvents = args.afterEventSeq !== undefined || args.eventLimit !== undefined;
+      if (wantsEvents) {
+        const afterEventSeq = args.afterEventSeq ?? 0;
+        const eventLimit = args.eventLimit ?? 50;
+        if (!Number.isSafeInteger(afterEventSeq) || afterEventSeq < 0) {
+          throw callError("invalid_event_cursor", "afterEventSeq must be a non-negative integer");
+        }
+        if (!Number.isInteger(eventLimit) || eventLimit < 1 || eventLimit > 100) {
+          throw callError("invalid_event_limit", "eventLimit must be an integer between 1 and 100");
+        }
+        await waitForJobEvents(job, afterEventSeq, waitMs, message.id, signal);
+        return toolResult(message.id, { ...snapshot(job), ...(await eventSnapshot(job, afterEventSeq, eventLimit)) });
+      }
+      await waitForJob(job, waitMs, message.id, signal);
       return toolResult(message.id, snapshot(job));
     }
     return rpcError(message.id, -32602, "unknown tool");
@@ -490,6 +514,7 @@ function cancelJob(job, reason) {
 
 function settleJob(job) {
   for (const finish of job.waiting || []) finish();
+  for (const finish of job.eventWaiting || []) finish();
   job.resolveDone?.();
 }
 
@@ -550,6 +575,8 @@ async function loadJobs() {
     if (job.threadId && threadFolders.has(job.threadId) && threadFolders.get(job.threadId) !== job.cwd) {
       throw new Error("Job and thread folder mismatch");
     }
+    job.eventSeq = await loadEventSeq(job.jobId);
+    job.eventWaiting = new Set();
     if (!terminalStatuses.has(job.status)) {
       job.status = "interrupted";
       job.errorCode = "adapter_restarted";
@@ -583,6 +610,31 @@ function waitForJob(job, waitMs, id, signal) {
     controller.signal.addEventListener("abort", finish, { once: true });
     signal?.addEventListener("abort", finish, { once: true });
     job.waiting?.add(finish);
+  });
+}
+
+function waitForJobEvents(job, afterEventSeq, waitMs, id, signal) {
+  if (!waitMs || (job.eventSeq ?? 0) > afterEventSeq || terminalStatuses.has(job.status) || signal?.aborted) return;
+  const controller = new AbortController();
+  const key = rpcKey(id);
+  const group = waiters.get(key) || new Set();
+  waiters.set(key, group);
+  group.add(controller);
+  job.eventWaiting ??= new Set();
+  return new Promise(resolve => {
+    const finish = () => {
+      clearTimeout(timer);
+      controller.signal.removeEventListener("abort", finish);
+      signal?.removeEventListener("abort", finish);
+      group.delete(controller);
+      if (!group.size) waiters.delete(key);
+      job.eventWaiting?.delete(finish);
+      resolve();
+    };
+    const timer = setTimeout(finish, waitMs);
+    controller.signal.addEventListener("abort", finish, { once: true });
+    signal?.addEventListener("abort", finish, { once: true });
+    job.eventWaiting.add(finish);
   });
 }
 
@@ -795,6 +847,10 @@ function runCodex(args, existingThreadId, audit) {
 
     function onMessage(message) {
       if (settled) return;
+      if (message?.method === "localCodex/visibleEvent") {
+        recordBridgeEvent(audit, message.params?.event);
+        return;
+      }
       if (message.id !== undefined && pending.has(String(message.id))) {
         const entry = pending.get(String(message.id));
         pending.delete(String(message.id));
@@ -938,6 +994,76 @@ function runCodex(args, existingThreadId, audit) {
       }
     }
   });
+}
+
+function recordBridgeEvent(job, event) {
+  if (!event || typeof event !== "object") return;
+  const seq = event.seq;
+  const type = typeof event.type === "string" ? event.type : "";
+  if (!Number.isSafeInteger(seq) || seq < 1 || seq <= (job.eventSeq ?? 0) || !VISIBLE_EVENT_TYPES.has(type)) return;
+  const record = {
+    seq,
+    time: typeof event.time === "string" ? event.time.slice(0, 100) : new Date().toISOString(),
+    type,
+    data: sanitizeEventValue(event.data),
+  };
+  try {
+    appendFileSync(resolve(JOB_EVENTS_DIR, `${job.jobId}.jsonl`), `${JSON.stringify(record)}\n`, { mode: 0o600 });
+    job.eventSeq = seq;
+    for (const finish of [...(job.eventWaiting || [])]) finish();
+  } catch {
+    process.stderr.write("local-codex-adapter job event log unavailable\n");
+  }
+}
+
+function sanitizeEventValue(value, depth = 0) {
+  if (depth > 8) return "[TRUNCATED]";
+  if (typeof value === "string") return value.replaceAll("\0", "").slice(0, 65536);
+  if (typeof value === "number" || typeof value === "boolean" || value === null) return value;
+  if (Array.isArray(value)) return value.slice(0, 200).map(item => sanitizeEventValue(item, depth + 1));
+  if (!value || typeof value !== "object") return null;
+  const out = {};
+  for (const [key, item] of Object.entries(value)) {
+    if (/reasoning|encrypted/i.test(key)) continue;
+    out[key] = sanitizeEventValue(item, depth + 1);
+  }
+  return out;
+}
+
+async function readEventRecords(jobId) {
+  let text;
+  try { text = await readFile(resolve(JOB_EVENTS_DIR, `${jobId}.jsonl`), "utf8"); }
+  catch (error) {
+    if (error?.code === "ENOENT") return [];
+    throw callError("event_storage_error", "Unable to read saved job events");
+  }
+  const events = [];
+  for (const line of text.split("\n")) {
+    if (!line.trim()) continue;
+    try {
+      const event = JSON.parse(line);
+      if (!Number.isSafeInteger(event.seq) || event.seq < 1 || typeof event.type !== "string" ||
+          !VISIBLE_EVENT_TYPES.has(event.type) || !event.time) continue;
+      events.push({ seq: event.seq, time: String(event.time).slice(0, 100), type: event.type, data: sanitizeEventValue(event.data) });
+    } catch { /* ignore an incomplete/truncated last line rather than losing prior events */ }
+  }
+  return events.sort((a, b) => a.seq - b.seq);
+}
+
+async function loadEventSeq(jobId) {
+  const events = await readEventRecords(jobId);
+  return events.at(-1)?.seq ?? 0;
+}
+
+async function eventSnapshot(job, afterEventSeq, eventLimit) {
+  const records = await readEventRecords(job.jobId);
+  const events = records.filter(event => event.seq > afterEventSeq).slice(0, eventLimit);
+  const nextEventSeq = events.at(-1)?.seq ?? afterEventSeq;
+  return {
+    events,
+    nextEventSeq,
+    eventsDone: terminalStatuses.has(job.status) && nextEventSeq >= (job.eventSeq ?? 0),
+  };
 }
 
 function threadParams(cwd, networkAccess, threadId, settings) {
@@ -1101,6 +1227,18 @@ function resultSchema() {
       finishedAt: { type: "number" },
       elapsedMs: { type: "number" },
       content: { type: "string" },
+      events: {
+        type: "array", maxItems: 100,
+        items: {
+          type: "object", additionalProperties: false,
+          properties: {
+            seq: { type: "integer" }, time: { type: "string" }, type: { type: "string" }, data: { type: ["object", "null"] },
+          },
+          required: ["seq", "time", "type", "data"],
+        },
+      },
+      nextEventSeq: { type: "integer" },
+      eventsDone: { type: "boolean" },
       errorCode: { type: "string" },
       message: { type: "string" },
       adapterVersion: { type: "string" },
