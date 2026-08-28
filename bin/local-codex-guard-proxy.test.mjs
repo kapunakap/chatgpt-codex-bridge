@@ -35,6 +35,13 @@ test("guard proxy forces native approvals, hides reasoning, and blocks until hos
   assert.ok(pendingName, "approval should remain pending without a host decision");
   assert.equal(output.some(message => message.method === "item/commandExecution/requestApproval"), false, "adapter must not receive the held approval request");
 
+  const bridgeEvents = output
+    .filter(message => message.method === "localCodex/visibleEvent")
+    .map(message => message.params.event);
+  assert.ok(bridgeEvents.some(event => event.type === "chatgpt.prompt"));
+  assert.ok(bridgeEvents.some(event => event.type === "approval.requested"));
+  assert.doesNotMatch(JSON.stringify(bridgeEvents), /PRIVATE_REASONING/);
+
   const traceMessages = (await readFile(trace, "utf8")).trim().split("\n").map(JSON.parse);
   const turn = traceMessages.find(message => message.method === "turn/start");
   assert.equal(turn.params.approvalPolicy, "untrusted");
