@@ -12,13 +12,15 @@ import readline from "node:readline";
 
 const argv = process.argv.slice(2);
 const separator = argv.indexOf("--");
-if (separator < 0) fail("usage: local-codex-guard-proxy --real-bin PATH --guard-dir DIR --network-access true|false -- ARGS...");
+if (separator < 0) fail("usage: local-codex-guard-proxy --real-bin PATH --guard-dir DIR --network-access true|false [--sequence-offset N] -- ARGS...");
 const options = parseOptions(argv.slice(0, separator));
 const childArgs = argv.slice(separator + 1);
 const realBin = options.get("real-bin");
 const guardDir = options.get("guard-dir");
 const networkAccess = options.get("network-access") === "true";
-if (!realBin || !guardDir || !options.has("network-access")) fail("missing proxy configuration");
+const sequenceOffset = Number(options.get("sequence-offset") || "0");
+if (!realBin || !guardDir || !options.has("network-access") ||
+    !Number.isSafeInteger(sequenceOffset) || sequenceOffset < 0) fail("missing or invalid proxy configuration");
 
 const cwd = realpathSync(process.cwd());
 const sessionId = randomUUID();
@@ -28,7 +30,7 @@ const approvalsDir = join(guardDir, "approvals");
 for (const dir of [guardDir, sessionsDir, eventsDir, approvalsDir]) mkdirSync(dir, { recursive: true, mode: 0o700 });
 const sessionFile = join(sessionsDir, `${sessionId}.json`);
 const eventsFile = join(eventsDir, `${sessionId}.jsonl`);
-let sequence = 0;
+let sequence = sequenceOffset;
 let session = {
   sessionId, pid: process.pid, cwd, networkAccess, startedAt: Date.now(), updatedAt: Date.now(),
   status: "starting", threadId: null, turnId: null, realBin: basename(realBin),
