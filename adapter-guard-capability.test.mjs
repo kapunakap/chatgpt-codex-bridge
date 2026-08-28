@@ -19,9 +19,14 @@ async function setup(t) {
   const stateFile = join(root, "control", "threads.json");
   const jobsDir = join(root, "control", "jobs");
   const approvalsDir = join(root, "control", "guard", "approvals");
+  const wrapperLauncher = join(root, "secure-wrapper");
   const port = 20000 + Math.floor(Math.random() * 30000);
   await mkdir(jobsDir, { recursive: true, mode: 0o700 });
   await writeFile(tokenFile, "Bearer test-secret\n", { mode: 0o600 });
+  // adapter spawns LOCAL_CODEX_BIN directly, while the installed secure wrapper
+  // is executable. Repository .mjs files need not retain an executable bit on
+  // every checkout, so mirror the installed contract with a tiny executable shim.
+  await writeFile(wrapperLauncher, `#!/usr/bin/env node\nawait import(${JSON.stringify(wrapper)});\n`, { mode: 0o700 });
   const env = {
     ...process.env,
     LOCAL_CODEX_ROOT: root,
@@ -32,7 +37,7 @@ async function setup(t) {
     LOCAL_CODEX_LOG_FILE: join(root, "audit.log"),
     LOCAL_CODEX_JOBS_DIR: jobsDir,
     LOCAL_CODEX_JOB_EVENTS_DIR: join(root, "control", "job-events"),
-    LOCAL_CODEX_BIN: wrapper,
+    LOCAL_CODEX_BIN: wrapperLauncher,
     LOCAL_CODEX_REAL_BIN: realAppServer,
     LOCAL_CODEX_CALL_TIMEOUT_MS: "10000",
   };
