@@ -26,12 +26,20 @@ Controls:
 ```text
 ↑↓ / j k   select job
 Tab        Conversation / Events / Raw log
+f          toggle live follow / freeze current event cursor
+/          search the selected job's visible event stream
+l          expand/collapse long command output
+d          toggle sanitized approval details/raw context
 a          approve once
-A          approve for the current Codex session
+A          approve for the current Codex session/job
 r          reject
 x          cancel the selected Local Codex job
 q          quit
 ```
+
+Long command output is collapsed by default so the conversation stays readable; `l` expands it. Search applies to the same sanitized visible event stream used by the three views. Follow mode is on by default; turning it off freezes the current event sequence while new events continue to be recorded.
+
+The approval view shows the exact action and reason plus the effective security context that can be inferred safely at the host boundary: network state/delta, possible remote write, host credential availability, workspace writes, external target, and any additional permissions supplied by Codex. `d` reveals the full sanitized native approval request for inspection.
 
 ## Observable event boundary
 
