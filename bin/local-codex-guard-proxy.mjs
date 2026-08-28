@@ -170,7 +170,13 @@ function observeServerMessage(message) {
   }
   if (method === "item/started" || method === "item/completed") {
     const item = sanitizeVisibleItem(params.item);
-    if (item) emit(method === "item/started" ? "item.started" : "item.completed", { item });
+    if (item) {
+      emit(method === "item/started" ? "item.started" : "item.completed", { item });
+      if (method === "item/completed") {
+        const browserFailure = browserEnvironmentFailure(item);
+        if (browserFailure) emit("browser.environment_blocked", browserFailure);
+      }
+    }
     return;
   }
   if (method === "serverRequest/resolved") {
@@ -234,6 +240,27 @@ function sanitizeVisibleItem(item) {
   const type = String(item.type || "");
   if (/reasoning/i.test(type)) return null;
   return sanitize(item);
+}
+
+function browserEnvironmentFailure(item) {
+  if (!/commandExecution/i.test(String(item?.type || ""))) return null;
+  const output = [
+    item.aggregatedOutput,
+    item.output,
+    item.stdout,
+    item.stderr,
+    item.error?.message,
+  ].filter(value => typeof value === "string").join("\n");
+  if (!/MachPortRendezvousServer/i.test(output)) return null;
+  const permissionDenied = /Permission denied\s*\(1100\)/i.test(output) ||
+    (/bootstrap_check_in/i.test(output) && /Permission denied/i.test(output));
+  const cleanupDenied = /kill\s+EPERM/i.test(output);
+  if (!permissionDenied && !cleanupDenied) return null;
+  return {
+    errorCode: "browser_sandbox_blocked",
+    signature: "chromium_mach_port_rendezvous",
+    message: "Chromium/Playwright was blocked by the macOS Codex sandbox before reliable browser assertions could run. This is execution-environment failure evidence, not an application/E2E assertion failure.",
+  };
 }
 
 function sanitize(value, depth = 0) {
