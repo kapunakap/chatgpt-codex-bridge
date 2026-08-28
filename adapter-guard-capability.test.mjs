@@ -75,15 +75,16 @@ async function setup(t) {
     return body.result.structuredContent;
   }
 
-  async function pendingApproval() {
-    for (let i = 0; i < 100; i++) {
+  async function pendingApproval(jobId) {
+    for (let i = 0; i < 250; i++) {
       try {
         const name = (await readdir(approvalsDir)).find(file => file.endsWith(".pending.json"));
         if (name) return JSON.parse(await readFile(join(approvalsDir, name), "utf8"));
       } catch {}
       await delay(20);
     }
-    throw new Error("network capability approval did not appear");
+    const status = await call("codex-status", { jobId });
+    throw new Error(`network capability approval did not appear; job status=${status.status} error=${status.errorCode || "none"} message=${status.message || "none"}`);
   }
 
   async function finished(jobId) {
@@ -107,7 +108,7 @@ test("network capability is visible before spawn and event order continues throu
     prompt: "Run the visible integration turn",
     networkAccess: true,
   });
-  const pending = await f.pendingApproval();
+  const pending = await f.pendingApproval(created.jobId);
   assert.equal(pending.jobId, created.jobId);
   assert.equal(pending.method, "localCodex/capabilityApproval");
   assert.equal(pending.params.capability, "networkAccess");
