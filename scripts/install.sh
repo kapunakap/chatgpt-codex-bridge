@@ -2,14 +2,14 @@
 set -euo pipefail
 
 usage() {
-  cat <<'EOF'
+  cat <<'USAGE'
 Usage:
   scripts/install.sh \
     [--root /absolute/path/to/legacy/repository] \
     --tunnel-id tunnel_... \
     --runtime-api-key-file /absolute/path/to/runtime-api-key \
     [--dry-run]
-EOF
+USAGE
 }
 
 typeset target_root=""
@@ -81,7 +81,10 @@ readonly TUNNEL_STATE_DIR="${USER_HOME}/Library/Application Support/tunnel-clien
 readonly PROFILE_DIR="${USER_HOME}/.config/tunnel-client"
 readonly ADAPTER_PATH="${LIBEXEC_DIR}/adapter.mjs"
 readonly CODEX_WRAPPER_PATH="${LIBEXEC_DIR}/codex-secure.mjs"
+readonly GUARD_PROXY_PATH="${LIBEXEC_DIR}/local-codex-guard-proxy.mjs"
+readonly WATCH_NODE_PATH="${LIBEXEC_DIR}/local-codex-watch.mjs"
 readonly LAUNCHER_PATH="${BIN_DIR}/local-codex-tunnel"
+readonly WATCH_PATH="${BIN_DIR}/local-codex-watch"
 readonly TOKEN_FILE="${STATE_DIR}/adapter-token"
 readonly THREADS_FILE="${STATE_DIR}/threads.json"
 readonly CONFIG_FILE="${STATE_DIR}/config.env"
@@ -94,7 +97,9 @@ if [[ "${dry_run}" == "true" ]]; then
   print "scope=per_job"
   print "legacy_root=${TARGET_ROOT}"
   print "launcher=${LAUNCHER_PATH}"
+  print "watch=${WATCH_PATH}"
   print "codex_wrapper=${CODEX_WRAPPER_PATH}"
+  print "guard_proxy=${GUARD_PROXY_PATH}"
   print "profile=${PROFILE_FILE}"
   exit 0
 fi
@@ -117,7 +122,10 @@ mkdir -p "${TUNNEL_STATE_DIR}/health" "${TUNNEL_STATE_DIR}/logs"
 install -d -m 700 "${STATE_DIR}"
 install -m 755 "${SOURCE_ROOT}/adapter.mjs" "${ADAPTER_PATH}"
 install -m 755 "${SOURCE_ROOT}/bin/local-codex-secure.mjs" "${CODEX_WRAPPER_PATH}"
+install -m 755 "${SOURCE_ROOT}/bin/local-codex-guard-proxy.mjs" "${GUARD_PROXY_PATH}"
+install -m 755 "${SOURCE_ROOT}/bin/local-codex-watch.mjs" "${WATCH_NODE_PATH}"
 install -m 755 "${SOURCE_ROOT}/bin/local-codex-tunnel" "${LAUNCHER_PATH}"
+install -m 755 "${SOURCE_ROOT}/bin/local-codex-watch" "${WATCH_PATH}"
 
 if [[ ! -s "${TOKEN_FILE}" ]]; then
   token_tmp=$(mktemp "${STATE_DIR}/adapter-token.XXXXXX")
@@ -164,3 +172,4 @@ mv "${profile_tmp}" "${PROFILE_FILE}"
 
 print "Installed Local Codex tunnel."
 print "Start it with: ${LAUNCHER_PATH}"
+print "Monitor and approve actions with: ${WATCH_PATH}"
