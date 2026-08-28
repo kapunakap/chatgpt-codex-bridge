@@ -17,7 +17,7 @@ const STATE_FILE = process.env.LOCAL_CODEX_STATE_FILE ||
 const LOG_FILE = process.env.LOCAL_CODEX_LOG_FILE ||
   resolve(homedir(), "Library/Application Support/tunnel-client/logs/local-codex.log");
 const CONTROL_DIR = resolve(dirname(STATE_FILE));
-const JOBS_DIR = resolve(CONTROL_DIR, "jobs");
+const JOBS_DIR = process.env.LOCAL_CODEX_JOBS_DIR || resolve(CONTROL_DIR, "jobs");
 const GUARD_DIR = resolve(CONTROL_DIR, "guard");
 const APPROVALS_DIR = resolve(GUARD_DIR, "approvals");
 const GUARD_PROXY = fileURLToPath(new URL("./local-codex-guard-proxy.mjs", import.meta.url));
@@ -190,9 +190,9 @@ if (!process.exitCode) {
   });
 }
 
-function waitForNetworkCapabilityApproval() {
+async function waitForNetworkCapabilityApproval() {
   const approvalId = randomUUID();
-  const jobId = currentJobId(cwd);
+  const jobId = await waitForCurrentJobId(cwd);
   if (!jobId) {
     throw new Error("Unable to bind network capability approval to the active Local Codex job; refusing privileged execution");
   }
@@ -261,6 +261,16 @@ function waitForNetworkCapabilityApproval() {
   });
 }
 
+async function waitForCurrentJobId(selectedCwd) {
+  const deadline = Date.now() + 2000;
+  for (;;) {
+    const jobId = currentJobId(selectedCwd);
+    if (jobId) return jobId;
+    if (Date.now() >= deadline) return null;
+    await new Promise(resolvePromise => setTimeout(resolvePromise, 20));
+  }
+}
+
 function currentJobId(selectedCwd) {
   if (!existsSync(JOBS_DIR)) return null;
   const candidates = [];
@@ -273,7 +283,9 @@ function currentJobId(selectedCwd) {
       }
     } catch { /* ignore unrelated/in-flight records */ }
   }
-  candidates.sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+  if (candidates.length > 1) {
+    throw new Error("Multiple active Local Codex jobs claim the same workspace; refusing privileged execution");
+  }
   return candidates[0]?.jobId ?? null;
 }
 
