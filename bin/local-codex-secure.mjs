@@ -10,25 +10,33 @@ import process from "node:process";
 const REAL_CODEX_BIN = process.env.LOCAL_CODEX_REAL_BIN || "codex";
 const STATE_FILE = process.env.LOCAL_CODEX_STATE_FILE ||
   resolve(homedir(), "Library/Application Support/local-codex-tunnel/threads.json");
-const GUARD_DIR = resolve(dirname(STATE_FILE), "guard");
+const CONTROL_DIR = resolve(dirname(STATE_FILE));
+const GUARD_DIR = resolve(CONTROL_DIR, "guard");
 const GUARD_PROXY = fileURLToPath(new URL("./local-codex-guard-proxy.mjs", import.meta.url));
 
 // The adapter always sends the hardened profile. The wrapper validates that
-// exact profile first, then network-enabled jobs deliberately widen read/env
-// access to match the user's normal local developer session. Writes remain
-// restricted to the selected workspace. Network-disabled jobs keep the
-// hardened profile unchanged.
-function permissionConfig(cwd, networkAccess, trustedHostAccess = false) {
+// exact profile first, then adds an unconditional deny for Local Codex's own
+// control state before the real Codex process starts. That deny protects the
+// adapter token, thread/job state, Guard approvals/decisions, and event files
+// even when the selected workspace is an ancestor such as the user's home.
+// Network-enabled jobs still deliberately widen ordinary host read/env access
+// to match the user's terminal, but never to this host-authority directory.
+function permissionConfig(cwd, networkAccess, trustedHostAccess = false, protectedControlDir = null) {
   const denied = ["/Users", "/System/Volumes/Data/Users", "/Volumes", "/private/tmp", "/tmp", "/private/var/tmp", "/var/tmp", "/private/var/folders", "/var/folders"];
   const inside = path => cwd === "/" || path === cwd || path.startsWith(`${cwd}/`);
-  const reads = process.platform === "darwin"
-    ? (trustedHostAccess
-      ? '":root"="read"'
+  let readRules;
+  if (process.platform === "darwin") {
+    readRules = trustedHostAccess
+      ? ['":root"="read"']
       : ['":root"="read"', ...denied.filter(path => {
         const canonical = path.replace(/^\/System\/Volumes\/Data(?=\/)/, "").replace(/^\/tmp$/, "/private/tmp").replace(/^\/var(?=\/)/, "/private/var");
         return !inside(path) && !inside(canonical);
-      }).map(path => `${JSON.stringify(path)}="deny"`)].join(", "))
-    : (trustedHostAccess ? '":root"="read"' : '":minimal"="read"');
+      }).map(path => `${JSON.stringify(path)}="deny"`)];
+  } else {
+    readRules = [trustedHostAccess ? '":root"="read"' : '":minimal"="read"'];
+  }
+  if (protectedControlDir) readRules.push(`${JSON.stringify(protectedControlDir)}="deny"`);
+  const reads = readRules.join(", ");
   const workspace = ['"."="write"', '".git"="write"', '".codex"="read"', '".env"="deny"', '".env.*"="deny"',
     '"**/.env"="deny"', '"**/.env.*"="deny"', '"*.env"="deny"', '"**/*.env"="deny"',
     '".npmrc"="deny"', '"**/.npmrc"="deny"', '".pypirc"="deny"', '"**/.pypirc"="deny"'].join(", ");
@@ -43,8 +51,8 @@ const HARDENED_SHELL_ENV_CONFIGS = [
 
 // networkAccess=true is intentionally terminal-like: ordinary developer auth
 // such as gh config/Keychain, GH_TOKEN/GITHUB_TOKEN, and SSH_AUTH_SOCK may be
-// used by commands. Keep only the tunnel's own control-plane/runtime variables
-// out of the Codex process so a coding task cannot impersonate the bridge.
+// used by commands. Keep the tunnel's own variables out of the Codex process
+// and keep CONTROL_DIR denied at the filesystem layer.
 const TRUSTED_SHELL_ENV_CONFIGS = [
   'shell_environment_policy.inherit="all"',
   "shell_environment_policy.ignore_default_excludes=true",
@@ -69,6 +77,9 @@ if (networkMatches.length !== 1) {
 }
 const networkAccess = networkMatches[0].includes("true");
 const cwd = realpathSync(process.cwd());
+// Validate only the adapter-owned input profile. The wrapper-owned CONTROL_DIR
+// deny is deliberately applied after this exact validation and cannot be
+// supplied, removed, or redirected by the caller.
 if (permission !== permissionConfig(cwd, networkAccess)) {
   throw new Error("Local Codex permission profile does not match the hardened workspace policy");
 }
@@ -76,8 +87,11 @@ if (args.includes("--sandbox") || args.some(value => value.includes("sandbox_mod
   throw new Error("Unsafe Codex sandbox configuration is not allowed");
 }
 
+// Always replace the validated input profile with the effective profile that
+// denies host-authority state. This also prevents a broad cwd such as HOME from
+// turning Guard decision files into workspace-writable files.
+args[permissionIndex] = permissionConfig(cwd, networkAccess, networkAccess, CONTROL_DIR);
 if (networkAccess) {
-  args[permissionIndex] = permissionConfig(cwd, true, true);
   for (const config of TRUSTED_SHELL_ENV_CONFIGS) args.push("-c", config);
 } else {
   for (const config of HARDENED_SHELL_ENV_CONFIGS) args.push("-c", config);
