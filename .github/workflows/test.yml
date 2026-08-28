@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   test:
@@ -16,31 +16,11 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-      - name: Apply probe schema compatibility fix
-        if: github.event_name == 'push' && github.ref == 'refs/heads/feat/browser-backend-probe'
-        run: |
-          python - <<'PY'
-          from pathlib import Path
-          p = Path('adapter.test.mjs')
-          text = p.read_text()
-          old = '  assert.deepEqual(listed.result.tools.map(t => t.name), ["codex", "codex-reply", "codex-status", "codex-cancel", "codex-folders"]);\n'
-          new = '  assert.deepEqual(listed.result.tools.map(t => t.name), ["codex", "codex-reply", "codex-status", "codex-cancel", "codex-browser-status", "codex-folders"]);\n  const browserStatus = listed.result.tools.find(t => t.name === "codex-browser-status");\n  assert.equal(browserStatus.annotations.readOnlyHint, true);\n  assert.deepEqual(browserStatus.inputSchema.required, ["cwd"]);\n'
-          if old not in text:
-              raise SystemExit(0)
-          p.write_text(text.replace(old, new, 1))
-          PY
-          if git diff --quiet -- adapter.test.mjs; then
-            exit 0
-          fi
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add adapter.test.mjs
-          git commit -m "test: include browser status tool in discovery contract"
-          git push origin HEAD:feat/browser-backend-probe
       - run: npm test
       - name: JavaScript syntax checks
         run: |
           node --check adapter.mjs
+          node --check browser-probe.mjs
           node --check bin/local-codex-secure.mjs
           node --check scripts/render-profile.mjs
 
@@ -55,6 +35,8 @@ jobs:
       - run: npm run check
       - name: Browser capability fail-closed test
         run: node --test adapter-browser.test.mjs
+      - name: Browser backend probe boundary tests
+        run: node --test browser-probe.test.mjs bin/local-codex-secure-probe.test.mjs
       - name: Fresh and legacy installer dry runs
         run: |
           key_file="$(mktemp)"
