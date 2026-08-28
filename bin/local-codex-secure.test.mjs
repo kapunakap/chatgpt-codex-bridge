@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { mkdtemp, readFile, realpath, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -25,9 +25,12 @@ function permissionConfig(cwd, networkAccess) {
   return `permissions.local-codex-tunnel={description="Local Codex", workspace_roots={${JSON.stringify(cwd)}=true}, filesystem={${reads}, ":workspace_roots"={${workspace}}}, network={enabled=${networkAccess}}}`;
 }
 
-async function runWrapper(t, configs, extraArgs = [], cwd = repoRoot) {
+async function runWrapper(t, configs, extraArgs = [], cwd) {
+  assert.ok(cwd, "test cwd is required so control state can be placed inside the selected workspace");
   const root = await mkdtemp(join(tmpdir(), "local-codex-secure-"));
   const recordFile = join(root, "record.json");
+  const controlDir = join(cwd, ".local-codex-control");
+  await mkdir(controlDir, { recursive: true });
   t.after(() => rm(root, { recursive: true, force: true }));
   const args = [wrapper, "app-server", "--listen", "stdio://"];
   for (const config of configs) args.push("-c", config);
@@ -37,13 +40,14 @@ async function runWrapper(t, configs, extraArgs = [], cwd = repoRoot) {
     stdio: "ignore",
     env: {
       ...process.env,
+      LOCAL_CODEX_STATE_FILE: join(controlDir, "threads.json"),
       LOCAL_CODEX_REAL_BIN: fixture,
       OPENAI_API_KEY: "marker",
       DATABASE_URL: "marker",
       GH_TOKEN: "marker",
       GITHUB_TOKEN: "marker",
       SSH_AUTH_SOCK: "/tmp/marker-socket",
-      LOCAL_CODEX_TOKEN_FILE: "/tmp/marker-file",
+      LOCAL_CODEX_TOKEN_FILE: join(controlDir, "adapter-token"),
       TUNNEL_CLIENT_RUNTIME_API_KEY: "marker",
       TEST_PASSWORD: "marker",
     },
@@ -55,10 +59,10 @@ async function runWrapper(t, configs, extraArgs = [], cwd = repoRoot) {
   let record;
   try { record = JSON.parse(await readFile(recordFile, "utf8")); }
   catch (error) { if (error.code !== "ENOENT") throw error; }
-  return { exitCode, record };
+  return { exitCode, record, controlDir };
 }
 
-test("secure wrapper keeps network-disabled jobs hardened", async t => {
+test("secure wrapper keeps network-disabled jobs hardened and denies host-authority state", async t => {
   const workspace = await realpath(await mkdtemp(join(tmpdir(), "local-codex-profile-")));
   t.after(() => rm(workspace, { recursive: true, force: true }));
   const permission = permissionConfig(workspace, false);
@@ -67,9 +71,11 @@ test("secure wrapper keeps network-disabled jobs hardened", async t => {
   const configs = result.record.args
     .map((value, index) => result.record.args[index - 1] === "-c" ? value : null)
     .filter(Boolean);
+  const effectivePermission = configs.find(value => value.startsWith("permissions.local-codex-tunnel="));
   assert.equal(configs.filter(value => value.startsWith("permissions.local-codex-tunnel=")).length, 1);
-  assert.equal(configs.find(value => value.startsWith("permissions.local-codex-tunnel=")), permission);
-  assert.match(permission, /network=\{enabled=false\}/);
+  assert.notEqual(effectivePermission, permission, "wrapper must add its own control-state deny after validating adapter input");
+  assert.match(effectivePermission, /network=\{enabled=false\}/);
+  assert.ok(effectivePermission.includes(`${JSON.stringify(result.controlDir)}="deny"`), "control state inside cwd must remain explicitly denied");
   assert.equal(configs.includes('shell_environment_policy.inherit="core"'), true);
   assert.equal(configs.includes("shell_environment_policy.ignore_default_excludes=false"), true);
   assert.ok(configs.some(value => value.includes('"*AUTH*"="exclude"')));
@@ -86,7 +92,7 @@ test("secure wrapper keeps network-disabled jobs hardened", async t => {
   assert.equal(result.record.env.passwordPresent, false);
 });
 
-test("network-enabled jobs receive terminal-like host auth without tunnel secrets", async t => {
+test("network-enabled jobs get terminal-like host auth but never Local Codex control state", async t => {
   const workspace = await realpath(await mkdtemp(join(tmpdir(), "local-codex-profile-")));
   t.after(() => rm(workspace, { recursive: true, force: true }));
   const permission = permissionConfig(workspace, true);
@@ -100,6 +106,7 @@ test("network-enabled jobs receive terminal-like host auth without tunnel secret
   assert.match(effectivePermission, /network=\{enabled=true\}/);
   assert.match(effectivePermission, /filesystem=\{":root"="read"/);
   assert.doesNotMatch(effectivePermission, /"\/Users"="deny"/);
+  assert.ok(effectivePermission.includes(`${JSON.stringify(result.controlDir)}="deny"`), "trusted host read must carve out Local Codex control state");
   assert.equal(configs.includes('shell_environment_policy.inherit="all"'), true);
   assert.equal(configs.includes("shell_environment_policy.ignore_default_excludes=true"), true);
   assert.ok(configs.some(value => value === 'shell_environment_policy.filters={"LOCAL_CODEX_*"="exclude","TUNNEL_CLIENT_*"="exclude"}'));
