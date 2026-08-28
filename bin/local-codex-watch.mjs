@@ -22,6 +22,12 @@ let view = 0;
 let dirty = true;
 let quitting = false;
 let ready = null;
+let follow = true;
+let followCutoff = null;
+let outputExpanded = false;
+let approvalDetails = false;
+let searching = false;
+let searchQuery = "";
 let latest = { jobs: [], sessions: [], approvals: [], events: new Map() };
 const viewNames = ["Conversation", "Events", "Raw log"];
 const renderOnce = process.argv.includes("--once");
@@ -107,6 +113,27 @@ function approvalsFor(job) {
   return latest.approvals.filter(item => item.sessionId === session.sessionId).sort((a, b) => a.createdAt - b.createdAt);
 }
 
+function currentEvents() {
+  const session = sessionFor(latest.jobs[selected]);
+  return session ? (latest.events.get(session.sessionId) || []) : [];
+}
+
+function scopedEvents(events) {
+  let scoped = events;
+  if (!follow) {
+    if (followCutoff === null) followCutoff = events.at(-1)?.seq ?? 0;
+    scoped = scoped.filter(event => (event.seq ?? 0) <= followCutoff);
+  }
+  if (searchQuery) {
+    const needle = searchQuery.toLowerCase();
+    scoped = scoped.filter(event => {
+      try { return JSON.stringify(event).toLowerCase().includes(needle); }
+      catch { return false; }
+    });
+  }
+  return scoped;
+}
+
 function render() {
   dirty = false;
   const width = Math.max(80, process.stdout.columns || 120);
@@ -118,14 +145,15 @@ function render() {
   const job = jobs[selected];
   const session = sessionFor(job);
   const approvals = approvalsFor(job);
-  const events = session ? (latest.events.get(session.sessionId) || []) : [];
+  const events = scopedEvents(session ? (latest.events.get(session.sessionId) || []) : []);
   const lines = [];
   const tunnel = ready ? `${green("●")} Tunnel connected` : `${red("●")} Tunnel offline`;
   const adapter = ready?.version ? `Adapter v${ready.version}` : "Adapter ?";
   const running = jobs.filter(j => ["starting", "running", "cancelling"].includes(j.status)).length;
   const queued = jobs.filter(j => j.status === "queued").length;
   const held = latest.approvals.length;
-  lines.push(padVisible(`${bold("LOCAL CODEX GUARD")}  ${tunnel}  ${dim(adapter)}  ${cyan(`${running} running`)}  ${dim(`${queued} queued`)}  ${held ? amber(`${held} APPROVAL REQUIRED`) : dim("0 held")}`, width));
+  const followState = follow ? green("FOLLOW ●") : amber("FOLLOW ○");
+  lines.push(padVisible(`${bold("LOCAL CODEX GUARD")}  ${tunnel}  ${dim(adapter)}  ${cyan(`${running} running`)}  ${dim(`${queued} queued`)}  ${held ? amber(`${held} APPROVAL REQUIRED`) : dim("0 held")}  ${followState}`, width));
   lines.push(dim("ChatGPT → Secure MCP Tunnel → Local Codex → Host"));
   lines.push("─".repeat(width));
   const bodyHeight = height - 6;
@@ -136,7 +164,10 @@ function render() {
     lines.push(`${padVisible(left[i] || "", leftW)} │ ${padVisible(center[i] || "", centerW)} │ ${padVisible(right[i] || "", rightW)}`);
   }
   lines.push("─".repeat(width));
-  lines.push(padVisible(`${viewNames.map((name, index) => index === view ? bold(`[${name}]`) : dim(name)).join("  ")}   ${dim("↑↓/jk select  Tab view  a approve  A job  r reject  x kill  q quit")}`, width));
+  const status = searching
+    ? `${amber("SEARCH")} /${searchQuery}█  ${dim("Enter apply  Esc cancel  Backspace edit")}`
+    : `${viewNames.map((name, index) => index === view ? bold(`[${name}]`) : dim(name)).join("  ")}   ${dim("↑↓/jk select  Tab view  f follow  / search  l output  d details  a/A/r approve  x kill  q quit")}`;
+  lines.push(padVisible(status, width));
   process.stdout.write(`\x1b[H${lines.slice(0, height).join("\n")}`);
 }
 
@@ -158,9 +189,14 @@ function renderJobs(jobs, selectedIndex, width, height) {
 function renderCenter(job, session, approvals, events, width, height) {
   if (!job) return [bold("CONVERSATION"), dim("No Local Codex jobs found")];
   if (approvals.length) return renderApproval(approvals[0], job, width, height);
-  const out = [bold(`${basename(job.cwd)}  ${viewNames[view]}`), ""];
+  const searchTag = searchQuery ? `  /${searchQuery}` : "";
+  const out = [bold(`${basename(job.cwd)}  ${viewNames[view]}${searchTag}`), ""];
   if (!session) {
     out.push(dim(job.status === "queued" ? "Waiting for scheduler / folder lock…" : "No live guard session attached."));
+    return out;
+  }
+  if (searchQuery && !events.length) {
+    out.push(dim(`No visible events match /${searchQuery}`));
     return out;
   }
   if (view === 2) {
@@ -182,6 +218,7 @@ function renderApproval(approval, job, width, height) {
   const reason = params.reason || "Codex requested host authorization before continuing.";
   const target = params.networkApprovalContext?.host || detectTarget(command);
   const additional = params.additionalPermissions || {};
+  const remoteWrite = /git\s+push|gh\s+(?:pr|issue|release|repo)|curl.*(?:-X|--request)\s*(?:POST|PUT|PATCH|DELETE)|upload|publish|npm\s+publish/i.test(command);
   const out = [
     amber(bold("⚠ ACTION REQUIRES HOST APPROVAL")), "",
     `${dim("Job")}       ${short(job.jobId)}`,
@@ -191,13 +228,27 @@ function renderApproval(approval, job, width, height) {
   ];
   for (const line of wrap(command, width)) out.push(bold(line));
   out.push("", bold("Reason"), ...wrap(reason, width));
-  out.push("", bold("ACCESS / RISK"));
-  out.push(`Network access     ${approval.networkAccess ? amber("ENABLED") : green("OFF")}`);
-  if (additional.network?.enabled) out.push(`Network delta      ${amber("OFF → ON")}`);
-  if (target) out.push(`External target    ${target}`);
-  if (/git\s+push|gh\s+|curl|upload|publish|npm\s+publish/i.test(command)) out.push(red("RISK HIGH · authenticated/external write possible"));
+  out.push("", bold("ACCESS CHANGE"));
+  out.push(`Network access        ${approval.networkAccess ? amber("ENABLED") : green("OFF")}`);
+  if (additional.network?.enabled) out.push(`Network delta         ${amber("OFF → ON")}`);
+  out.push(`Remote write          ${remoteWrite ? red("POSSIBLE") : dim("not detected")}`);
+  out.push(`Host credentials      ${approval.networkAccess ? amber("AVAILABLE") : green("FILTERED")}`);
+  out.push(`Workspace writes      ${green("ALLOWED")}`);
+  if (target) out.push(`External service      ${target}`);
+  if (Object.keys(additional).length) out.push(`Additional perms      ${crop(compact(additional), Math.max(1, width - 22))}`);
+  if (remoteWrite || additional.network?.enabled) out.push(red("RISK HIGH · authenticated/external write possible"));
   else out.push(amber("RISK REVIEW REQUIRED"));
-  out.push("", amber("No action will execute until approved."), "", "[a] Approve once   [A] Approve for this job", "[r] Reject          [x] Kill job");
+  out.push("", amber("No action will execute until approved."));
+  if (approvalDetails) {
+    out.push("", bold("DETAILS"));
+    out.push(`${dim("Method")}     ${crop(approval.method || "?", Math.max(1, width - 11))}`);
+    out.push(`${dim("Request")}    ${crop(String(approval.requestId ?? "?"), Math.max(1, width - 11))}`);
+    if (params.itemId) out.push(`${dim("Item")}       ${crop(params.itemId, Math.max(1, width - 11))}`);
+    if (params.kind) out.push(`${dim("Kind")}       ${params.kind}`);
+    if (Array.isArray(params.availableDecisions)) out.push(`${dim("Decisions")}  ${crop(params.availableDecisions.join(", "), Math.max(1, width - 11))}`);
+    out.push(...wrap(JSON.stringify(params, null, 2), width).map(dim));
+  }
+  out.push("", "[a] Approve once   [A] Approve for this job", "[r] Reject          [x] Kill job   [d] Details");
   return out.slice(0, height);
 }
 
@@ -220,6 +271,9 @@ function renderInspector(job, session, approvals, width, height) {
   out.push(`${dim("network".padEnd(11))}${job.networkAccess ? amber("enabled") : "off"}`);
   out.push(`${dim("host auth".padEnd(11))}${job.networkAccess ? amber("available") : "filtered"}`);
   out.push(`${dim("cwd bound".padEnd(11))}${green("yes")}`);
+  out.push("", `${dim("follow".padEnd(11))}${follow ? green("on") : amber("paused")}`);
+  out.push(`${dim("output".padEnd(11))}${outputExpanded ? "expanded" : "collapsed"}`);
+  if (searchQuery) out.push(`${dim("search".padEnd(11))}/${crop(searchQuery, Math.max(1, width - 12))}`);
   return out.slice(0, height);
 }
 
@@ -243,7 +297,16 @@ function conversationLines(events, width) {
         const command = Array.isArray(item.command) ? item.command.join(" ") : (item.command || "command");
         out.push(dim(`› ${crop(command, Math.max(1, width - 2))}`));
         const output = item.aggregatedOutput || item.output || item.stdout;
-        if (typeof output === "string" && output.trim()) out.push(...wrap(output.trim(), width).map(dim));
+        if (typeof output === "string" && output.trim()) {
+          const lines = wrap(output.trim(), width);
+          if (!outputExpanded && lines.length > 3) {
+            out.push(...lines.slice(0, 2).map(dim));
+            out.push(dim(`▸ command output ${lines.length} lines · [l] expand`));
+          } else {
+            out.push(...lines.map(dim));
+            if (outputExpanded && lines.length > 3) out.push(dim(`▾ command output ${lines.length} lines · [l] collapse`));
+          }
+        }
       } else if (/fileChange/i.test(item.type || "")) {
         out.push(dim(`› file change ${item.status || ""}`));
       }
@@ -265,10 +328,34 @@ function formatEvent(event) {
 
 async function handleKey(data) {
   if (quitting) return;
+  if (searching) {
+    if (data === "\r" || data === "\n") { searching = false; dirty = true; return; }
+    if (data === "\x1b") { searching = false; dirty = true; return; }
+    if (data === "\x7f" || data === "\b") { searchQuery = searchQuery.slice(0, -1); dirty = true; return; }
+    const printable = data.replace(/[\x00-\x1f\x7f]/g, "");
+    if (printable) searchQuery = (searchQuery + printable).slice(0, 200);
+    dirty = true;
+    return;
+  }
   if (data === "q" || data === "\u0003") return quit();
   if (data === "\t") { view = (view + 1) % viewNames.length; dirty = true; return; }
-  if (data === "j" || data === "\x1b[B") { selected = Math.min(latest.jobs.length - 1, selected + 1); dirty = true; return; }
-  if (data === "k" || data === "\x1b[A") { selected = Math.max(0, selected - 1); dirty = true; return; }
+  if (data === "f") {
+    follow = !follow;
+    followCutoff = follow ? null : (currentEvents().at(-1)?.seq ?? 0);
+    dirty = true;
+    return;
+  }
+  if (data === "/") { searching = true; searchQuery = ""; dirty = true; return; }
+  if (data === "l") { outputExpanded = !outputExpanded; dirty = true; return; }
+  if (data === "d") { approvalDetails = !approvalDetails; dirty = true; return; }
+  if (data === "j" || data === "\x1b[B") {
+    selected = Math.max(0, Math.min(Math.max(0, latest.jobs.length - 1), selected + 1));
+    followCutoff = null; approvalDetails = false; dirty = true; return;
+  }
+  if (data === "k" || data === "\x1b[A") {
+    selected = Math.max(0, selected - 1);
+    followCutoff = null; approvalDetails = false; dirty = true; return;
+  }
   const job = latest.jobs[selected];
   const approval = approvalsFor(job)[0];
   if (data === "a" && approval) return decide(approval, "accept");
