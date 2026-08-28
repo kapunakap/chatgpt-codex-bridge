@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { mkdtemp, readFile, readdir } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, realpath } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -12,7 +12,7 @@ const wrapper = join(root, "bin/local-codex-secure.mjs");
 const fixture = join(root, "test/fixtures/record-codex-env.mjs");
 
 async function runProbe({ mode = "browser-status", profileOverride } = {}) {
-  const cwd = await mkdtemp(join(tmpdir(), "local-codex-secure-probe-"));
+  const cwd = await realpath(await mkdtemp(join(tmpdir(), "local-codex-secure-probe-")));
   const controlDir = join(cwd, ".local-codex-control");
   const recordFile = join(cwd, "..", `${cwd.split("/").at(-1)}-record.json`);
   const profile = profileOverride ?? probePermissionConfig(cwd);
@@ -69,7 +69,7 @@ test("secure wrapper browser probe launches real App Server without Guard state"
 
 test("secure wrapper rejects unknown probe modes and writable probe profiles", async () => {
   assert.notEqual((await runProbe({ mode: "unknown" })).exitCode, 0);
-  const badCwd = await mkdtemp(join(tmpdir(), "local-codex-bad-probe-profile-"));
+  const badCwd = await realpath(await mkdtemp(join(tmpdir(), "local-codex-bad-probe-profile-")));
   const bad = probePermissionConfig(badCwd).replace('"."="read"', '"."="write"');
   // Use the matching cwd by invoking a separate wrapper directly.
   const controlDir = join(badCwd, ".local-codex-control");
