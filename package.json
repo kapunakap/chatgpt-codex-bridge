@@ -9,7 +9,7 @@
     "node": ">=22"
   },
   "scripts": {
-    "test": "node --test adapter.test.mjs adapter-events.test.mjs selection.test.mjs scripts/render-profile.test.mjs bin/local-codex-secure.test.mjs bin/local-codex-guard-proxy.test.mjs bin/local-codex-watch.test.mjs",
-    "check": "node --check adapter.mjs && node --check adapter-events.test.mjs && node --check bin/local-codex-secure.mjs && node --check bin/local-codex-guard-proxy.mjs && node --check bin/local-codex-watch.mjs && node --check scripts/render-profile.mjs && zsh -n bin/local-codex-tunnel && zsh -n bin/local-codex-watch && zsh -n scripts/install.sh"
+    "test": "node --test adapter.test.mjs adapter-events.test.mjs adapter-guard-capability.test.mjs selection.test.mjs scripts/render-profile.test.mjs bin/local-codex-secure.test.mjs bin/local-codex-guard-proxy.test.mjs bin/local-codex-watch.test.mjs",
+    "check": "node --check adapter.mjs && node --check adapter-events.test.mjs && node --check adapter-guard-capability.test.mjs && node --check bin/local-codex-secure.mjs && node --check bin/local-codex-guard-proxy.mjs && node --check bin/local-codex-watch.mjs && node --check scripts/render-profile.mjs && zsh -n bin/local-codex-tunnel && zsh -n bin/local-codex-watch && zsh -n scripts/install.sh"
   }
 }
