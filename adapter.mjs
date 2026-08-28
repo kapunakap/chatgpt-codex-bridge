@@ -45,6 +45,7 @@ const VISIBLE_EVENT_TYPES = new Set([
   "chatgpt.prompt", "thread.started", "turn.requested", "turn.started", "turn.completed", "turn.interrupt_requested",
   "settings.updated", "assistant.delta", "item.started", "item.completed",
   "approval.requested", "approval.resolved", "approval.server_resolved",
+  "browser.environment_blocked",
 ]);
 function permissionConfig(cwd, networkAccess) {
   // Codex 0.147's macOS :minimal preset includes unconditional temp writes.
@@ -91,6 +92,7 @@ if (!expectedAuthorization) {
 
 const threadFolders = new Map();
 const threadNetworkAccess = new Map();
+const threadBrowserAccess = new Map();
 let threadState = {};
 await mkdir(dirname(LOG_FILE), { recursive: true, mode: 0o700 });
 appendFileSync(LOG_FILE, "", { mode: 0o600 });
@@ -119,12 +121,20 @@ const replyNetworkProperty = {
   type: "boolean",
   description: "Choose from the current task and saved thread state. Omit to inherit: an enabled thread stays enabled and a disabled or legacy thread stays disabled. Set true when this reply newly requires outbound command network access, even if the user only implies it—for example git fetch, git pull, git clone, installing dependencies or packages, curl, HTTP/API access, or downloads. Set false when networking must be disabled again. This does not change filesystem access.",
 };
+const newThreadBrowserProperty = {
+  type: "boolean", default: false,
+  description: "Set true when the task requires launching a local browser process such as Playwright, Chromium, Puppeteer, or Chrome for Testing. This is independent of networkAccess. On macOS, current upstream Codex does not expose the scoped Mach-port permission Chromium needs, so true fails clearly before a job starts instead of weakening the sandbox. On other platforms this records browser intent without widening filesystem or network access.",
+};
+const replyBrowserProperty = {
+  type: "boolean",
+  description: "Omit to inherit the thread's browserAccess state. Set true when this reply newly requires launching a local browser process. Set false to disable it again. This does not imply network access. On macOS, true fails clearly before a job starts while upstream Codex lacks a safe scoped Chromium/Mach permission.",
+};
 
 const tools = [
   {
     name: "codex",
     title: "Local Codex",
-    description: "Start a background Codex job in cwd, any existing absolute folder you choose. Choose networkAccess from the user's task intent, not only explicit wording: set true when completing the request requires outbound access such as git fetch, git pull, git clone, dependency or package installation, curl, HTTP/API access, or downloads, even if the user never mentions network access; omit or use false for fully local work. No directory allowlist or per-folder approval. Use codex-folders to locate the narrowest folder relevant to the user's task. Writes stay inside its canonical path. Jobs in different canonical folders can run concurrently up to the configured limit; jobs for an already-active folder are serialized through the queue. Returns jobId immediately; poll codex-status with waitMs=20000, never resubmit to check progress. Default Luna/max.",
+    description: "Start a background Codex job in cwd, any existing absolute folder you choose. Choose networkAccess from the user's task intent, not only explicit wording: set true when completing the request requires outbound access such as git fetch, git pull, git clone, dependency or package installation, curl, HTTP/API access, or downloads, even if the user never mentions network access; omit or use false for fully local work. Choose browserAccess separately when the task requires Playwright, Chromium, Puppeteer, or Chrome for Testing. browserAccess does not imply network access or wider filesystem access; on macOS it currently fails clearly before starting because upstream Codex lacks a safe scoped Chromium Mach-port permission. No directory allowlist or per-folder approval. Use codex-folders to locate the narrowest folder relevant to the user's task. Writes stay inside its canonical path. Jobs in different canonical folders can run concurrently up to the configured limit; jobs for an already-active folder are serialized through the queue. Returns jobId immediately; poll codex-status with waitMs=20000, never resubmit to check progress. Default Luna/max.",
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -133,6 +143,7 @@ const tools = [
         cwd: { type: "string", minLength: 1, maxLength: 4096, description: "Absolute path to an existing working folder. Symlinks resolve to their target; the returned canonical cwd is the write boundary." },
         prompt: { type: "string", minLength: 1, maxLength: 100000 },
         networkAccess: newThreadNetworkProperty,
+        browserAccess: newThreadBrowserProperty,
         ...selectionProperties,
       },
       required: ["requestId", "cwd", "prompt"],
@@ -148,7 +159,7 @@ const tools = [
   {
     name: "codex-reply",
     title: "Local Codex Reply",
-    description: "Start a background reply on an adapter-owned thread, using its saved folder. Omit networkAccess to inherit: enabled stays enabled and disabled stays disabled. Set true when this reply newly requires outbound access such as git fetch, git pull, git clone, dependency or package installation, curl, HTTP/API access, or downloads, even if the user only implies it; set false when networking must be disabled again. Folder changes are not allowed; use codex for a new folder. Replies use the same per-folder serialization and bounded queue as new jobs. Returns jobId; poll codex-status with waitMs=20000. Omitted model/reasoningEffort retain thread settings; overrides persist. Reuse requestId on retries.",
+    description: "Start a background reply on an adapter-owned thread, using its saved folder. Omit networkAccess to inherit: enabled stays enabled and disabled stays disabled. Set true when this reply newly requires outbound access such as git fetch, git pull, git clone, dependency or package installation, curl, HTTP/API access, or downloads, even if the user only implies it; set false when networking must be disabled again. Omit browserAccess to inherit the saved browser capability; set true when the reply needs a local browser process and false to disable it again. browserAccess is independent of networkAccess and on macOS browserAccess=true currently fails clearly before work starts because upstream Codex lacks a safe scoped Chromium Mach-port permission. Folder changes are not allowed; use codex for a new folder. Replies use the same per-folder serialization and bounded queue as new jobs. Returns jobId; poll codex-status with waitMs=20000. Omitted model/reasoningEffort retain thread settings; overrides persist. Reuse requestId on retries.",
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -157,6 +168,7 @@ const tools = [
         threadId: { type: "string", minLength: 1, maxLength: 200 },
         prompt: { type: "string", minLength: 1, maxLength: 100000 },
         networkAccess: replyNetworkProperty,
+        browserAccess: replyBrowserProperty,
         ...selectionProperties,
       },
       required: ["requestId", "threadId", "prompt"],
@@ -171,7 +183,7 @@ const tools = [
   },
   {
     name: "codex-status", title: "Local Codex Job Status",
-    description: "Read a saved job. For normal completion polling, optionally wait up to 20 seconds with waitMs=20000. For incremental visible activity, start with afterEventSeq=0 and waitMs=20000; the call returns as soon as a new event arrives or the job becomes terminal. Pass nextEventSeq back as afterEventSeq on the next poll. Events include externally visible prompts/messages/commands/results/approval state and never hidden reasoning.",
+    description: "Read a saved job. For normal completion polling, optionally wait up to 20 seconds with waitMs=20000. For incremental visible activity, start with afterEventSeq=0 and waitMs=20000; the call returns as soon as a new event arrives or the job becomes terminal. Pass nextEventSeq back as afterEventSeq on the next poll. Events include externally visible prompts/messages/commands/results/approval state and never hidden reasoning. Known macOS Chromium sandbox failures are classified as execution-environment failures in the job snapshot/events.",
     inputSchema: { type: "object", additionalProperties: false, properties: {
       jobId: { type: "string", minLength: 1, maxLength: 200 },
       waitMs: { type: "integer", minimum: 0, maximum: 20000, default: 0 },
@@ -220,6 +232,7 @@ const server = createServer(async (req, res) => {
         activeJobIds: active.map(job => job.jobId), activeCwds: active.map(job => job.cwd),
         queuedJobIds: jobQueue.map(job => job.jobId), queuedCwds: jobQueue.map(job => job.cwd),
         maxConcurrency: MAX_CONCURRENCY, maxQueue: MAX_QUEUE, scheduling: "fifo-runnable-per-folder",
+        browserAccessStatus: process.platform === "darwin" ? "upstream-sandbox-blocked" : "available",
       });
     }
     if (req.url?.startsWith("/.well-known/")) {
@@ -317,8 +330,8 @@ async function callTool(message, signal) {
       return toolResult(message.id, await listFolders(args));
     }
     if (name === "codex" || name === "codex-reply") {
-      validateArguments(args, name === "codex" ? ["requestId", "cwd", "prompt", "networkAccess", "model", "reasoningEffort"]
-        : ["requestId", "threadId", "prompt", "networkAccess", "model", "reasoningEffort"]);
+      validateArguments(args, name === "codex" ? ["requestId", "cwd", "prompt", "networkAccess", "browserAccess", "model", "reasoningEffort"]
+        : ["requestId", "threadId", "prompt", "networkAccess", "browserAccess", "model", "reasoningEffort"]);
       const missing = tools.find(tool => tool.name === name).inputSchema.required.filter(field => args[field] === undefined);
       if (missing.length) {
         throw callError("schema_outdated", `Local Codex ${VERSION} is missing required fields: ${missing.join(", ")}. In ChatGPT, open Local Codex > Manage > Refresh, then start a fresh chat. No job was started.`);
@@ -329,17 +342,26 @@ async function callTool(message, signal) {
       if (args.networkAccess !== undefined && typeof args.networkAccess !== "boolean") {
         throw callError("invalid_request", "networkAccess must be true or false when provided");
       }
+      if (args.browserAccess !== undefined && typeof args.browserAccess !== "boolean") {
+        throw callError("invalid_request", "browserAccess must be true or false when provided");
+      }
       if (name === "codex-reply" && !threadFolders.has(args.threadId)) {
         throw callError("unknown_thread", "threadId was not created by this Local Codex adapter");
       }
       const cwd = name === "codex" ? await canonicalDirectory(args.cwd, "cwd") : threadFolders.get(args.threadId);
       const networkAccess = args.networkAccess ?? (name === "codex-reply" ? threadNetworkAccess.get(args.threadId) : false) ?? false;
+      const browserAccess = args.browserAccess ?? (name === "codex-reply" ? threadBrowserAccess.get(args.threadId) : false) ?? false;
+      if (browserAccess && process.platform === "darwin") {
+        throw callError("browser_access_unavailable",
+          "browserAccess is not safely available on macOS with current upstream Codex. Chromium/Playwright requires global Mach port permissions that the scoped Codex permission profile cannot grant. No job was started and the sandbox was not weakened. Use a browser-capable Linux/Docker environment until upstream Codex adds scoped browser support.");
+      }
       const key = digest(args.requestId);
       const fingerprintInput = [cwd, name, args.prompt, args.threadId ?? null,
         MODEL_ALIASES.get(args.model) || args.model || null, args.reasoningEffort ?? null];
       // Keep omitted-field fingerprints byte-for-byte compatible with pre-v3.1
-      // saved jobs. Explicit false is still a different request from omission.
+      // saved jobs. Explicit capability values are still distinct requests.
       if (args.networkAccess !== undefined) fingerprintInput.push(args.networkAccess);
+      if (args.browserAccess !== undefined) fingerprintInput.push(args.browserAccess);
       const fingerprint = digest(JSON.stringify(fingerprintInput));
       const prior = requests.get(key);
       if (prior) {
@@ -356,11 +378,12 @@ async function callTool(message, signal) {
       const job = {
         jobId: randomUUID(), requestKey: key, fingerprint, tool: name, cwd,
         status: startNow ? "starting" : "queued", threadId: args.threadId ?? null, turnId: null,
-        model: null, reasoningEffort: null, networkAccess, settingsStatus: "pending",
+        model: null, reasoningEffort: null, networkAccess, browserAccess, settingsStatus: "pending",
         startedAt: Date.now(), updatedAt: Date.now(), eventSeq: 0,
       };
-      // Acceptance is durable before work is started or queued. Prompts stay
-      // only in memory; restart recovery marks queued/running work interrupted.
+      // Acceptance is durable before work is started or queued. Visible prompts
+      // and activity may also be persisted in the private Guard/job-event stream;
+      // restart recovery still marks queued/running work interrupted rather than replaying it.
       persistJob(job);
       jobs.set(job.jobId, job);
       requests.set(key, job);
@@ -521,11 +544,13 @@ function settleJob(job) {
 function snapshot(job) {
   return {
     jobId: job.jobId, status: job.status, cwd: job.cwd, threadId: job.threadId, turnId: job.turnId,
-    model: job.model, reasoningEffort: job.reasoningEffort, networkAccess: job.networkAccess ?? false,
+    model: job.model, reasoningEffort: job.reasoningEffort,
+    networkAccess: job.networkAccess ?? false, browserAccess: job.browserAccess ?? false,
     startedAt: job.startedAt, updatedAt: job.updatedAt,
     elapsedMs: (job.finishedAt ?? Date.now()) - job.startedAt,
     ...(job.finishedAt ? { finishedAt: job.finishedAt } : {}),
     ...(job.content !== undefined ? { content: job.content } : {}),
+    ...(job.environmentErrorCode ? { environmentErrorCode: job.environmentErrorCode, environmentMessage: job.environmentMessage } : {}),
     ...(job.errorCode ? { errorCode: job.errorCode, message: job.message } : {}),
   };
 }
@@ -572,6 +597,8 @@ async function loadJobs() {
     if (typeof job.cwd !== "string" || !isAbsolute(job.cwd)) throw new Error("Invalid job folder");
     if (job.networkAccess === undefined) job.networkAccess = false;
     if (typeof job.networkAccess !== "boolean") throw new Error("Invalid job network setting");
+    if (job.browserAccess === undefined) job.browserAccess = false;
+    if (typeof job.browserAccess !== "boolean") throw new Error("Invalid job browser setting");
     if (job.threadId && threadFolders.has(job.threadId) && threadFolders.get(job.threadId) !== job.cwd) {
       throw new Error("Job and thread folder mismatch");
     }
@@ -734,7 +761,7 @@ function runCodex(args, existingThreadId, audit) {
       detached: process.platform !== "win32",
       // Do not forward raw app-server stderr to the shared audit log.
       stdio: ["pipe", "pipe", "ignore"],
-      env: { ...process.env },
+      env: { ...process.env, LOCAL_CODEX_BROWSER_ACCESS: String(audit.browserAccess ?? false) },
     });
     let stdoutBuffer = "";
     let threadId = existingThreadId;
@@ -802,8 +829,8 @@ function runCodex(args, existingThreadId, audit) {
         send({ method: "initialized", params: {} });
         const models = await listModels();
         // Existing Codex history owns model/reasoning reply defaults. The
-        // adapter separately pins command-network state because each app-server
-        // process receives a job-scoped permission profile definition.
+        // adapter separately pins bridge capabilities because each app-server
+        // process receives a job-scoped permission profile/environment.
         const prior = existingThreadId
           ? await request("thread/resume", threadParams(cwd, audit.networkAccess, existingThreadId))
           : DEFAULT_SETTINGS;
@@ -822,6 +849,7 @@ function runCodex(args, existingThreadId, audit) {
         audit.threadId = threadId;
         threadFolders.set(threadId, cwd);
         threadNetworkAccess.set(threadId, audit.networkAccess);
+        threadBrowserAccess.set(threadId, audit.browserAccess ?? false);
         saveThreadState();
         persistJob(audit);
         if (!existingThreadId) confirmSettings(threadResponse.model, threadResponse.reasoningEffort);
@@ -1010,6 +1038,13 @@ function recordBridgeEvent(job, event) {
   try {
     appendFileSync(resolve(JOB_EVENTS_DIR, `${job.jobId}.jsonl`), `${JSON.stringify(record)}\n`, { mode: 0o600 });
     job.eventSeq = seq;
+    if (type === "browser.environment_blocked") {
+      job.environmentErrorCode = "browser_sandbox_blocked";
+      job.environmentMessage = typeof record.data?.message === "string"
+        ? record.data.message
+        : "Chromium/Playwright was blocked by the macOS Codex sandbox before reliable browser assertions could run.";
+      persistJob(job);
+    }
     for (const finish of [...(job.eventWaiting || [])]) finish();
   } catch {
     process.stderr.write("local-codex-adapter job event log unavailable\n");
@@ -1188,7 +1223,7 @@ function logCall(event, audit, errorCode) {
     jobId: audit.jobId, tool: audit.tool, status: audit.status,
     threadId: audit.threadId, turnId: audit.turnId,
     model: audit.model, reasoningEffort: audit.reasoningEffort,
-    networkAccess: audit.networkAccess ?? false,
+    networkAccess: audit.networkAccess ?? false, browserAccess: audit.browserAccess ?? false,
     settingsStatus: audit.settingsStatus,
     durationMs: Date.now() - audit.startedAt,
     ...(errorCode ? { errorCode } : {}),
@@ -1222,11 +1257,14 @@ function resultSchema() {
       model: { type: ["string", "null"] },
       reasoningEffort: { type: ["string", "null"] },
       networkAccess: { type: "boolean" },
+      browserAccess: { type: "boolean" },
       startedAt: { type: "number" },
       updatedAt: { type: "number" },
       finishedAt: { type: "number" },
       elapsedMs: { type: "number" },
       content: { type: "string" },
+      environmentErrorCode: { type: "string" },
+      environmentMessage: { type: "string" },
       events: {
         type: "array", maxItems: 100,
         items: {
@@ -1264,16 +1302,24 @@ async function loadThreadState() {
     if (typeof cwd !== "string" || !isAbsolute(cwd)) throw new Error("Invalid thread folder");
     const networkAccess = threadState.threadNetworkAccess?.[id] ?? false;
     if (typeof networkAccess !== "boolean") throw new Error("Invalid thread network setting");
+    const browserAccess = threadState.threadBrowserAccess?.[id] ?? false;
+    if (typeof browserAccess !== "boolean") throw new Error("Invalid thread browser setting");
     threadFolders.set(id, cwd);
     threadNetworkAccess.set(id, networkAccess);
-    if (saved === undefined || threadState.threadNetworkAccess?.[id] === undefined) migrated = true;
+    threadBrowserAccess.set(id, browserAccess);
+    if (saved === undefined || threadState.threadNetworkAccess?.[id] === undefined ||
+        threadState.threadBrowserAccess?.[id] === undefined) migrated = true;
   }
   if (migrated) saveThreadState();
 }
 
 function saveThreadState() {
+  // browserAccess is an additive optional map in the existing v4 state shape;
+  // keep the version stable so older v4 readers can ignore the new field.
   threadState = { ...threadState, schemaVersion: 4, threadIds: [...threadFolders.keys()],
-    threadCwds: Object.fromEntries(threadFolders), threadNetworkAccess: Object.fromEntries(threadNetworkAccess) };
+    threadCwds: Object.fromEntries(threadFolders),
+    threadNetworkAccess: Object.fromEntries(threadNetworkAccess),
+    threadBrowserAccess: Object.fromEntries(threadBrowserAccess) };
   writePrivateJson(STATE_FILE, threadState);
 }
 
