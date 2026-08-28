@@ -2,9 +2,16 @@
 
 import { realpathSync } from "node:fs";
 import { spawn } from "node:child_process";
+import { homedir } from "node:os";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import process from "node:process";
 
 const REAL_CODEX_BIN = process.env.LOCAL_CODEX_REAL_BIN || "codex";
+const STATE_FILE = process.env.LOCAL_CODEX_STATE_FILE ||
+  resolve(homedir(), "Library/Application Support/local-codex-tunnel/threads.json");
+const GUARD_DIR = resolve(dirname(STATE_FILE), "guard");
+const GUARD_PROXY = fileURLToPath(new URL("./local-codex-guard-proxy.mjs", import.meta.url));
 
 // The adapter always sends the hardened profile. The wrapper validates that
 // exact profile first, then network-enabled jobs deliberately widen read/env
@@ -101,12 +108,18 @@ if (networkAccess) {
   }
 }
 
-// Test fixtures are JavaScript files checked into this repository and are not
-// executable through GitHub's contents API, so run an explicit .mjs override
-// with Node. Production uses the real `codex` executable directly.
-const command = REAL_CODEX_BIN.endsWith(".mjs") ? process.execPath : REAL_CODEX_BIN;
-const commandArgs = REAL_CODEX_BIN.endsWith(".mjs") ? [REAL_CODEX_BIN, ...args] : args;
-const child = spawn(command, commandArgs, {
+// The guard proxy is deliberately below the adapter and above the real Codex
+// app-server. It can therefore force the native Codex approval policy and hold
+// server-initiated approval requests before commands/file changes execute. The
+// TUI is only a controller/view; enforcement continues if the TUI disconnects.
+const child = spawn(process.execPath, [
+  GUARD_PROXY,
+  "--real-bin", REAL_CODEX_BIN,
+  "--guard-dir", GUARD_DIR,
+  "--network-access", String(networkAccess),
+  "--",
+  ...args,
+], {
   stdio: "inherit",
   env: childEnv,
 });
@@ -121,7 +134,7 @@ for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"]) {
 }
 
 child.on("error", error => {
-  process.stderr.write(`Unable to start Codex: ${error.message}\n`);
+  process.stderr.write(`Unable to start guarded Codex: ${error.message}\n`);
   process.exitCode = 1;
 });
 child.on("exit", (code, signal) => {
