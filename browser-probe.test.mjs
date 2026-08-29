@@ -26,7 +26,9 @@ test("browser probe reports an enabled bundled official backend", async () => {
   assert.equal(result.managedPolicy.browserUseFullCdpAccess, true);
   assert.deepEqual(result.bundledPlugins.map(plugin => plugin.id), ["browser@openai-bundled"]);
   assert.equal(result.bundledPlugins[0].bundled, true);
-  assert.deepEqual(result.probeSupport, { configRequirements: "ok", pluginInstalled: "ok" });
+  assert.deepEqual(result.probeSupport, {
+    configRequirements: "ok", pluginInstalled: "ok", mcpServerStatus: "ok", browserRuntimeSetup: "ok",
+  });
 });
 
 test("browser probe respects managed policy blocks before plugin state", async () => {
@@ -40,7 +42,22 @@ test("browser probe distinguishes disabled bundled plugins from unknown older Ap
   assert.equal((await runCase("plugin-disabled")).officialBrowserBackend, "plugin_disabled");
   const unsupported = await runCase("unsupported");
   assert.equal(unsupported.officialBrowserBackend, "unknown");
-  assert.deepEqual(unsupported.probeSupport, { configRequirements: "unsupported", pluginInstalled: "unsupported" });
+  assert.deepEqual(unsupported.probeSupport, {
+    configRequirements: "unsupported", pluginInstalled: "unsupported",
+    mcpServerStatus: "unsupported", browserRuntimeSetup: "unsupported",
+  });
+});
+
+test("browser probe requires the trusted transport and successful runtime setup", async () => {
+  const missing = await runCase("transport-missing");
+  assert.equal(missing.officialBrowserBackend, "unknown");
+  assert.equal(missing.probeSupport.mcpServerStatus, "ok");
+  assert.equal(missing.probeSupport.browserRuntimeSetup, "unsupported");
+  assert.match(missing.message, /node_repl/i);
+
+  const failed = await runCase("runtime-error");
+  assert.equal(failed.officialBrowserBackend, "unknown");
+  assert.equal(failed.probeSupport.browserRuntimeSetup, "error");
 });
 
 test("browser probe permission profile is read-only and network-disabled", async () => {

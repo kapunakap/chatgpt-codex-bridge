@@ -1,20 +1,28 @@
 #!/usr/bin/env node
 
 import { createServer } from "node:http";
+import { createServer as createNetServer } from "node:net";
 import { spawn } from "node:child_process";
 import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
 import { appendFileSync, closeSync, fsyncSync, openSync, renameSync, writeFileSync } from "node:fs";
-import { mkdir, readFile, readdir, realpath, stat } from "node:fs/promises";
+import { chmod, mkdir, readFile, readdir, realpath, rm, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import process from "node:process";
-import { browserStatusTool, probeBrowserBackend } from "./browser-probe.mjs";
+import {
+  browserStatusTool,
+  createOfficialBrowserBroker,
+  officialBrowserDynamicTools,
+  probeBrowserBackend,
+} from "./browser-probe.mjs";
 
 // Only used to migrate pre-v3 records; never used as a new job's default.
 const legacyRootInput = process.env.LOCAL_CODEX_ROOT;
 const HOST = process.env.LOCAL_CODEX_HOST || "127.0.0.1";
 const PORT = Number(process.env.LOCAL_CODEX_PORT || "8765");
 const CODEX_BIN = process.env.LOCAL_CODEX_BIN || "codex";
+const BROWSER_PROXY_PATH = fileURLToPath(new URL("./browser-proxy.mjs", import.meta.url));
 const TOKEN_FILE = process.env.LOCAL_CODEX_TOKEN_FILE;
 const STATE_FILE = process.env.LOCAL_CODEX_STATE_FILE ||
   resolve(homedir(), "Library/Application Support/local-codex-tunnel/threads.json");
@@ -22,7 +30,7 @@ const LOG_FILE = process.env.LOCAL_CODEX_LOG_FILE ||
   resolve(homedir(), "Library/Application Support/tunnel-client/logs/local-codex.log");
 const JOBS_DIR = process.env.LOCAL_CODEX_JOBS_DIR || resolve(dirname(STATE_FILE), "jobs");
 const JOB_EVENTS_DIR = process.env.LOCAL_CODEX_JOB_EVENTS_DIR || resolve(dirname(STATE_FILE), "job-events");
-const VERSION = "3.2.0";
+const VERSION = "3.3.0";
 const DEFAULT_SETTINGS = { model: "gpt-5.6-luna", reasoningEffort: "max" };
 const MODEL_ALIASES = new Map([
   ["luna", "gpt-5.6-luna"], ["terra", "gpt-5.6-terra"], ["sol", "gpt-5.6-sol"],
@@ -107,6 +115,22 @@ const terminalStatuses = new Set(["completed", "failed", "cancelled", "timed_out
 const activeJobs = new Map();
 const activeFolders = new Set();
 const jobQueue = [];
+const browserSessions = new Map();
+const browserMcpTools = officialBrowserDynamicTools()[0].tools.map(tool => {
+  const readOnly = ["open", "snapshot", "get_text", "screenshot", "close"].includes(tool.name);
+  return {
+    name: `official_browser_${tool.name}`,
+    title: `Official Browser: ${tool.name}`,
+    description: tool.description,
+    inputSchema: tool.inputSchema,
+    annotations: {
+      readOnlyHint: readOnly,
+      destructiveHint: !readOnly,
+      idempotentHint: ["snapshot", "get_text", "screenshot", "close"].includes(tool.name),
+      openWorldHint: true,
+    },
+  };
+});
 let ready = false;
 let shuttingDown = false;
 let storageHealthy = true;
@@ -122,20 +146,21 @@ const replyNetworkProperty = {
   type: "boolean",
   description: "Choose from the current task and saved thread state. Omit to inherit: an enabled thread stays enabled and a disabled or legacy thread stays disabled. Set true when this reply newly requires outbound command network access, even if the user only implies it—for example git fetch, git pull, git clone, installing dependencies or packages, curl, HTTP/API access, or downloads. Set false when networking must be disabled again. This does not change filesystem access.",
 };
+
 const newThreadBrowserProperty = {
   type: "boolean", default: false,
-  description: "Set true when the task requires launching a local browser process such as Playwright, Chromium, Puppeteer, or Chrome for Testing. This is independent of networkAccess. On macOS, current upstream Codex does not expose the scoped Mach-port permission Chromium needs, so true fails clearly before a job starts instead of weakening the sandbox. On other platforms this records browser intent without widening filesystem or network access.",
+  description: "Set true when the task requires the official Codex Browser/Chrome backend for navigation, page inspection, interaction, screenshots, or browser-based QA. This is independent of networkAccess and never enables shell-launched Playwright, Chromium, Puppeteer, Chrome for Testing, wider filesystem access, or danger-full-access. Official Browser permissions and confirmations remain enforced by ChatGPT.",
 };
 const replyBrowserProperty = {
   type: "boolean",
-  description: "Omit to inherit the thread's browserAccess state. Set true when this reply newly requires launching a local browser process. Set false to disable it again. This does not imply network access. On macOS, true fails clearly before a job starts while upstream Codex lacks a safe scoped Chromium/Mach permission.",
+  description: "Omit to inherit the thread's official Browser capability. Set true when this reply newly needs the official Codex Browser/Chrome backend and false to disable it again. This does not imply command network access and never enables shell Chromium or a wider sandbox.",
 };
 
 const tools = [
   {
     name: "codex",
     title: "Local Codex",
-    description: "Start a background Codex job in cwd, any existing absolute folder you choose. Choose networkAccess from the user's task intent, not only explicit wording: set true when completing the request requires outbound access such as git fetch, git pull, git clone, dependency or package installation, curl, HTTP/API access, or downloads, even if the user never mentions network access; omit or use false for fully local work. Choose browserAccess separately when the task requires Playwright, Chromium, Puppeteer, or Chrome for Testing. browserAccess does not imply network access or wider filesystem access; on macOS it currently fails clearly before starting because upstream Codex lacks a safe scoped Chromium Mach-port permission. No directory allowlist or per-folder approval. Use codex-folders to locate the narrowest folder relevant to the user's task. Writes stay inside its canonical path. Jobs in different canonical folders can run concurrently up to the configured limit; jobs for an already-active folder are serialized through the queue. Returns jobId immediately; poll codex-status with waitMs=20000, never resubmit to check progress. Default Luna/max.",
+    description: "Start a background Codex job in cwd, any existing absolute folder you choose. Choose networkAccess from the user's task intent: set true when completing the request requires outbound command access such as git fetch, git pull, git clone, installing dependencies or packages, curl, HTTP/API access, or downloads, even if the user did not explicitly ask for network access; omit or use false for fully local command work. Choose browserAccess separately when the task needs the official Codex Browser/Chrome backend for navigation, page inspection, interaction, screenshots, or browser-based QA. browserAccess never enables shell-launched Playwright/Chromium, command networking, wider filesystem access, or danger-full-access. No directory allowlist or per-folder approval. Use codex-folders to locate the narrowest relevant folder. Jobs in different canonical folders can run concurrently; jobs for an active folder are serialized through the queue. Returns jobId immediately; poll codex-status with waitMs=20000, never resubmit to check progress. Default Luna/max.",
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -160,7 +185,7 @@ const tools = [
   {
     name: "codex-reply",
     title: "Local Codex Reply",
-    description: "Start a background reply on an adapter-owned thread, using its saved folder. Omit networkAccess to inherit: enabled stays enabled and disabled stays disabled. Set true when this reply newly requires outbound access such as git fetch, git pull, git clone, dependency or package installation, curl, HTTP/API access, or downloads, even if the user only implies it; set false when networking must be disabled again. Omit browserAccess to inherit the saved browser capability; set true when the reply needs a local browser process and false to disable it again. browserAccess is independent of networkAccess and on macOS browserAccess=true currently fails clearly before work starts because upstream Codex lacks a safe scoped Chromium Mach-port permission. Folder changes are not allowed; use codex for a new folder. Replies use the same per-folder serialization and bounded queue as new jobs. Returns jobId; poll codex-status with waitMs=20000. Omitted model/reasoningEffort retain thread settings; overrides persist. Reuse requestId on retries.",
+    description: "Start a background reply on an adapter-owned thread in its saved folder. Omit networkAccess to inherit: enabled stays enabled and disabled stays disabled. Set true when this reply newly requires outbound command access, even if the user only implies it; set false when command networking must be disabled again. Omit browserAccess to inherit the saved official Browser capability; set true when the reply needs the official Codex Browser/Chrome backend and false to disable it. browserAccess is independent of networkAccess and never enables shell Chromium or a wider sandbox. Folder changes are not allowed; use codex for a new folder. Replies use the same per-folder queue. Returns jobId; poll codex-status with waitMs=20000. Omitted model/reasoningEffort retain thread settings; overrides persist. Reuse requestId on retries.",
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -234,7 +259,7 @@ const server = createServer(async (req, res) => {
         activeJobIds: active.map(job => job.jobId), activeCwds: active.map(job => job.cwd),
         queuedJobIds: jobQueue.map(job => job.jobId), queuedCwds: jobQueue.map(job => job.cwd),
         maxConcurrency: MAX_CONCURRENCY, maxQueue: MAX_QUEUE, scheduling: "fifo-runnable-per-folder",
-        browserAccessStatus: process.platform === "darwin" ? "upstream-sandbox-blocked" : "available",
+        browserAccessStatus: "official-backend",
       });
     }
     if (req.url?.startsWith("/.well-known/")) {
@@ -358,9 +383,9 @@ async function callTool(message, signal) {
       const cwd = name === "codex" ? await canonicalDirectory(args.cwd, "cwd") : threadFolders.get(args.threadId);
       const networkAccess = args.networkAccess ?? (name === "codex-reply" ? threadNetworkAccess.get(args.threadId) : false) ?? false;
       const browserAccess = args.browserAccess ?? (name === "codex-reply" ? threadBrowserAccess.get(args.threadId) : false) ?? false;
-      if (browserAccess && process.platform === "darwin") {
-        throw callError("browser_access_unavailable",
-          "browserAccess is not safely available on macOS with current upstream Codex. Chromium/Playwright requires global Mach port permissions that the scoped Codex permission profile cannot grant. No job was started and the sandbox was not weakened. Use codex-browser-status to check whether the official Codex Browser Use backend is available on this host, or use a browser-capable Linux/Docker environment.");
+      const browserTurnMetadata = browserAccess ? extractBrowserTurnMetadata(message.params?._meta) : null;
+      if (browserAccess && !browserTurnMetadata) {
+        throw callError("browser_host_context_unavailable", "Official Browser Use requires a live ChatGPT turn context. Refresh Local Codex tools and start the browser job from ChatGPT; no job was started.");
       }
       const key = digest(args.requestId);
       const fingerprintInput = [cwd, name, args.prompt, args.threadId ?? null,
@@ -385,7 +410,8 @@ async function callTool(message, signal) {
       const job = {
         jobId: randomUUID(), requestKey: key, fingerprint, tool: name, cwd,
         status: startNow ? "starting" : "queued", threadId: args.threadId ?? null, turnId: null,
-        model: null, reasoningEffort: null, networkAccess, browserAccess, settingsStatus: "pending",
+        model: null, reasoningEffort: null, networkAccess, browserAccess,
+        browserBackend: browserAccess ? "official_codex" : "none", browserTurnMetadata, settingsStatus: "pending",
         startedAt: Date.now(), updatedAt: Date.now(), eventSeq: 0,
       };
       // Acceptance is durable before work is started or queued. Visible prompts
@@ -443,6 +469,159 @@ async function callTool(message, signal) {
       ...(errorCode === "schema_outdated" ? { adapterVersion: VERSION, schemaFingerprint: SCHEMA_FINGERPRINT } : {}),
     }, true);
   }
+}
+
+async function handleBrowserMcpMessage(message, session, signal) {
+  if (!message || message.jsonrpc !== "2.0" || typeof message.method !== "string") {
+    return rpcError(message?.id ?? null, -32600, "invalid request");
+  }
+  if (!("id" in message)) return null;
+  if (message.method === "initialize") {
+    return {
+      jsonrpc: "2.0", id: message.id,
+      result: {
+        protocolVersion: message.params?.protocolVersion || "2025-06-18",
+        capabilities: { tools: { listChanged: false } },
+        serverInfo: { name: "local-codex-official-browser", title: "Local Codex Official Browser", version: VERSION },
+      },
+    };
+  }
+  if (message.method === "ping") return { jsonrpc: "2.0", id: message.id, result: {} };
+  if (message.method === "tools/list") return { jsonrpc: "2.0", id: message.id, result: { tools: browserMcpTools } };
+  if (message.method !== "tools/call") return rpcError(message.id, -32601, `method not found: ${message.method}`);
+  if (signal?.aborted) return browserMcpToolResult(message.id, [{ type: "text", text: "Official Browser request cancelled" }], true);
+
+  const name = message.params?.name;
+  if (typeof name !== "string" || !name.startsWith("official_browser_")) {
+    return browserMcpToolResult(message.id, [{ type: "text", text: "Unknown official Browser tool" }], true);
+  }
+  const action = name.slice("official_browser_".length);
+  const task = async () => {
+    logCall("browser_tool_requested", session.audit);
+    try {
+      const broker = await getBrowserSessionBroker(session);
+      const result = await broker.execute(action, message.params?.arguments || {}, session.turnMetadata);
+      logCall("browser_tool_completed", session.audit);
+      return browserMcpToolResult(message.id, Array.isArray(result?.content) ? result.content : [], result?.isError === true, result?._meta);
+    } catch (error) {
+      logCall("browser_tool_failed", session.audit, error?.callCode || "browser_runtime_unavailable");
+      const text = error?.callCode === "browser_tool_invalid" ? error.message : "Official Browser operation failed";
+      return browserMcpToolResult(message.id, [{ type: "text", text }], true);
+    }
+  };
+  const result = session.operation.then(task, task);
+  session.operation = result.then(() => undefined, () => undefined);
+  return result;
+}
+
+async function createBrowserSocketSession(audit) {
+  const token = randomUUID();
+  const socketPath = resolve(audit.cwd, `.lcb-${token.slice(0, 12)}.sock`);
+  if (Buffer.byteLength(socketPath) > 100) {
+    throw callError("browser_transport_unavailable", "The selected workspace path is too long for the private Browser socket; no model turn was started.");
+  }
+  const session = {
+    token,
+    socketPath,
+    socketServer: null,
+    connections: new Set(),
+    jobId: audit.jobId,
+    cwd: audit.cwd,
+    turnMetadata: audit.browserTurnMetadata,
+    audit,
+    brokerPromise: null,
+    operation: Promise.resolve(),
+  };
+  try { await rm(socketPath, { force: true }); } catch {}
+  const socketServer = createNetServer(socket => {
+    session.connections.add(socket);
+    socket.setEncoding("utf8");
+    let buffer = "";
+    let authenticated = false;
+    socket.on("data", chunk => {
+      buffer += chunk;
+      for (;;) {
+        const newline = buffer.indexOf("\n");
+        if (newline < 0) break;
+        const line = buffer.slice(0, newline).trim();
+        buffer = buffer.slice(newline + 1);
+        if (!line) continue;
+        let message;
+        try { message = JSON.parse(line); }
+        catch { socket.destroy(); return; }
+        if (!authenticated) {
+          if (message?.token !== token) { socket.destroy(); return; }
+          authenticated = true;
+          continue;
+        }
+        void handleBrowserMcpMessage(message, session).then(response => {
+          if (response && !socket.destroyed) socket.write(`${JSON.stringify(response)}\n`);
+        }).catch(() => {
+          if (!socket.destroyed) socket.write(`${JSON.stringify(rpcError(message?.id ?? null, -32603, "Official Browser operation failed"))}\n`);
+        });
+      }
+    });
+    socket.on("close", () => session.connections.delete(socket));
+    socket.on("error", () => session.connections.delete(socket));
+  });
+  session.socketServer = socketServer;
+  await new Promise((resolvePromise, rejectPromise) => {
+    socketServer.once("error", rejectPromise);
+    socketServer.listen(socketPath, () => {
+      socketServer.removeListener("error", rejectPromise);
+      resolvePromise();
+    });
+  }).catch(async () => {
+    try { await rm(socketPath, { force: true }); } catch {}
+    throw callError("browser_transport_unavailable", "Unable to create the private Browser socket inside the selected workspace; no model turn was started.");
+  });
+  try { await chmod(socketPath, 0o600); }
+  catch {
+    socketServer.close();
+    try { await rm(socketPath, { force: true }); } catch {}
+    throw callError("browser_transport_unavailable", "Unable to protect the private Browser socket; no model turn was started.");
+  }
+  browserSessions.set(token, session);
+  return session;
+}
+
+function getBrowserSessionBroker(session) {
+  session.brokerPromise ??= createOfficialBrowserBroker({ cwd: session.cwd, codexBin: CODEX_BIN, adapterVersion: VERSION })
+    .then(broker => {
+      logCall("browser_broker_ready", session.audit);
+      return broker;
+    }, error => {
+      logCall("browser_broker_failed", session.audit, error?.callCode || "browser_runtime_unavailable");
+      throw error;
+    });
+  return session.brokerPromise;
+}
+
+async function disposeBrowserSession(session) {
+  browserSessions.delete(session.token);
+  for (const connection of session.connections || []) connection.destroy();
+  if (session.socketServer?.listening) {
+    await new Promise(resolvePromise => session.socketServer.close(resolvePromise));
+  }
+  try { await rm(session.socketPath, { force: true }); } catch {}
+  if (!session.brokerPromise) return;
+  try {
+    await Promise.race([
+      session.brokerPromise.then(broker => broker.close()),
+      new Promise(resolvePromise => setTimeout(resolvePromise, 2000)),
+    ]);
+  } catch {}
+}
+
+function browserMcpToolResult(id, content, isError, meta) {
+  return {
+    jsonrpc: "2.0", id,
+    result: {
+      content,
+      ...(isError ? { isError: true } : {}),
+      ...(meta && typeof meta === "object" ? { _meta: meta } : {}),
+    },
+  };
 }
 
 function canRunFolder(cwd) {
@@ -553,6 +732,7 @@ function snapshot(job) {
     jobId: job.jobId, status: job.status, cwd: job.cwd, threadId: job.threadId, turnId: job.turnId,
     model: job.model, reasoningEffort: job.reasoningEffort,
     networkAccess: job.networkAccess ?? false, browserAccess: job.browserAccess ?? false,
+    browserBackend: job.browserBackend ?? (job.browserAccess ? "official_codex" : "none"),
     startedAt: job.startedAt, updatedAt: job.updatedAt,
     elapsedMs: (job.finishedAt ?? Date.now()) - job.startedAt,
     ...(job.finishedAt ? { finishedAt: job.finishedAt } : {}),
@@ -606,6 +786,8 @@ async function loadJobs() {
     if (typeof job.networkAccess !== "boolean") throw new Error("Invalid job network setting");
     if (job.browserAccess === undefined) job.browserAccess = false;
     if (typeof job.browserAccess !== "boolean") throw new Error("Invalid job browser setting");
+    if (job.browserBackend === undefined) job.browserBackend = job.browserAccess ? "official_codex" : "none";
+    if (!["none", "official_codex"].includes(job.browserBackend)) throw new Error("Invalid job browser backend");
     if (job.threadId && threadFolders.has(job.threadId) && threadFolders.get(job.threadId) !== job.cwd) {
       throw new Error("Job and thread folder mismatch");
     }
@@ -760,15 +942,61 @@ function validateArguments(args, keys) {
   }
 }
 
-function runCodex(args, existingThreadId, audit) {
+function extractBrowserTurnMetadata(meta) {
+  let value = meta?.["x-codex-turn-metadata"];
+  if (typeof value === "string") {
+    try { value = JSON.parse(value); } catch { return null; }
+  }
+  if (!value || typeof value !== "object" || Array.isArray(value) ||
+      typeof value.session_id !== "string" || typeof value.turn_id !== "string") return null;
+  return {
+    session_id: value.session_id,
+    turn_id: value.turn_id,
+    thread_id: typeof value.thread_id === "string" ? value.thread_id : value.session_id,
+    thread_source: typeof value.thread_source === "string" ? value.thread_source : "user",
+    ...(typeof value.model === "string" ? { model: value.model } : {}),
+  };
+}
+
+async function runCodex(args, existingThreadId, audit) {
+  if (audit.browserAccess) {
+    let probe;
+    try {
+      probe = await probeBrowserBackend({ cwd: audit.cwd, codexBin: CODEX_BIN, adapterVersion: VERSION });
+    } catch {
+      throw callError("browser_runtime_unavailable", "The official Codex Browser runtime probe failed; no model turn was started.");
+    }
+    if (probe.officialBrowserBackend !== "available") {
+      const errorCode = probe.officialBrowserBackend === "policy_blocked" ? "browser_policy_blocked"
+        : probe.officialBrowserBackend === "plugin_disabled" ? "browser_plugin_unavailable"
+          : probe.probeSupport?.browserRuntimeSetup === "unsupported" || probe.probeSupport?.mcpServerStatus !== "ok"
+            ? "browser_transport_unavailable"
+          : "browser_runtime_unavailable";
+      throw callError(errorCode, `${probe.message} No model turn was started.`);
+    }
+    audit.browserBackend = "official_codex";
+    logCall("browser_backend_selected", audit);
+  }
+  const browserSession = audit.browserAccess ? await createBrowserSocketSession(audit) : null;
   return new Promise((resolvePromise, rejectPromise) => {
     const cwd = audit.cwd;
-    const child = spawn(CODEX_BIN, ["app-server", "--listen", "stdio://", "-c", permissionConfig(cwd, audit.networkAccess)], {
+    const appServerArgs = [
+      "app-server", "--listen", "stdio://", "-c", permissionConfig(cwd, audit.networkAccess),
+      "-c", "mcp_servers.node_repl.enabled=false",
+      "-c", "mcp_servers.playwright.enabled=false",
+    ];
+    if (audit.browserAccess) {
+      appServerArgs.push(
+        "-c", `mcp_servers.local_codex_browser.command=${JSON.stringify(process.execPath)}`,
+        "-c", `mcp_servers.local_codex_browser.args=${JSON.stringify([BROWSER_PROXY_PATH, "--socket", browserSession.socketPath, "--token", browserSession.token])}`,
+      );
+    }
+    const child = spawn(CODEX_BIN, appServerArgs, {
       cwd,
       detached: process.platform !== "win32",
       // Do not forward raw app-server stderr to the shared audit log.
       stdio: ["pipe", "pipe", "ignore"],
-      env: { ...process.env, LOCAL_CODEX_BROWSER_ACCESS: String(audit.browserAccess ?? false) },
+      env: { ...process.env },
     });
     let stdoutBuffer = "";
     let threadId = existingThreadId;
@@ -839,7 +1067,7 @@ function runCodex(args, existingThreadId, audit) {
         // adapter separately pins bridge capabilities because each app-server
         // process receives a job-scoped permission profile/environment.
         const prior = existingThreadId
-          ? await request("thread/resume", threadParams(cwd, audit.networkAccess, existingThreadId))
+          ? await request("thread/resume", threadParams(cwd, audit.networkAccess, audit.browserAccess, existingThreadId))
           : DEFAULT_SETTINGS;
         selected = selectSettings(args, prior, models);
         Object.assign(audit, selected, { settingsStatus: "requested" });
@@ -847,13 +1075,14 @@ function runCodex(args, existingThreadId, audit) {
 
         const threadResponse = existingThreadId
           ? prior
-          : await request("thread/start", threadParams(cwd, audit.networkAccess, null, selected));
+          : await request("thread/start", threadParams(cwd, audit.networkAccess, audit.browserAccess, null, selected));
         if (threadResponse?.thread?.cwd && threadResponse.thread.cwd !== cwd) {
           throw callError("folder_mismatch", "Codex returned a different thread folder; no turn was started");
         }
         threadId = threadResponse?.thread?.id || threadId;
         if (!threadId) throw new Error("Codex did not return a thread id");
         audit.threadId = threadId;
+        if (audit.browserAccess) logCall("browser_backend_ready", audit);
         threadFolders.set(threadId, cwd);
         threadNetworkAccess.set(threadId, audit.networkAccess);
         threadBrowserAccess.set(threadId, audit.browserAccess ?? false);
@@ -861,7 +1090,7 @@ function runCodex(args, existingThreadId, audit) {
         persistJob(audit);
         if (!existingThreadId) confirmSettings(threadResponse.model, threadResponse.reasoningEffort);
         turnSubmitted = true;
-        const turnResponse = await request("turn/start", turnParams(cwd, threadId, args.prompt, selected));
+        const turnResponse = await request("turn/start", turnParams(cwd, threadId, args.prompt, selected, audit.browserAccess));
         turnId = turnResponse?.turn?.id || turnId;
         audit.turnId = turnId;
         persistJob(audit);
@@ -870,7 +1099,7 @@ function runCodex(args, existingThreadId, audit) {
         // A fresh rollout may not yet be flushed to disk and cannot be resumed
         // immediately. Its thread/start response already confirmed both fields.
         if (existingThreadId) {
-          const effective = await request("thread/resume", threadParams(cwd, audit.networkAccess, threadId));
+          const effective = await request("thread/resume", threadParams(cwd, audit.networkAccess, audit.browserAccess, threadId));
           confirmSettings(effective.model, effective.reasoningEffort);
         }
         turnConfirmed = true;
@@ -889,7 +1118,11 @@ function runCodex(args, existingThreadId, audit) {
       if (message.id !== undefined && pending.has(String(message.id))) {
         const entry = pending.get(String(message.id));
         pending.delete(String(message.id));
-        if (message.error) entry.reject(callError("server_request_failed", `Codex app-server rejected ${entry.method}`));
+        if (message.error) {
+          const error = callError("server_request_failed", `Codex app-server rejected ${entry.method}`);
+          error.rpcCode = message.error?.code;
+          entry.reject(error);
+        }
         else entry.resolve(message.result);
         return;
       }
@@ -996,9 +1229,10 @@ function runCodex(args, existingThreadId, audit) {
       delete audit.stop;
       for (const entry of pending.values()) entry.reject(error || new Error("Codex call ended"));
       pending.clear();
-      const resolveAfterExit = () => {
+      const resolveAfterExit = async () => {
         clearTimeout(killTimer);
         signalChild("SIGKILL"); // Remove any remaining children before releasing this folder lock.
+        if (browserSession) await disposeBrowserSession(browserSession);
         if (error) rejectPromise(error);
         else resolvePromise(value);
       };
@@ -1006,8 +1240,8 @@ function runCodex(args, existingThreadId, audit) {
       const killTimer = setTimeout(() => {
         signalChild("SIGKILL");
       }, 2000);
-      if (exited || !child.pid) resolveAfterExit();
-      else child.once("exit", resolveAfterExit);
+      if (exited || !child.pid) void resolveAfterExit();
+      else child.once("exit", () => { void resolveAfterExit(); });
     }
 
     function signalChild(signal) {
@@ -1108,12 +1342,18 @@ async function eventSnapshot(job, afterEventSeq, eventLimit) {
   };
 }
 
-function threadParams(cwd, networkAccess, threadId, settings) {
+function browserInstructions(browserAccess) {
+  return browserAccess
+    ? "Official Codex Browser Use is enabled for this job through the local_codex_browser MCP server. Use only its official_browser_open, official_browser_snapshot, official_browser_get_text, official_browser_click, official_browser_fill, official_browser_press, official_browser_screenshot, and official_browser_close tools. Do not call node_repl, Playwright MCP, Computer Use, or browser packages directly. Never launch Playwright, Chromium, Puppeteer, Chrome, or another browser as a shell process. Browser access does not widen command network or filesystem permissions."
+    : "Official Browser Use is disabled for this job. Do not invoke Browser, Chrome, Computer Use, node_repl browser services, or shell-launched browser processes.";
+}
+
+function threadParams(cwd, networkAccess, browserAccess, threadId, settings) {
   const params = {
     cwd,
     approvalPolicy: "never",
     permissions: "local-codex-tunnel",
-    developerInstructions: `Operate only inside ${cwd}. Command network access is ${networkAccess ? "enabled" : "disabled"}. Do not request broader access.`,
+    developerInstructions: `Operate only inside ${cwd}. Command network access is ${networkAccess ? "enabled" : "disabled"}. ${browserInstructions(browserAccess)} Do not request broader access.`,
   };
   if (threadId) params.threadId = threadId;
   if (settings) {
@@ -1123,8 +1363,8 @@ function threadParams(cwd, networkAccess, threadId, settings) {
   return params;
 }
 
-function turnParams(cwd, threadId, prompt, settings) {
-  return {
+function turnParams(cwd, threadId, prompt, settings, browserAccess) {
+  const params = {
     threadId,
     input: [{ type: "text", text: prompt }],
     cwd,
@@ -1133,6 +1373,12 @@ function turnParams(cwd, threadId, prompt, settings) {
     model: settings.model,
     effort: settings.reasoningEffort,
   };
+  if (browserAccess) {
+    params.additionalContext = {
+      "local-codex-browser-access": { kind: "application", value: browserInstructions(true) },
+    };
+  }
+  return params;
 }
 
 function toolResult(id, result, isError = false) {
@@ -1231,6 +1477,7 @@ function logCall(event, audit, errorCode) {
     threadId: audit.threadId, turnId: audit.turnId,
     model: audit.model, reasoningEffort: audit.reasoningEffort,
     networkAccess: audit.networkAccess ?? false, browserAccess: audit.browserAccess ?? false,
+    browserBackend: audit.browserBackend ?? (audit.browserAccess ? "official_codex" : "none"),
     settingsStatus: audit.settingsStatus,
     durationMs: Date.now() - audit.startedAt,
     ...(errorCode ? { errorCode } : {}),
@@ -1265,6 +1512,7 @@ function resultSchema() {
       reasoningEffort: { type: ["string", "null"] },
       networkAccess: { type: "boolean" },
       browserAccess: { type: "boolean" },
+      browserBackend: { type: "string", enum: ["none", "official_codex"] },
       startedAt: { type: "number" },
       updatedAt: { type: "number" },
       finishedAt: { type: "number" },
