@@ -178,6 +178,18 @@ Purely local prompts keep command networking disabled:
 Use Local Codex in /path/to/project to run the tests from the current checkout without fetching or installing anything.
 ```
 
+Official Browser tasks use `browserAccess: true` independently of command networking:
+
+```text
+Use Local Codex in /path/to/project with browserAccess: true and networkAccess: false.
+Open http://127.0.0.1:3000 in the official Codex Browser, inspect the rendered page,
+and report the heading text. Do not launch Playwright or Chromium from the shell.
+```
+
+`browserAccess` selects the bundled Browser/Chrome runtime through a dedicated `local_codex_browser` MCP broker in the adapter. The sandboxed model turn receives only validated `official_browser_*` operations through a mode-`0600`, capability-token-protected Unix socket inside the already-authorized workspace; the socket is removed when the job exits. Direct `node_repl` and Playwright MCP are disabled for that turn. This does not make `npx playwright test`, Puppeteer, Chromium, or Chrome for Testing executable inside the macOS command sandbox, and it never enables `danger-full-access`, command networking, or another filesystem root. ChatGPT keeps ownership of website, interaction, and CDP confirmations.
+
+Browser jobs must be submitted from a live ChatGPT turn because the broker uses that turn's safe session identifiers to attach to the same official Browser session. Direct unaffiliated loopback calls fail with `browser_host_context_unavailable` before a job is accepted.
+
 After upgrading from v1, refresh Local Codex's tool definitions in ChatGPT (or reconnect the app if needed). v2 requires `requestId` and changes submission responses from final answers to job handles. A cached v1 call without `requestId` is rejected without starting work.
 
 v3 additionally requires `cwd` for `codex` and adds `codex-folders`. Refresh tools after upgrading from v2; cached submissions without `cwd` are rejected with a clear error. Existing jobs and threads are migrated to their original folder using the old `LOCAL_CODEX_ROOT`. Their results and request fingerprints are preserved. The migration source is saved once in thread state, so later configuration changes cannot retarget old threads. `LOCAL_CODEX_ROOT` (and the installer's optional `--root`) is only a legacy migration input, not a default or limit for new jobs. Keep it set until legacy records have been migrated; fresh installations do not need it.
@@ -188,13 +200,15 @@ v3.1.1 clarifies the MCP contract so ChatGPT chooses `networkAccess` from the us
 
 v3.2 adds concurrent jobs across different canonical folders, same-folder serialization, bounded queueing, and configurable concurrency/queue limits. Existing saved request fingerprints and completed results remain compatible. Restart recovery does not replay queued or active work; unfinished jobs become `interrupted`.
 
+v3.3 routes `browserAccess: true` through the official bundled Codex Browser runtime on every platform. Before starting a model turn, Local Codex verifies managed policy, the enabled Browser plugin, the trusted `node_repl` transport, and Browser runtime setup. Browser-enabled replies inherit the capability unless explicitly disabled. Refresh Local Codex's tools and start a fresh conversation after upgrading.
+
 The current `main` behavior additionally makes `networkAccess: true` terminal-like for host reads and developer authentication, while leaving network-disabled jobs hardened and keeping the tunnel's own runtime/control variables filtered.
 
 ### If ChatGPT reports missing `requestId` or `cwd`
 
 Missing required submission fields return `schema_outdated`, the adapter version, and its `schemaFingerprint`. No job is started. In ChatGPT, open **Local Codex → Manage → Refresh**, then use a **fresh conversation**. Existing conversations can retain older tool definitions even when the connection's settings show the new schema. Do not work around this by dropping required fields, inventing a working directory, or retrying with new IDs.
 
-The adapter's `/readyz` response includes the same fingerprint. Safe `schema_served` and `call_rejected` log events identify which schema was served and why a request was rejected, without logging caller IDs, prompts, or argument values. The static plugin description/version in ChatGPT is separate from the live tool schema; inspect its **Actions → Input schema** to verify `requestId`, `cwd`, and `networkAccess`.
+The adapter's `/readyz` response includes the same fingerprint. Safe `schema_served`, `browser_backend_selected`, `browser_backend_ready`, and `call_rejected` log events identify which schema/capability was used without logging caller IDs, prompts, browser arguments, or output. The static plugin description/version in ChatGPT is separate from the live tool schema; inspect its **Actions → Input schema** to verify `requestId`, `cwd`, `networkAccess`, and `browserAccess`.
 
 Treat a successful no-file-changes job submitted and polled from ChatGPT as the end-to-end check. A healthy local endpoint alone does not prove that ChatGPT has the updated tools.
 

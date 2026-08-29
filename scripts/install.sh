@@ -81,6 +81,7 @@ readonly TUNNEL_STATE_DIR="${USER_HOME}/Library/Application Support/tunnel-clien
 readonly PROFILE_DIR="${USER_HOME}/.config/tunnel-client"
 readonly ADAPTER_PATH="${LIBEXEC_DIR}/adapter.mjs"
 readonly BROWSER_PROBE_PATH="${LIBEXEC_DIR}/browser-probe.mjs"
+readonly BROWSER_PROXY_PATH="${LIBEXEC_DIR}/browser-proxy.mjs"
 readonly CODEX_WRAPPER_PATH="${LIBEXEC_DIR}/codex-secure.mjs"
 readonly GUARD_PROXY_PATH="${LIBEXEC_DIR}/local-codex-guard-proxy.mjs"
 readonly WATCH_NODE_PATH="${LIBEXEC_DIR}/local-codex-watch.mjs"
@@ -102,6 +103,7 @@ if [[ "${dry_run}" == "true" ]]; then
   print "codex_wrapper=${CODEX_WRAPPER_PATH}"
   print "guard_proxy=${GUARD_PROXY_PATH}"
   print "browser_probe=${BROWSER_PROBE_PATH}"
+  print "browser_proxy=${BROWSER_PROXY_PATH}"
   print "profile=${PROFILE_FILE}"
   exit 0
 fi
@@ -124,6 +126,7 @@ mkdir -p "${TUNNEL_STATE_DIR}/health" "${TUNNEL_STATE_DIR}/logs"
 install -d -m 700 "${STATE_DIR}"
 install -m 755 "${SOURCE_ROOT}/adapter.mjs" "${ADAPTER_PATH}"
 install -m 755 "${SOURCE_ROOT}/browser-probe.mjs" "${BROWSER_PROBE_PATH}"
+install -m 755 "${SOURCE_ROOT}/browser-proxy.mjs" "${BROWSER_PROXY_PATH}"
 install -m 755 "${SOURCE_ROOT}/bin/local-codex-secure.mjs" "${CODEX_WRAPPER_PATH}"
 install -m 755 "${SOURCE_ROOT}/bin/local-codex-guard-proxy.mjs" "${GUARD_PROXY_PATH}"
 install -m 755 "${SOURCE_ROOT}/bin/local-codex-watch.mjs" "${WATCH_NODE_PATH}"

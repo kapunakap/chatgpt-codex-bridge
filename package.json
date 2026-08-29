@@ -1,6 +1,6 @@
 {
   "name": "chatgpt-local-codex-tunnel",
-  "version": "3.2.0",
+  "version": "3.3.0",
   "description": "Run local Codex from ChatGPT through OpenAI Secure MCP Tunnel.",
   "private": true,
   "type": "module",
@@ -9,7 +9,7 @@
     "node": ">=22"
   },
   "scripts": {
-    "test": "node --test adapter.test.mjs adapter-events.test.mjs adapter-guard-capability.test.mjs adapter-browser.test.mjs browser-probe.test.mjs selection.test.mjs scripts/render-profile.test.mjs bin/local-codex-secure.test.mjs bin/local-codex-secure-probe.test.mjs bin/local-codex-guard-proxy.test.mjs bin/local-codex-guard-browser.test.mjs bin/local-codex-watch.test.mjs",
-    "check": "node --check adapter.mjs && node --check browser-probe.mjs && node --check browser-probe.test.mjs && node --check adapter-events.test.mjs && node --check adapter-guard-capability.test.mjs && node --check adapter-browser.test.mjs && node --check bin/local-codex-secure.mjs && node --check bin/local-codex-secure-probe.test.mjs && node --check bin/local-codex-guard-proxy.mjs && node --check bin/local-codex-guard-browser.test.mjs && node --check bin/local-codex-watch.mjs && node --check scripts/render-profile.mjs && zsh -n bin/local-codex-tunnel && zsh -n bin/local-codex-watch && zsh -n scripts/install.sh"
+    "test": "node --test adapter.test.mjs adapter-events.test.mjs adapter-guard-capability.test.mjs adapter-browser.test.mjs browser-probe.test.mjs browser-proxy.test.mjs selection.test.mjs scripts/render-profile.test.mjs bin/local-codex-secure.test.mjs bin/local-codex-secure-probe.test.mjs bin/local-codex-guard-proxy.test.mjs bin/local-codex-guard-browser.test.mjs bin/local-codex-watch.test.mjs",
+    "check": "node --check adapter.mjs && node --check browser-probe.mjs && node --check browser-proxy.mjs && node --check browser-probe.test.mjs && node --check browser-proxy.test.mjs && node --check adapter-events.test.mjs && node --check adapter-guard-capability.test.mjs && node --check adapter-browser.test.mjs && node --check bin/local-codex-secure.mjs && node --check bin/local-codex-secure-probe.test.mjs && node --check bin/local-codex-guard-proxy.mjs && node --check bin/local-codex-guard-browser.test.mjs && node --check bin/local-codex-watch.mjs && node --check scripts/render-profile.mjs && zsh -n bin/local-codex-tunnel && zsh -n bin/local-codex-watch && zsh -n scripts/install.sh"
   }
 }
