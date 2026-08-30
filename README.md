@@ -48,6 +48,8 @@ Command network access is also thread-scoped. New threads default to **disabled*
 
 When `networkAccess: true`, Local Codex intentionally behaves like the user's normal trusted local Codex/terminal session for reads and developer authentication: commands can use host user files and ambient developer auth such as `gh` config/Keychain credentials, `SSH_AUTH_SOCK`, `GH_TOKEN`, and `GITHUB_TOKEN`. Writes still stay inside the selected workspace. The bridge's own `LOCAL_CODEX_*` and `TUNNEL_CLIENT_*` variables remain stripped.
 
+Host approval prompts are optional and default to **off**. `LOCAL_CODEX_APPROVAL_MODE=off` runs command/file actions without TUI approval and grants an explicitly selected `networkAccess: true` capability without another prompt. Set `LOCAL_CODEX_APPROVAL_MODE=host` in `config.env` and restart the local tunnel to restore the network preflight plus per-command/file approval workflow. Unknown values fail before Codex starts.
+
 ### Background job flow (v2)
 
 1. Choose `cwd`, generate a unique `requestId`, and submit once. The response contains a `jobId` and canonical `cwd`, not the answer.
@@ -73,7 +75,7 @@ Job metadata and final results are saved atomically under `LOCAL_CODEX_JOBS_DIR`
 - `.codex` stays read-only. `.git` is writable inside the selected folder because fetch, clone, commit, and related Git operations require metadata writes.
 - Common credential files inside every selected folder are denied to sandboxed commands: `.env`, `.env.*`, `*.env`, `.npmrc`, and `.pypirc`, including nested copies.
 - The authenticated folder lookup tool can list directory names elsewhere; it does not grant a network-disabled running job access to those folders.
-- Commands run without network access by default. `networkAccess: true` enables broad direct command network access without a domain allowlist and also enables normal host developer authentication. A network-enabled job can send readable host/workspace data to external services and can act with credentials available to your normal developer session.
+- Commands run without network access by default. `networkAccess: true` enables broad direct command network access without a domain allowlist and also enables normal host developer authentication. A network-enabled job can send readable host/workspace data to external services and can act with credentials available to your normal developer session. With the default `LOCAL_CODEX_APPROVAL_MODE=off`, that capability is not separately host-approved.
 - Network-disabled jobs use a small environment allowlist with secret-name filtering. Network-enabled jobs inherit the normal host developer environment, except `LOCAL_CODEX_*` and `TUNNEL_CLIENT_*` variables are removed so the bridge's own control/runtime credentials are not exposed.
 - Thread replies are accepted only for thread IDs created by this adapter.
 - No inbound public port is required.

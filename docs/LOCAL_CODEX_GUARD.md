@@ -1,15 +1,14 @@
 # Local Codex Guard / Watch
 
-`local-codex-watch` is the host-side terminal UI for observing Local Codex jobs and approving privileged actions.
+`local-codex-watch` is the host-side terminal UI for observing Local Codex jobs and, when enabled, approving privileged actions.
 
 The implementation intentionally separates enforcement from rendering:
 
 - `local-codex-secure.mjs` keeps the existing workspace/network security profile validation.
 - `local-codex-guard-proxy.mjs` sits between the adapter and the real `codex app-server` process.
-- The proxy forces Codex's native approval policy to `untrusted` with the host `user` as reviewer.
-- Native `item/commandExecution/requestApproval` and `item/fileChange/requestApproval` requests are held by the proxy and are **not** forwarded to the ChatGPT-facing adapter.
-- The requested action remains blocked until the host writes an explicit decision through `local-codex-watch`.
-- If the TUI exits or disconnects, a pending approval remains pending. The UI is not the enforcement boundary.
+- `LOCAL_CODEX_APPROVAL_MODE=off` is the default: the proxy forces `approvalPolicy: never` and automatically accepts unexpected native approval requests without creating pending files.
+- `LOCAL_CODEX_APPROVAL_MODE=host` restores the previous behavior: the proxy forces `untrusted` with the host `user` as reviewer and holds native command/file requests below the ChatGPT-facing adapter.
+- In `host` mode, the requested action remains blocked until the host writes an explicit decision through `local-codex-watch`; closing the TUI does not approve it.
 
 ## Run
 
@@ -18,6 +17,8 @@ After installing or reinstalling the bridge:
 ```bash
 local-codex-watch
 ```
+
+The generated config contains `LOCAL_CODEX_APPROVAL_MODE=off`. Change it to `host` and restart `local-codex-tunnel` to enable approval prompts. Unknown values fail before Codex starts.
 
 The normal screen is labeled LOCAL CODEX MONITOR and follows the existing design mock: jobs on the left, conversation/activity in the center, and a job/capability inspector on the right. It uses a bounded three-pane frame, separate view and shortcut rows, and repaints from the real terminal dimensions so resizing does not wrap or corrupt the display. When an action is held, the center becomes the dominant approval view.
 
@@ -36,6 +37,12 @@ r          reject
 x          cancel the selected Local Codex job
 q          quit
 ```
+
+The `a`, `A`, `r`, and approval-detail controls are active only in `host` mode when an approval is pending.
+
+The monitor labels prompt provenance honestly. An exact caller-supplied ChatGPT conversation title is shown as `CHATGPT`; otherwise the App Server thread name is shown as `CODEX (fallback)`, with the persisted prompt preview as the final `PROMPT (fallback)`. Current ChatGPT connector metadata does not expose its conversation title automatically, so the monitor never relabels a generated fallback as exact.
+
+`o` works only after a job is terminal and has a saved thread ID. It leaves the monitor screen, authenticates a dedicated interactive-resume path with the private adapter token, and runs the native Codex TUI under the same workspace/network profile and `off|host` approval mode. On exit it restores the monitor, its selection, and the current terminal size. ChatGPT Browser context is not transferable; browser-enabled jobs require a second `o` after the warning. Activity added from the native TUI belongs to Codex history and is not appended to the already-terminal bridge job event file.
 
 Long command output is collapsed by default so the conversation stays readable; `l` expands it. Search applies to the same sanitized visible event stream used by the three views. Follow mode is on by default; turning it off freezes the current event sequence while new events continue to be recorded.
 
@@ -78,6 +85,6 @@ This keeps the normal Local Codex background-job contract: ChatGPT starts work o
 
 ## Current security scope
 
-This first Guard slice uses Codex's native `untrusted` approval policy, so commands that Codex classifies as requiring user approval are physically held before execution. Workspace writes still follow the existing bridge permission profile.
+Workspace writes always follow the existing bridge permission profile. Approval mode changes host prompts, not filesystem or network sandbox rules.
 
-`networkAccess: true` retains the bridge's existing terminal-like developer-auth model. Guard makes network-capable commands reviewable through Codex's approval flow, but a future capability-specific phase should narrow network/credential access itself instead of treating broad process-level network access as the final model.
+In the default `off` mode, command/file actions run without host prompts and an explicitly selected `networkAccess: true` capability immediately enables the bridge's terminal-like host read/developer-auth model. In `host` mode, network access is held before process start and native command/file approvals are held during the job. Neither mode turns broad network and credential access into a fine-grained capability sandbox.

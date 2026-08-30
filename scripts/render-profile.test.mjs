@@ -41,6 +41,7 @@ test("fresh installation dry run does not require a fixed root", { skip: process
   const output = await run(["scripts/install.sh", "--tunnel-id", "tunnel_example", "--runtime-api-key-file", key, "--dry-run"], "/bin/zsh");
   assert.match(output, /DRY_RUN_OK/);
   assert.match(output, /scope=per_job/);
+  assert.match(output, /approval_mode=off/);
   assert.match(output, /legacy_root=\n/);
   assert.match(output, /codex_wrapper=.*local-codex-tunnel\/codex-secure\.mjs/);
   assert.match(output, /watch_renderer=.*local-codex-tunnel\/local-codex-watch-render\.mjs/);
@@ -55,6 +56,20 @@ test("legacy installation dry run retains the migration root and secure wrapper"
   assert.match(output, /DRY_RUN_OK/);
   assert.match(output, new RegExp(`legacy_root=${canonicalDirectory.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`));
   assert.match(output, /codex_wrapper=.*local-codex-tunnel\/codex-secure\.mjs/);
+});
+
+test("approval mode defaults to off in launcher, installer, and example config", async () => {
+  const root = fileURLToPath(new URL("..", import.meta.url));
+  const launcher = await readFile(join(root, "bin/local-codex-tunnel"), "utf8");
+  const watchLauncher = await readFile(join(root, "bin/local-codex-watch"), "utf8");
+  const installer = await readFile(join(root, "scripts/install.sh"), "utf8");
+  const example = await readFile(join(root, "examples/config.env.example"), "utf8");
+  assert.match(launcher, /LOCAL_CODEX_APPROVAL_MODE=.*:-off/);
+  assert.match(watchLauncher, /LOCAL_CODEX_APPROVAL_MODE=.*:-off/);
+  assert.match(watchLauncher, /LOCAL_CODEX_BIN=.*:-codex/);
+  assert.match(watchLauncher, /LOCAL_CODEX_REAL_BIN=.*:-codex/);
+  assert.match(installer, /LOCAL_CODEX_APPROVAL_MODE=%q/);
+  assert.match(example, /^LOCAL_CODEX_APPROVAL_MODE=off$/m);
 });
 
 function run(args, executable = process.execPath) {

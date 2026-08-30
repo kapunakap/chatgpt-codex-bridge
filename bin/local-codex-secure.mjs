@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { randomUUID } from "node:crypto";
+import { randomUUID, timingSafeEqual } from "node:crypto";
 import {
   appendFileSync, closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync,
   readdirSync, realpathSync, renameSync, rmSync, writeFileSync,
@@ -13,11 +13,14 @@ import process from "node:process";
 
 const REAL_CODEX_BIN = process.env.LOCAL_CODEX_REAL_BIN || "codex";
 const PROBE_MODE = process.env.LOCAL_CODEX_PROBE_MODE || null;
+const APPROVAL_MODE = process.env.LOCAL_CODEX_APPROVAL_MODE || "off";
+const INTERACTIVE_RESUME = process.env.LOCAL_CODEX_INTERACTIVE_RESUME === "1";
 const STATE_FILE = process.env.LOCAL_CODEX_STATE_FILE ||
   resolve(homedir(), "Library/Application Support/local-codex-tunnel/threads.json");
 const LOG_FILE = process.env.LOCAL_CODEX_LOG_FILE ||
   resolve(homedir(), "Library/Application Support/tunnel-client/logs/local-codex.log");
 const CONTROL_DIR = resolve(dirname(STATE_FILE));
+const TOKEN_FILE = process.env.LOCAL_CODEX_TOKEN_FILE || resolve(CONTROL_DIR, "adapter-token");
 const JOBS_DIR = process.env.LOCAL_CODEX_JOBS_DIR || resolve(CONTROL_DIR, "jobs");
 const GUARD_DIR = resolve(CONTROL_DIR, "guard");
 const APPROVALS_DIR = resolve(GUARD_DIR, "approvals");
@@ -75,9 +78,10 @@ const HARDENED_SHELL_ENV_CONFIGS = [
   'shell_environment_policy.filters={"*PASSWORD*"="exclude","*PASS*"="exclude","*AUTH*"="exclude","*CREDENTIAL*"="exclude","*COOKIE*"="exclude","*SESSION*"="exclude","LOCAL_CODEX_*"="exclude","TUNNEL_CLIENT_*"="exclude"}',
 ];
 
-// networkAccess=true is intentionally terminal-like after the host explicitly
-// approves that capability: ordinary developer auth such as gh config/Keychain,
-// GH_TOKEN/GITHUB_TOKEN, and SSH_AUTH_SOCK may then be used by commands. Keep
+// networkAccess=true is intentionally terminal-like after the caller selects
+// that capability: ordinary developer auth such as gh config/Keychain,
+// GH_TOKEN/GITHUB_TOKEN, and SSH_AUTH_SOCK may then be used by commands. Host
+// approval is additionally required only when APPROVAL_MODE is "host". Keep
 // the tunnel's own variables out of the Codex process and keep CONTROL_DIR
 // denied at the filesystem layer.
 const TRUSTED_SHELL_ENV_CONFIGS = [
@@ -89,8 +93,36 @@ const TRUSTED_SHELL_ENV_CONFIGS = [
 if (PROBE_MODE !== null && PROBE_MODE !== "browser-status") {
   throw new Error("Unknown Local Codex probe mode");
 }
+if (INTERACTIVE_RESUME && PROBE_MODE) {
+  throw new Error("Interactive resume cannot run in probe mode");
+}
+if (!["off", "host"].includes(APPROVAL_MODE)) {
+  throw new Error("LOCAL_CODEX_APPROVAL_MODE must be off or host");
+}
+const hostApprovalsEnabled = APPROVAL_MODE === "host";
 
-const args = process.argv.slice(2);
+const requestedArgs = process.argv.slice(2);
+const cwd = realpathSync(process.cwd());
+let interactiveNetworkAccess = null;
+if (INTERACTIVE_RESUME) {
+  if (requestedArgs.length !== 2 || requestedArgs[0] !== "resume" ||
+      typeof requestedArgs[1] !== "string" || !requestedArgs[1] || requestedArgs[1].startsWith("-") ||
+      requestedArgs[1].length > 200) {
+    throw new Error("Interactive resume requires exactly one saved thread id");
+  }
+  if (!authorizedResume(process.env.LOCAL_CODEX_RESUME_TOKEN)) {
+    throw new Error("Interactive resume authorization failed");
+  }
+  if (!['true', 'false'].includes(process.env.LOCAL_CODEX_RESUME_NETWORK_ACCESS)) {
+    throw new Error("Interactive resume requires an explicit network setting");
+  }
+  interactiveNetworkAccess = process.env.LOCAL_CODEX_RESUME_NETWORK_ACCESS === "true";
+}
+
+const args = [...requestedArgs];
+if (INTERACTIVE_RESUME) {
+  args.push("--include-non-interactive", "-C", cwd, "-c", permissionConfig(cwd, interactiveNetworkAccess));
+}
 const permissionIndexes = [];
 for (let index = 0; index < args.length - 1; index++) {
   if (args[index] === "-c" && args[index + 1].startsWith("permissions.local-codex-tunnel=")) {
@@ -107,7 +139,6 @@ if (networkMatches.length !== 1) {
   throw new Error("Local Codex permission profile must select exactly one network state");
 }
 const networkAccess = networkMatches[0].includes("true");
-const cwd = realpathSync(process.cwd());
 if (PROBE_MODE && networkAccess) {
   throw new Error("Local Codex probe mode cannot enable command network access");
 }
@@ -176,27 +207,37 @@ for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"]) {
   });
 }
 
+if (INTERACTIVE_RESUME) {
+  args.push(
+    "-a", hostApprovalsEnabled ? "untrusted" : "never",
+    "-c", 'sandbox_permissions=["local-codex-tunnel"]',
+    "-c", "mcp_servers.node_repl.enabled=false",
+    "-c", "mcp_servers.playwright.enabled=false",
+    "-c", "mcp_servers.local_codex_browser.enabled=false",
+  );
+}
+
 // Probe mode never starts a Guard session or a Codex thread. It only exposes
 // the real App Server's stdio to the adapter under the validated read-only
 // profile. LOCAL_CODEX_* / TUNNEL_CLIENT_* are not passed to the child.
-if (PROBE_MODE) {
+if (PROBE_MODE || INTERACTIVE_RESUME) {
   const command = REAL_CODEX_BIN.endsWith(".mjs") ? process.execPath : REAL_CODEX_BIN;
   const commandArgs = REAL_CODEX_BIN.endsWith(".mjs") ? [REAL_CODEX_BIN, ...args] : args;
   child = spawn(command, commandArgs, { stdio: "inherit", env: childEnv });
   child.on("error", error => {
-    process.stderr.write(`Unable to start Local Codex probe: ${error.message}\n`);
+    const label = INTERACTIVE_RESUME ? "interactive resume" : "probe";
+    process.stderr.write(`Unable to start Local Codex ${label}: ${error.message}\n`);
     process.exitCode = 1;
   });
   child.on("exit", (code, signal) => {
     process.exitCode = signal ? 1 : (code ?? 1);
   });
 } else {
-  // The network-enabled profile exposes ordinary developer credentials to the
-  // eventual Codex process, so the capability itself must be host-approved before
-  // that process exists. The pending decision lives in CONTROL_DIR, which the
-  // eventual sandbox explicitly denies, preventing self-approval.
+  // In host approval mode, the network-enabled profile is held before the real
+  // Codex process exists. In the default off mode, the explicit networkAccess
+  // selection grants the capability without another host prompt.
   let sequenceOffset = 0;
-  if (networkAccess) {
+  if (networkAccess && hostApprovalsEnabled) {
     const decision = await waitForNetworkCapabilityApproval();
     sequenceOffset = 2; // approval.requested + approval.resolved precede proxy events.
     if (decision !== "accept" && decision !== "acceptForSession") {
@@ -205,15 +246,15 @@ if (PROBE_MODE) {
   }
 
   if (!process.exitCode) {
-    // The guard proxy is deliberately below the wrapper and above the real Codex
-    // app-server. It forces native Codex approval policy and holds command/file
-    // approval requests. The TUI is only a controller/view; enforcement continues
-    // if the TUI disconnects.
+    // The proxy always records visible events. In host mode it also holds native
+    // command/file approvals; in off mode it forces approvalPolicy=never and
+    // automatically resolves any unexpected approval request.
     child = spawn(process.execPath, [
       GUARD_PROXY,
       "--real-bin", REAL_CODEX_BIN,
       "--guard-dir", GUARD_DIR,
       "--network-access", String(networkAccess),
+      "--approval-mode", APPROVAL_MODE,
       "--sequence-offset", String(sequenceOffset),
       "--",
       ...args,
@@ -234,6 +275,16 @@ if (PROBE_MODE) {
       process.exitCode = code ?? 1;
     });
   }
+}
+
+function authorizedResume(value) {
+  if (typeof value !== "string" || !value) return false;
+  let expected;
+  try { expected = readFileSync(TOKEN_FILE, "utf8").trim(); }
+  catch { return false; }
+  const actualBuffer = Buffer.from(value);
+  const expectedBuffer = Buffer.from(expected);
+  return actualBuffer.length === expectedBuffer.length && timingSafeEqual(actualBuffer, expectedBuffer);
 }
 
 async function waitForNetworkCapabilityApproval() {

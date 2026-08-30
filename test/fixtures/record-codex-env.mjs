@@ -22,6 +22,7 @@ writeFileSync(recordFile, JSON.stringify({
     githubTokenPresent: "GITHUB_TOKEN" in process.env,
     sshAuthSockPresent: "SSH_AUTH_SOCK" in process.env,
     localTokenFilePresent: "LOCAL_CODEX_TOKEN_FILE" in process.env,
+    approvalModePresent: "LOCAL_CODEX_APPROVAL_MODE" in process.env,
     runtimeApiKeyPresent: "TUNNEL_CLIENT_RUNTIME_API_KEY" in process.env,
     passwordPresent: "TEST_PASSWORD" in process.env,
   },

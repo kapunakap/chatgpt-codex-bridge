@@ -5,9 +5,12 @@
 1. enables outbound command networking;
 2. makes ordinary host developer authentication available, such as GitHub CLI / Git credentials and `SSH_AUTH_SOCK`.
 
-Local Codex Guard therefore gates this capability **before the real Codex app-server process is created**.
+Approval behavior is host-configurable:
 
-## Flow
+- `LOCAL_CODEX_APPROVAL_MODE=off` (default) grants an explicitly requested `networkAccess: true` capability without another host prompt.
+- `LOCAL_CODEX_APPROVAL_MODE=host` gates the capability **before the real Codex app-server process is created**.
+
+## Host-mode flow
 
 ```text
 ChatGPT requests networkAccess: true
@@ -23,9 +26,9 @@ host credentials FILTERED → AVAILABLE
 spawn guarded Codex      no privileged Codex process
 ```
 
-The secure wrapper writes a private pending approval under the Local Codex control-state directory. `local-codex-watch` renders it even though there is not yet a Codex thread/session. Approval and rejection decisions are host-side files written by the TUI.
+In `host` mode, the secure wrapper writes a private pending approval under the Local Codex control-state directory. `local-codex-watch` renders it even though there is not yet a Codex thread/session. Approval and rejection decisions are host-side files written by the TUI.
 
-The real Codex process is not spawned until the host returns `accept` or `acceptForSession`. `decline` exits without granting the capability. Cancelling the Local Codex job terminates the waiting wrapper and removes the pending request.
+The real Codex process is not spawned until the host returns `accept` or `acceptForSession`. `decline` exits without granting the capability. Cancelling the Local Codex job terminates the waiting wrapper and removes the pending request. In the default `off` mode, no pending file is created and the process starts immediately with terminal-like host access.
 
 ## Host-authority state
 
@@ -38,16 +41,16 @@ This protects:
 - Guard pending approvals and decision files;
 - job/Guard event state.
 
-The capability gate runs in trusted host-side wrapper code *before* the real Codex sandboxed process exists, so Codex cannot read or write its own approval decision.
+When `host` mode is enabled, the capability gate runs in trusted host-side wrapper code *before* the real Codex sandboxed process exists, so Codex cannot read or write its own approval decision.
 
 ## Audit / visible events
 
-The wrapper writes capability request/resolution metadata to the shared security audit log without prompts, outputs, or credentials.
+In `host` mode, the wrapper writes capability request/resolution metadata to the shared security audit log without prompts, outputs, or credentials.
 
 It also emits sanitized `approval.requested` and `approval.resolved` visible events to the adapter. The Guard proxy starts its event sequence after those preflight events, preserving one ordered incremental `codex-status` stream.
 
 ## Scope
 
-Approval is per Local Codex job/process. `acceptForSession` does not create a global machine grant. A later Local Codex job that again requests `networkAccess: true` must pass the host preflight again.
+In `host` mode, approval is per Local Codex job/process. `acceptForSession` does not create a global machine grant. A later Local Codex job that again requests `networkAccess: true` must pass the host preflight again.
 
-Native command/file-change approval gates still run after the capability preflight. Approving network access does not automatically approve later dangerous commands.
+Native command/file-change approval gates still run after the capability preflight in `host` mode. In `off` mode, the proxy forces `approvalPolicy: never` and automatically resolves any unexpected native approval request as accepted while recording an automatic resolution event.

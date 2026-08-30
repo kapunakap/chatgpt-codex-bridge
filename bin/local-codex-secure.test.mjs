@@ -26,7 +26,7 @@ function permissionConfig(cwd, networkAccess) {
   return `permissions.local-codex-tunnel={description="Local Codex", workspace_roots={${JSON.stringify(cwd)}=true}, filesystem={${reads}, ":workspace_roots"={${workspace}}}, network={enabled=${networkAccess}}}`;
 }
 
-async function runWrapper(t, configs, extraArgs = [], cwd, capabilityDecision = "accept") {
+async function runWrapper(t, configs, extraArgs = [], cwd, capabilityDecision = "accept", approvalMode = "off") {
   assert.ok(cwd, "test cwd is required so control state can be placed inside the selected workspace");
   const root = await mkdtemp(join(tmpdir(), "local-codex-secure-"));
   const recordFile = join(root, "record.json");
@@ -54,6 +54,7 @@ async function runWrapper(t, configs, extraArgs = [], cwd, capabilityDecision = 
       LOCAL_CODEX_JOBS_DIR: jobsDir,
       LOCAL_CODEX_LOG_FILE: join(root, "audit.log"),
       LOCAL_CODEX_REAL_BIN: fixture,
+      LOCAL_CODEX_APPROVAL_MODE: approvalMode,
       OPENAI_API_KEY: "marker",
       DATABASE_URL: "marker",
       GH_TOKEN: "marker",
@@ -65,7 +66,7 @@ async function runWrapper(t, configs, extraArgs = [], cwd, capabilityDecision = 
     },
   });
   let pending;
-  if (networkEnabled) {
+  if (networkEnabled && approvalMode === "host") {
     for (let i = 0; i < 150; i++) {
       try {
         const name = (await readdir(approvalsDir)).find(file => file.endsWith(".pending.json"));
@@ -98,6 +99,101 @@ async function runWrapper(t, configs, extraArgs = [], cwd, capabilityDecision = 
   return { exitCode, record, controlDir, approvalsDir, pending, audit };
 }
 
+async function runInteractiveResume(t, { networkAccess, approvalMode = "off", token = "Bearer resume-secret" }) {
+  const root = await realpath(await mkdtemp(join(tmpdir(), "local-codex-resume-")));
+  const workspace = join(root, "workspace");
+  const controlDir = join(workspace, ".local-codex-control");
+  const tokenFile = join(controlDir, "adapter-token");
+  const fakeCodex = join(root, "fake-codex-resume.mjs");
+  const recordFile = join(root, "resume-record.json");
+  await mkdir(controlDir, { recursive: true, mode: 0o700 });
+  await writeFile(tokenFile, "Bearer resume-secret\n", { mode: 0o600 });
+  await writeFile(fakeCodex, `#!/usr/bin/env node
+import { writeFileSync } from "node:fs";
+writeFileSync(${JSON.stringify(recordFile)}, JSON.stringify({
+  args: process.argv.slice(2),
+  cwd: process.cwd(),
+  env: {
+    openai: "OPENAI_API_KEY" in process.env,
+    gh: "GH_TOKEN" in process.env,
+    local: Object.keys(process.env).filter(key => key.startsWith("LOCAL_CODEX_")),
+    tunnel: Object.keys(process.env).filter(key => key.startsWith("TUNNEL_CLIENT_")),
+  },
+}));
+`);
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const child = spawn(process.execPath, [wrapper, "resume", "11111111-1111-1111-1111-111111111111"], {
+    cwd: workspace,
+    stdio: ["ignore", "pipe", "pipe"],
+    env: {
+      ...process.env,
+      LOCAL_CODEX_INTERACTIVE_RESUME: "1",
+      LOCAL_CODEX_RESUME_TOKEN: token,
+      LOCAL_CODEX_RESUME_NETWORK_ACCESS: String(networkAccess),
+      LOCAL_CODEX_APPROVAL_MODE: approvalMode,
+      LOCAL_CODEX_STATE_FILE: join(controlDir, "threads.json"),
+      LOCAL_CODEX_TOKEN_FILE: tokenFile,
+      LOCAL_CODEX_REAL_BIN: fakeCodex,
+      OPENAI_API_KEY: "marker",
+      GH_TOKEN: "marker",
+      TUNNEL_CLIENT_RUNTIME_API_KEY: "marker",
+    },
+  });
+  const exitCode = await new Promise((resolve, reject) => {
+    child.once("error", reject);
+    child.once("exit", resolve);
+  });
+  let record;
+  try { record = JSON.parse(await readFile(recordFile, "utf8")); }
+  catch (error) { if (error.code !== "ENOENT") throw error; }
+  let approvalFiles = [];
+  try { approvalFiles = await readdir(join(controlDir, "guard", "approvals")); }
+  catch (error) { if (error.code !== "ENOENT") throw error; }
+  return { exitCode, record, controlDir, approvalFiles };
+}
+
+test("interactive resume keeps a real TTY path with the original disabled-network boundary", async t => {
+  const result = await runInteractiveResume(t, { networkAccess: false });
+  assert.equal(result.exitCode, 0);
+  assert.equal(result.record.cwd.endsWith("/workspace"), true);
+  assert.deepEqual(result.record.args.slice(0, 2), ["resume", "11111111-1111-1111-1111-111111111111"]);
+  assert.ok(result.record.args.includes("--include-non-interactive"));
+  assert.equal(result.record.args[result.record.args.indexOf("-a") + 1], "never");
+  const configs = result.record.args
+    .map((value, index) => result.record.args[index - 1] === "-c" ? value : null)
+    .filter(Boolean);
+  const permission = configs.find(value => value.startsWith("permissions.local-codex-tunnel="));
+  assert.match(permission, /network=\{enabled=false\}/);
+  assert.ok(permission.includes(`${JSON.stringify(result.controlDir)}="deny"`));
+  assert.ok(configs.includes('sandbox_permissions=["local-codex-tunnel"]'));
+  assert.ok(configs.includes("mcp_servers.local_codex_browser.enabled=false"));
+  assert.equal(result.record.env.openai, false);
+  assert.equal(result.record.env.gh, false);
+  assert.deepEqual(result.record.env.local, []);
+  assert.deepEqual(result.record.env.tunnel, []);
+  assert.deepEqual(result.approvalFiles, []);
+});
+
+test("interactive resume preserves network access and uses native CLI approvals in host mode", async t => {
+  const result = await runInteractiveResume(t, { networkAccess: true, approvalMode: "host" });
+  assert.equal(result.exitCode, 0);
+  assert.equal(result.record.args[result.record.args.indexOf("-a") + 1], "untrusted");
+  const permission = result.record.args.find(value => value.startsWith("permissions.local-codex-tunnel="));
+  assert.match(permission, /network=\{enabled=true\}/);
+  assert.ok(permission.includes(`${JSON.stringify(result.controlDir)}="deny"`));
+  assert.equal(result.record.env.openai, true);
+  assert.equal(result.record.env.gh, true);
+  assert.deepEqual(result.record.env.local, []);
+  assert.deepEqual(result.approvalFiles, [], "native TUI approvals must not create bridge approval files");
+});
+
+test("interactive resume fails closed without the monitor token", async t => {
+  const result = await runInteractiveResume(t, { networkAccess: false, token: "wrong" });
+  assert.notEqual(result.exitCode, 0);
+  assert.equal(result.record, undefined);
+  assert.deepEqual(result.approvalFiles, []);
+});
+
 test("secure wrapper keeps network-disabled jobs hardened and denies host-authority state", async t => {
   const workspace = await realpath(await mkdtemp(join(tmpdir(), "local-codex-profile-")));
   t.after(() => rm(workspace, { recursive: true, force: true }));
@@ -124,15 +220,37 @@ test("secure wrapper keeps network-disabled jobs hardened and denies host-author
   assert.equal(result.record.env.githubTokenPresent, false);
   assert.equal(result.record.env.sshAuthSockPresent, false);
   assert.equal(result.record.env.localTokenFilePresent, false);
+  assert.equal(result.record.env.approvalModePresent, false);
   assert.equal(result.record.env.runtimeApiKeyPresent, false);
   assert.equal(result.record.env.passwordPresent, false);
 });
 
-test("network-enabled jobs are held before spawn, then receive host auth after approval", async t => {
+test("default off mode grants network capability without approval files", async t => {
+  const workspace = await realpath(await mkdtemp(join(tmpdir(), "local-codex-profile-off-")));
+  t.after(() => rm(workspace, { recursive: true, force: true }));
+  const permission = permissionConfig(workspace, true);
+  const result = await runWrapper(t, [permission], [], workspace);
+  assert.equal(result.exitCode, 0);
+  assert.equal(result.pending, undefined);
+  assert.equal(result.record.env.ghTokenPresent, true);
+  assert.equal(result.record.env.githubTokenPresent, true);
+  assert.equal(result.record.env.sshAuthSockPresent, true);
+  assert.equal(result.record.env.approvalModePresent, false);
+  assert.equal(result.audit.some(entry => entry.capability === "networkAccess"), false);
+  let approvalFiles = [];
+  try {
+    approvalFiles = await readdir(result.approvalsDir);
+  } catch (error) {
+    if (error.code !== "ENOENT") throw error;
+  }
+  assert.deepEqual(approvalFiles, []);
+});
+
+test("host approval mode holds network-enabled jobs before spawn", async t => {
   const workspace = await realpath(await mkdtemp(join(tmpdir(), "local-codex-profile-")));
   t.after(() => rm(workspace, { recursive: true, force: true }));
   const permission = permissionConfig(workspace, true);
-  const result = await runWrapper(t, [permission], [], workspace, "accept");
+  const result = await runWrapper(t, [permission], [], workspace, "accept", "host");
   assert.equal(result.exitCode, 0);
   const configs = result.record.args
     .map((value, index) => result.record.args[index - 1] === "-c" ? value : null)
@@ -156,6 +274,7 @@ test("network-enabled jobs are held before spawn, then receive host auth after a
   assert.equal(result.record.env.sshAuthSockPresent, true);
   assert.equal(result.record.env.passwordPresent, true);
   assert.equal(result.record.env.localTokenFilePresent, false);
+  assert.equal(result.record.env.approvalModePresent, false);
   assert.equal(result.record.env.runtimeApiKeyPresent, false);
   const capabilityAudit = result.audit.filter(entry => entry.component === "local-codex-guard" && entry.capability === "networkAccess");
   assert.deepEqual(capabilityAudit.map(entry => entry.event), ["capability_approval_requested", "capability_approval_resolved"]);
@@ -165,12 +284,27 @@ test("network-enabled jobs are held before spawn, then receive host auth after a
 test("rejecting network capability prevents real Codex from starting", async t => {
   const workspace = await realpath(await mkdtemp(join(tmpdir(), "local-codex-profile-reject-")));
   t.after(() => rm(workspace, { recursive: true, force: true }));
-  const result = await runWrapper(t, [permissionConfig(workspace, true)], [], workspace, "decline");
+  const result = await runWrapper(t, [permissionConfig(workspace, true)], [], workspace, "decline", "host");
   assert.equal(result.exitCode, 77);
   assert.equal(result.record, undefined);
   const capabilityAudit = result.audit.filter(entry => entry.component === "local-codex-guard" && entry.capability === "networkAccess");
   assert.deepEqual(capabilityAudit.map(entry => entry.event), ["capability_approval_requested", "capability_approval_resolved"]);
   assert.equal(capabilityAudit.at(-1).decision, "decline");
+});
+
+test("secure wrapper rejects an invalid approval mode before Codex starts", async t => {
+  const workspace = await realpath(await mkdtemp(join(tmpdir(), "local-codex-invalid-approval-mode-")));
+  t.after(() => rm(workspace, { recursive: true, force: true }));
+  const result = await runWrapper(
+    t,
+    [permissionConfig(workspace, false)],
+    [],
+    workspace,
+    "accept",
+    "sometimes"
+  );
+  assert.notEqual(result.exitCode, 0);
+  assert.equal(result.record, undefined);
 });
 
 test("secure wrapper fails closed on missing, duplicate, malformed, or unsafe permission profiles", async t => {

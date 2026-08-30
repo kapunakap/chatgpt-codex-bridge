@@ -19,6 +19,7 @@ async function runCase(mode) {
     "--real-bin", fixture,
     "--guard-dir", guardDir,
     "--network-access", "false",
+    "--approval-mode", "off",
     "--",
     "--case", mode,
   ], { cwd: temp, stdio: ["pipe", "pipe", "pipe"] });

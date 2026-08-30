@@ -39,6 +39,7 @@ async function setup(t) {
     LOCAL_CODEX_JOB_EVENTS_DIR: join(root, "control", "job-events"),
     LOCAL_CODEX_BIN: wrapperLauncher,
     LOCAL_CODEX_REAL_BIN: realAppServer,
+    LOCAL_CODEX_APPROVAL_MODE: "host",
     LOCAL_CODEX_CALL_TIMEOUT_MS: "10000",
   };
   let child;
@@ -48,15 +49,17 @@ async function setup(t) {
     child = spawn(process.execPath, ["adapter.mjs"], { cwd: repo, env, stdio: ["ignore", "ignore", "pipe"] });
     await new Promise((resolve, reject) => {
       const timer = setTimeout(() => reject(new Error("adapter did not start")), 5000);
+      let stderr = "";
       child.stderr.on("data", chunk => {
-        if (chunk.toString().includes("ready on")) {
+        stderr += chunk.toString();
+        if (stderr.includes("ready on")) {
           clearTimeout(timer);
           resolve();
         }
       });
       child.once("exit", code => {
         clearTimeout(timer);
-        reject(new Error(`adapter exited ${code}`));
+        reject(new Error("adapter exited " + String(code) + ": " + stderr));
       });
     });
   }
