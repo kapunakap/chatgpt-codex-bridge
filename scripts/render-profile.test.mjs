@@ -44,6 +44,8 @@ test("fresh installation dry run does not require a fixed root", { skip: process
   assert.match(output, /approval_mode=off/);
   assert.match(output, /legacy_root=\n/);
   assert.match(output, /codex_wrapper=.*local-codex-tunnel\/codex-secure\.mjs/);
+  assert.match(output, /worktree_manager=.*local-codex-tunnel\/worktree-manager\.mjs/);
+  assert.match(output, /worktree_root=.*local-codex-worktrees/);
   assert.match(output, /watch_renderer=.*local-codex-tunnel\/local-codex-watch-render\.mjs/);
 });
 
@@ -72,6 +74,9 @@ test("approval mode defaults to off in launcher, installer, and example config",
   assert.match(example, /^LOCAL_CODEX_APPROVAL_MODE=off$/m);
   assert.match(installer, /LOCAL_CODEX_MAX_CONCURRENCY=%q\\n' "10"/);
   assert.match(example, /^LOCAL_CODEX_MAX_CONCURRENCY=10$/m);
+  assert.match(installer, /LOCAL_CODEX_WORKTREE_RETENTION=%q/);
+  assert.match(example, /^LOCAL_CODEX_WORKTREE_RETENTION=15$/m);
+  assert.match(example, /^LOCAL_CODEX_WORKTREE_ROOT=.*local-codex-worktrees$/m);
 });
 
 function run(args, executable = process.execPath) {

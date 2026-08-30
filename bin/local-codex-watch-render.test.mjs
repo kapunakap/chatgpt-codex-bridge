@@ -225,6 +225,26 @@ test("source labels strip terminal controls and remain bounded", () => {
   }
 });
 
+test("worktree jobs keep the source repository name and expose isolation metadata", () => {
+  const jobs = fixture().jobs.map((job, index) => index === 0 ? {
+    ...job,
+    cwd: "/Users/onin/Library/Application Support/local-codex-worktrees/gta/11111111",
+    sourceCwd: "/Users/onin/dev/gta-labin",
+    workspaceKind: "worktree",
+    worktreeId: "11111111-1111-1111-1111-111111111111",
+    worktreeState: "ready",
+    baseSha: "abcdef0123456789abcdef0123456789abcdef01",
+  } : job);
+  const lines = buildMonitorFrame(fixture({ jobs, job: jobs[0] }));
+  assertGeometry(lines, 118, 47);
+  const plain = lines.map(stripVTControlCharacters).join("\n");
+  assert.match(plain, /● RUN\s+gta-labin/);
+  assert.match(plain, /SOURCE REPO/);
+  assert.match(plain, /ISOLATION\s+│ worktree/);
+  assert.match(plain, /WORKTREE\s+│ ready/);
+  assert.match(plain, /BASE\s+│ abcdef01/);
+});
+
 test("Jobs shows relative age while Inspector keeps elapsed duration", () => {
   const jobs = [
     {

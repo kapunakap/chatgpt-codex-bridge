@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import { createServer } from "node:http";
 import { chmod, mkdir, mkdtemp, readFile, realpath, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -183,6 +184,59 @@ test("watch restores the monitor after secure resume launch failure", async t =>
   const output = read().slice(failedAt);
   assert.match(output, /Unable to start Codex CLI/);
   assert.match(output, /\x1b\[\?1049h\x1b\[\?25l/);
+  child.stdin.write("q");
+  await new Promise((resolve, reject) => { child.once("error", reject); child.once("exit", resolve); });
+});
+
+test("watch restores a snapshotted worktree before opening the native CLI", async t => {
+  const f = await fixture();
+  const restoredCwd = join(f.temp, "restored-worktree");
+  await mkdir(restoredCwd);
+  const completedAt = Date.now();
+  await writeFile(f.jobFile, JSON.stringify({
+    jobId: f.jobId, status: "completed", cwd: join(f.temp, "missing-worktree"),
+    sourceCwd: join(f.temp, "gta-labin"), workspaceKind: "worktree",
+    worktreeId: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", worktreeState: "snapshotted",
+    threadId: "thread-1", model: "gpt-5.6-luna", reasoningEffort: "high", networkAccess: false,
+    startedAt: completedAt - 12000, updatedAt: completedAt, finishedAt: completedAt,
+  }));
+  let restoreCalls = 0;
+  const server = createServer((request, response) => {
+    if (request.method === "GET") {
+      response.setHeader("Content-Type", "application/json");
+      response.end(JSON.stringify({ status: "ready", maxConcurrency: 10 }));
+      return;
+    }
+    let body = "";
+    request.on("data", chunk => { body += chunk; });
+    request.on("end", () => {
+      const message = JSON.parse(body);
+      if (message.method === "localCodex/worktreeRestore") restoreCalls += 1;
+      response.setHeader("Content-Type", "application/json");
+      response.end(JSON.stringify({ jsonrpc: "2.0", id: message.id, result: { cwd: restoredCwd, worktreeState: "ready" } }));
+    });
+  });
+  await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => server.close());
+  const recordFile = join(f.temp, "restored-resume.json");
+  const fakeSecure = join(f.temp, "fake-restored-resume.mjs");
+  await writeFile(fakeSecure, `#!/usr/bin/env node
+import { writeFileSync } from "node:fs";
+writeFileSync(process.env.TEST_RESUME_RECORD, JSON.stringify({ cwd: process.cwd(), args: process.argv.slice(2) }));
+`);
+  await chmod(fakeSecure, 0o755);
+  const { child } = startWatch(f, [], {
+    LOCAL_CODEX_BIN: fakeSecure,
+    LOCAL_CODEX_PORT: String(server.address().port),
+    TEST_RESUME_RECORD: recordFile,
+  });
+  t.after(() => { if (child.exitCode === null) child.kill("SIGTERM"); });
+  await delay(300);
+  child.stdin.write("o");
+  const record = JSON.parse(await readWhenPresent(recordFile));
+  assert.equal(restoreCalls, 1);
+  assert.equal(record.cwd, await realpath(restoredCwd));
+  assert.deepEqual(record.args, ["resume", "thread-1"]);
   child.stdin.write("q");
   await new Promise((resolve, reject) => { child.once("error", reject); child.once("exit", resolve); });
 });

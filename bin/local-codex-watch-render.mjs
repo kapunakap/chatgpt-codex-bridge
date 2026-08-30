@@ -156,7 +156,7 @@ function renderJobs(jobs, selectedIndex, width, height, now) {
 
 function renderJobRow(job, width, selected, now) {
   const status = job.held ? "! HOLD" : plainStateLabel(job.status);
-  const name = basename(job.cwd || "?");
+  const name = basename(job.sourceCwd || job.cwd || "?");
   const jobAge = age(job, now);
   const plain = joinLeftRightPlain(status + "  " + name, jobAge, width);
   if (selected) return selectedRow(plain);
@@ -190,7 +190,7 @@ function renderCenter({
   }
 
   const output = [
-    cyan(bold(basename(job.cwd || "?"))),
+    cyan(bold(basename(job.sourceCwd || job.cwd || "?"))),
     renderSource(sourceFor(job, events)),
     dim("┄".repeat(width)),
   ];
@@ -298,6 +298,9 @@ function renderInspector({
   const fields = [
     ["STATUS", status],
     ["WORKSPACE", displayPath(job.cwd || "?", homeDir)],
+    ["SOURCE REPO", displayPath(job.sourceCwd || job.cwd || "?", homeDir)],
+    ["ISOLATION", job.workspaceKind || "direct"],
+    ...(job.worktreeId ? [["WORKTREE", job.worktreeState || "planned"], ["BASE", short(job.baseSha)]] : []),
     ["SOURCE", source.kind + ": " + source.text],
     ["MODEL", job.model || "pending"],
     ["REASONING", job.reasoningEffort || "pending"],
@@ -315,7 +318,7 @@ function renderInspector({
   output.push(dim("─".repeat(width)));
   output.push(fieldRow("active", String(ready?.activeCalls ?? "?") + " / " + String(ready?.maxConcurrency ?? "?"), width));
   output.push(fieldRow("queued", String(ready?.queuedCalls ?? "?"), width));
-  output.push(fieldRow("folder lock", basename(job.cwd || "?"), width));
+  output.push(fieldRow("folder lock", basename(job.sourceCwd || job.cwd || "?"), width));
   output.push(dim("─".repeat(width)));
   output.push(bold("SANDBOX"));
   output.push(dim("─".repeat(width)));

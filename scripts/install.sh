@@ -80,6 +80,7 @@ readonly STATE_DIR="${USER_HOME}/Library/Application Support/local-codex-tunnel"
 readonly TUNNEL_STATE_DIR="${USER_HOME}/Library/Application Support/tunnel-client"
 readonly PROFILE_DIR="${USER_HOME}/.config/tunnel-client"
 readonly ADAPTER_PATH="${LIBEXEC_DIR}/adapter.mjs"
+readonly WORKTREE_MANAGER_PATH="${LIBEXEC_DIR}/worktree-manager.mjs"
 readonly BROWSER_PROBE_PATH="${LIBEXEC_DIR}/browser-probe.mjs"
 readonly BROWSER_PROXY_PATH="${LIBEXEC_DIR}/browser-proxy.mjs"
 readonly CODEX_WRAPPER_PATH="${LIBEXEC_DIR}/codex-secure.mjs"
@@ -94,6 +95,7 @@ readonly CONFIG_FILE="${STATE_DIR}/config.env"
 readonly PROFILE_FILE="${PROFILE_DIR}/${PROFILE_NAME}.yaml"
 readonly HEALTH_URL_FILE="${TUNNEL_STATE_DIR}/health/${PROFILE_NAME}.url"
 readonly LOG_FILE="${TUNNEL_STATE_DIR}/logs/${PROFILE_NAME}.log"
+readonly WORKTREE_ROOT="${USER_HOME}/Library/Application Support/local-codex-worktrees"
 
 if [[ "${dry_run}" == "true" ]]; then
   print "DRY_RUN_OK"
@@ -101,6 +103,8 @@ if [[ "${dry_run}" == "true" ]]; then
   print "approval_mode=off"
   print "legacy_root=${TARGET_ROOT}"
   print "launcher=${LAUNCHER_PATH}"
+  print "worktree_manager=${WORKTREE_MANAGER_PATH}"
+  print "worktree_root=${WORKTREE_ROOT}"
   print "watch=${WATCH_PATH}"
   print "watch_renderer=${WATCH_RENDER_PATH}"
   print "codex_wrapper=${CODEX_WRAPPER_PATH}"
@@ -111,7 +115,7 @@ if [[ "${dry_run}" == "true" ]]; then
   exit 0
 fi
 
-for required_command in node codex tunnel-client curl openssl; do
+for required_command in node codex tunnel-client curl openssl git; do
   if ! command -v "${required_command}" >/dev/null 2>&1; then
     print -u2 "Required command is missing: ${required_command}"
     exit 1
@@ -127,7 +131,9 @@ fi
 mkdir -p "${BIN_DIR}" "${LIBEXEC_DIR}" "${PROFILE_DIR}"
 mkdir -p "${TUNNEL_STATE_DIR}/health" "${TUNNEL_STATE_DIR}/logs"
 install -d -m 700 "${STATE_DIR}"
+install -d -m 700 "${WORKTREE_ROOT}"
 install -m 755 "${SOURCE_ROOT}/adapter.mjs" "${ADAPTER_PATH}"
+install -m 644 "${SOURCE_ROOT}/worktree-manager.mjs" "${WORKTREE_MANAGER_PATH}"
 install -m 755 "${SOURCE_ROOT}/browser-probe.mjs" "${BROWSER_PROBE_PATH}"
 install -m 755 "${SOURCE_ROOT}/browser-proxy.mjs" "${BROWSER_PROXY_PATH}"
 install -m 755 "${SOURCE_ROOT}/bin/local-codex-secure.mjs" "${CODEX_WRAPPER_PATH}"
@@ -155,6 +161,8 @@ config_tmp=$(mktemp "${STATE_DIR}/config.env.XXXXXX")
   printf 'LOCAL_CODEX_STATE_FILE=%q\n' "${THREADS_FILE}"
   printf 'LOCAL_CODEX_LOG_FILE=%q\n' "${LOG_FILE}"
   printf 'LOCAL_CODEX_JOBS_DIR=%q\n' "${STATE_DIR}/jobs"
+  printf 'LOCAL_CODEX_WORKTREE_ROOT=%q\n' "${WORKTREE_ROOT}"
+  printf 'LOCAL_CODEX_WORKTREE_RETENTION=%q\n' "15"
   printf 'LOCAL_CODEX_APPROVAL_MODE=%q\n' "off"
   printf 'LOCAL_CODEX_CALL_TIMEOUT_MS=%q\n' "1800000"
   printf 'LOCAL_CODEX_MAX_CONCURRENCY=%q\n' "10"

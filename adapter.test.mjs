@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { spawn } from "node:child_process";
-import { mkdir, mkdtemp, readFile, realpath, rename, stat, symlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, realpath, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { join } from "node:path";
@@ -12,6 +12,14 @@ import test from "node:test";
 const repo = fileURLToPath(new URL(".", import.meta.url));
 const terminal = new Set(["completed", "failed", "cancelled", "timed_out", "interrupted"]);
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+async function runGit(cwd, ...args) {
+  const child = spawn("git", ["-C", cwd, ...args], { stdio: ["ignore", "pipe", "pipe"] });
+  let stderr = "";
+  child.stderr.on("data", chunk => { stderr += chunk; });
+  const [code] = await once(child, "exit");
+  assert.equal(code, 0, stderr);
+}
 
 async function fixture(t, options = {}) {
   const root = await realpath(await mkdtemp(join(tmpdir(), "local-codex-adapter-test-")));
@@ -31,6 +39,7 @@ async function fixture(t, options = {}) {
     LOCAL_CODEX_ROOT: root, LOCAL_CODEX_PORT: String(port), LOCAL_CODEX_HOST: "127.0.0.1",
     LOCAL_CODEX_TOKEN_FILE: tokenFile, LOCAL_CODEX_STATE_FILE: join(root, "threads.json"),
     LOCAL_CODEX_LOG_FILE: join(root, "audit.log"), LOCAL_CODEX_JOBS_DIR: join(root, "jobs"),
+    LOCAL_CODEX_WORKTREE_ROOT: join(root, "worktrees"), LOCAL_CODEX_WORKTREE_RETENTION: "15",
     LOCAL_CODEX_BIN: options.missingBin ? join(root, "missing") : fake, LOCAL_CODEX_CALL_TIMEOUT_MS: String(options.timeout || 10000),
     LOCAL_CODEX_MAX_CONCURRENCY: String(options.maxConcurrency ?? 10), LOCAL_CODEX_MAX_QUEUE: String(options.maxQueue ?? 100),
     FAKE_ROOT: root,
@@ -96,7 +105,7 @@ test("discovery, authentication, schemas, and validation", async t => {
   assert.equal(discover.error.code, -32601);
   const initialized = await f.rpc({ jsonrpc: "2.0", id: "i", method: "initialize", params: { protocolVersion: "2025-11-25" } });
   assert.equal(initialized.result.protocolVersion, "2025-11-25");
-  assert.equal(initialized.result.serverInfo.version, "3.3.0");
+  assert.equal(initialized.result.serverInfo.version, "3.4.0");
   const listed = await f.rpc({ jsonrpc: "2.0", id: "l", method: "tools/list" });
   assert.deepEqual(listed.result.tools.map(t => t.name), ["codex", "codex-reply", "codex-status", "codex-cancel", "codex-browser-status", "codex-folders"]);
   const browserStatus = listed.result.tools.find(t => t.name === "codex-browser-status");
@@ -109,6 +118,9 @@ test("discovery, authentication, schemas, and validation", async t => {
   assert.match(codex.inputSchema.properties.sourceTitle.description, /exact title/i);
   assert.match(codex.inputSchema.properties.sourceTitle.description, /never invent/i);
   assert.equal(reply.inputSchema.properties.sourceTitle.maxLength, 200);
+  assert.equal(codex.inputSchema.properties.worktree.type, "boolean");
+  assert.equal(codex.inputSchema.properties.worktree.default, true);
+  assert.equal(reply.inputSchema.properties.worktree, undefined);
   assert.equal(codex.inputSchema.properties.networkAccess.type, "boolean");
   assert.equal(codex.inputSchema.properties.networkAccess.default, false);
   assert.match(codex.description, /different canonical folders can run concurrently/i);
@@ -135,6 +147,9 @@ test("discovery, authentication, schemas, and validation", async t => {
   for (const networkAccess of [null, 1, "true", {}]) {
     assert.equal((await f.call("codex", { requestId: `network-${JSON.stringify(networkAccess)}`, prompt: "hello", networkAccess })).errorCode, "invalid_request");
   }
+  for (const worktree of [null, 1, "true", {}]) {
+    assert.equal((await f.call("codex", { requestId: `worktree-${JSON.stringify(worktree)}`, prompt: "hello", worktree })).errorCode, "invalid_request");
+  }
   for (const sourceTitle of ["", "line one\nline two", "x".repeat(201), 7]) {
     assert.equal((await f.call("codex", { requestId: `title-${JSON.stringify(sourceTitle)}`, prompt: "hello", sourceTitle })).errorCode, "invalid_request");
   }
@@ -160,12 +175,15 @@ test("durable immediate acceptance, duplicate retries, same-folder queueing, and
   const ready = await (await fetch(`http://127.0.0.1:${f.port}/readyz`)).json();
   assert.equal(ready.activeCalls, 1); assert.equal(ready.queuedCalls, 1);
   assert.equal(ready.maxConcurrency, 10); assert.equal(ready.maxQueue, 100);
+  assert.equal(ready.worktreesDefault, true); assert.equal(ready.worktreeRetention, 15);
   assert.deepEqual(ready.queuedJobIds, [queued.jobId]);
   assert.equal((await f.call("codex-status", { jobId, waitMs: 20001 })).errorCode, "invalid_wait");
   const result = await f.finished(jobId);
   assert.equal(result.content, "FINAL_OK"); assert.equal(result.status, "completed");
   assert.equal(result.model, "gpt-5.6-luna"); assert.equal(result.reasoningEffort, "max");
   assert.equal(result.networkAccess, false);
+  assert.equal(result.workspaceKind, "direct"); assert.equal(result.worktreeReason, "non_git");
+  assert.equal(result.sourceCwd, f.root); assert.equal(result.cwd, f.root);
   assert.equal((await f.call("codex", args)).jobId, jobId);
   const queuedResult = await f.finished(queued.jobId);
   assert.equal(queuedResult.status, "completed"); assert.equal(queuedResult.content, "FINAL_OK");
@@ -184,7 +202,7 @@ test("durable immediate acceptance, duplicate retries, same-folder queueing, and
   }
   const state = JSON.parse(await readFile(join(f.root, "threads.json"), "utf8"));
   assert.ok(state.threadIds.includes(result.threadId));
-  assert.equal(state.schemaVersion, 4); assert.equal(state.threadNetworkAccess[result.threadId], false);
+  assert.equal(state.schemaVersion, 5); assert.equal(state.threadNetworkAccess[result.threadId], false);
   const jobFile = join(f.root, "jobs", `${jobId}.json`);
   assert.equal((await stat(jobFile)).mode & 0o777, 0o600);
   assert.equal((await stat(join(f.root, "jobs"))).mode & 0o777, 0o700);
@@ -243,6 +261,76 @@ test("different folders run concurrently while same-folder jobs serialize", asyn
   assert.equal((await f.finished(a2.jobId)).status, "completed");
   await f.call("codex-cancel", { jobId: b1.jobId });
   assert.equal((await f.finished(b1.jobId)).status, "cancelled");
+});
+
+test("Git jobs use distinct detached worktrees by default; replies reuse and worktree false stays direct", async t => {
+  const f = await fixture(t, { maxConcurrency: 10 });
+  const repo = await realpath(await mkdtemp(join(tmpdir(), "local-codex-adapter-worktree-")));
+  t.after(() => rm(repo, { recursive: true, force: true }));
+  const subdir = join(repo, "packages", "app");
+  await mkdir(subdir, { recursive: true });
+  await runGit(repo, "init");
+  await runGit(repo, "config", "user.name", "Test User");
+  await runGit(repo, "config", "user.email", "test@example.com");
+  await writeFile(join(repo, "tracked.txt"), "committed\n");
+  await writeFile(join(subdir, "app.txt"), "app\n");
+  await runGit(repo, "add", ".");
+  await runGit(repo, "commit", "-m", "initial");
+  await writeFile(join(repo, "tracked.txt"), "dirty source\n");
+
+  const first = await f.finished((await f.call("codex", {
+    requestId: "worktree-default", cwd: subdir, prompt: "hello",
+  })).jobId);
+  assert.equal(first.workspaceKind, "worktree");
+  assert.equal(first.sourceCwd, subdir);
+  assert.notEqual(first.cwd, subdir);
+  assert.equal(first.worktreeState, "ready");
+  assert.match(first.baseSha, /^[0-9a-f]{40}$/);
+  assert.equal(await readFile(join(first.cwd, "app.txt"), "utf8"), "app\n");
+  assert.equal(await readFile(join(first.cwd, "..", "..", "tracked.txt"), "utf8"), "committed\n");
+
+  await f.stop();
+  await f.start();
+  const reply = await f.finished((await f.call("codex-reply", {
+    requestId: "worktree-reply", threadId: first.threadId, prompt: "hello",
+  })).jobId);
+  assert.equal(reply.cwd, first.cwd);
+  assert.equal(reply.worktreeId, first.worktreeId);
+
+  const second = await f.finished((await f.call("codex", {
+    requestId: "worktree-second", cwd: subdir, prompt: "hello",
+  })).jobId);
+  assert.equal(second.workspaceKind, "worktree");
+  assert.notEqual(second.cwd, first.cwd);
+
+  const parallelA = await f.call("codex", { requestId: "worktree-parallel-a", cwd: subdir, prompt: "hold" });
+  const parallelB = await f.call("codex", { requestId: "worktree-parallel-b", cwd: subdir, prompt: "hold" });
+  const [runningA, runningB] = await Promise.all([f.started(parallelA.jobId), f.started(parallelB.jobId)]);
+  assert.equal(runningA.status, "running"); assert.equal(runningB.status, "running");
+  assert.notEqual(runningA.cwd, runningB.cwd);
+  const parallelReady = await (await fetch(`http://127.0.0.1:${f.port}/readyz`)).json();
+  assert.ok(parallelReady.activeCalls >= 2);
+  await f.call("codex-cancel", { jobId: parallelA.jobId });
+  await f.call("codex-cancel", { jobId: parallelB.jobId });
+  assert.equal((await f.finished(parallelA.jobId)).status, "cancelled");
+  assert.equal((await f.finished(parallelB.jobId)).status, "cancelled");
+
+  const direct = await f.finished((await f.call("codex", {
+    requestId: "worktree-direct", cwd: subdir, prompt: "hello", worktree: false,
+  })).jobId);
+  assert.equal(direct.workspaceKind, "direct");
+  assert.equal(direct.worktreeReason, "disabled");
+  assert.equal(direct.cwd, subdir);
+
+  const calls = await f.records();
+  const worktreeSpawn = calls.find(record => record.event === "spawn" && record.cwd === first.cwd);
+  const permission = worktreeSpawn.args[worktreeSpawn.args.indexOf("-c") + 1];
+  const commonGitDir = (await realpath(join(repo, ".git")));
+  assert.ok(permission.includes(`${JSON.stringify(commonGitDir)}=true`));
+  const state = JSON.parse(await readFile(join(f.root, "threads.json"), "utf8"));
+  assert.equal(state.threadWorkspaceKinds[first.threadId], "worktree");
+  assert.equal(state.threadSourceCwds[first.threadId], subdir);
+  assert.equal(state.threadWorktreeIds[first.threadId], first.worktreeId);
 });
 
 test("bounded queue is FIFO among runnable jobs and returns queue_full", async t => {
@@ -537,7 +625,7 @@ test("legacy migration pins old folders and preserves fingerprints and results",
   assert.equal((await f.call("codex", args)).jobId, done.jobId);
   const state = JSON.parse(await readFile(join(f.root, "threads.json"), "utf8"));
   assert.equal(state.threadCwds[done.threadId], f.root); assert.equal(state.threadNetworkAccess[done.threadId], false);
-  assert.equal(state.schemaVersion, 4); assert.equal(state.retainedMetadata, "keep");
+  assert.equal(state.schemaVersion, 5); assert.equal(state.retainedMetadata, "keep");
   assert.equal((await stat(join(f.root, "threads.json"))).mode & 0o777, 0o600);
   await f.stop(); f.env.LOCAL_CODEX_ROOT = "/missing-old-config-root"; await f.start();
   const reply = await f.finished((await f.call("codex-reply", { requestId: "legacy-reply", threadId: done.threadId, prompt: "hello" })).jobId);

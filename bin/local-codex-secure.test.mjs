@@ -11,7 +11,7 @@ const wrapper = join(repoRoot, "bin/local-codex-secure.mjs");
 const fixture = join(repoRoot, "test/fixtures/record-codex-env.mjs");
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
 
-function permissionConfig(cwd, networkAccess) {
+function permissionConfig(cwd, networkAccess, commonGitDir = null) {
   const denied = ["/Users", "/System/Volumes/Data/Users", "/Volumes", "/private/tmp", "/tmp", "/private/var/tmp", "/var/tmp", "/private/var/folders", "/var/folders"];
   const inside = path => cwd === "/" || path === cwd || path.startsWith(`${cwd}/`);
   const reads = process.platform === "darwin"
@@ -23,7 +23,9 @@ function permissionConfig(cwd, networkAccess) {
   const workspace = ['"."="write"', '".git"="write"', '".codex"="read"', '".env"="deny"', '".env.*"="deny"',
     '"**/.env"="deny"', '"**/.env.*"="deny"', '"*.env"="deny"', '"**/*.env"="deny"',
     '".npmrc"="deny"', '"**/.npmrc"="deny"', '".pypirc"="deny"', '"**/.pypirc"="deny"'].join(", ");
-  return `permissions.local-codex-tunnel={description="Local Codex", workspace_roots={${JSON.stringify(cwd)}=true}, filesystem={${reads}, ":workspace_roots"={${workspace}}}, network={enabled=${networkAccess}}}`;
+  const roots = [cwd];
+  if (commonGitDir && commonGitDir !== cwd && !commonGitDir.startsWith(`${cwd}/`)) roots.push(commonGitDir);
+  return `permissions.local-codex-tunnel={description="Local Codex", workspace_roots={${roots.map(root => `${JSON.stringify(root)}=true`).join(", ")}}, filesystem={${reads}, ":workspace_roots"={${workspace}}}, network={enabled=${networkAccess}}}`;
 }
 
 async function runWrapper(t, configs, extraArgs = [], cwd, capabilityDecision = "accept", approvalMode = "off") {
@@ -194,6 +196,27 @@ test("interactive resume fails closed without the monitor token", async t => {
   assert.deepEqual(result.approvalFiles, []);
 });
 
+test("secure wrapper validates and preserves the shared Git metadata root for linked worktrees", async t => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), "local-codex-linked-profile-")));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const repo = join(root, "repo");
+  const worktree = join(root, "worktree");
+  await mkdir(repo);
+  await runCommand("git", ["-C", repo, "init"]);
+  await runCommand("git", ["-C", repo, "config", "user.name", "Test User"]);
+  await runCommand("git", ["-C", repo, "config", "user.email", "test@example.com"]);
+  await writeFile(join(repo, "tracked.txt"), "tracked\n");
+  await runCommand("git", ["-C", repo, "add", "."]);
+  await runCommand("git", ["-C", repo, "commit", "-m", "initial"]);
+  await runCommand("git", ["-C", repo, "worktree", "add", "--detach", worktree, "HEAD"]);
+  const commonGitDir = await realpath(join(repo, ".git"));
+  const result = await runWrapper(t, [permissionConfig(worktree, false, commonGitDir)], [], worktree);
+  assert.equal(result.exitCode, 0);
+  const permission = result.record.args.find(value => value.startsWith("permissions.local-codex-tunnel="));
+  assert.ok(permission.includes(`${JSON.stringify(worktree)}=true`));
+  assert.ok(permission.includes(`${JSON.stringify(commonGitDir)}=true`));
+});
+
 test("secure wrapper keeps network-disabled jobs hardened and denies host-authority state", async t => {
   const workspace = await realpath(await mkdtemp(join(tmpdir(), "local-codex-profile-")));
   t.after(() => rm(workspace, { recursive: true, force: true }));
@@ -324,3 +347,14 @@ test("secure wrapper fails closed on missing, duplicate, malformed, or unsafe pe
     assert.equal(result.record, undefined);
   }
 });
+
+async function runCommand(command, args) {
+  const child = spawn(command, args, { stdio: ["ignore", "pipe", "pipe"] });
+  let stderr = "";
+  child.stderr.on("data", chunk => { stderr += chunk; });
+  const code = await new Promise((resolve, reject) => {
+    child.once("error", reject);
+    child.once("exit", resolve);
+  });
+  assert.equal(code, 0, stderr);
+}

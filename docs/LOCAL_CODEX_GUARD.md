@@ -51,6 +51,8 @@ The selected job remains selected by job ID when its status changes and the list
 
 The Jobs pane's `AGE` value is relative: active and queued jobs count from their start, while terminal jobs count from their finish or last update. It uses compact seconds, minutes, hours, or days. The Inspector's `ELAPSED` field remains the execution duration.
 
+Managed-worktree jobs keep the source repository name in the Jobs pane. The Inspector separates `WORKSPACE` from `SOURCE REPO` and shows isolation type, worktree state, and base commit. If retention has snapshotted a selected job, `o` asks the local adapter to verify and restore it before launching Codex CLI.
+
 The approval view shows the exact action and reason plus the effective security context that can be inferred safely at the host boundary: network state/delta, possible remote write, host credential availability, workspace writes, external target, and any additional permissions supplied by Codex. `d` reveals the full sanitized native approval request for inspection.
 
 ## Observable event boundary

@@ -16,6 +16,7 @@ import {
   officialBrowserDynamicTools,
   probeBrowserBackend,
 } from "./browser-probe.mjs";
+import { createWorktreeManager } from "./worktree-manager.mjs";
 
 // Only used to migrate pre-v3 records; never used as a new job's default.
 const legacyRootInput = process.env.LOCAL_CODEX_ROOT;
@@ -30,7 +31,9 @@ const LOG_FILE = process.env.LOCAL_CODEX_LOG_FILE ||
   resolve(homedir(), "Library/Application Support/tunnel-client/logs/local-codex.log");
 const JOBS_DIR = process.env.LOCAL_CODEX_JOBS_DIR || resolve(dirname(STATE_FILE), "jobs");
 const JOB_EVENTS_DIR = process.env.LOCAL_CODEX_JOB_EVENTS_DIR || resolve(dirname(STATE_FILE), "job-events");
-const VERSION = "3.3.0";
+const WORKTREE_ROOT = process.env.LOCAL_CODEX_WORKTREE_ROOT || resolve(homedir(), "Library/Application Support/local-codex-worktrees");
+const WORKTREE_RETENTION = Number(process.env.LOCAL_CODEX_WORKTREE_RETENTION || "15");
+const VERSION = "3.4.0";
 const DEFAULT_SETTINGS = { model: "gpt-5.6-luna", reasoningEffort: "max" };
 const MODEL_ALIASES = new Map([
   ["luna", "gpt-5.6-luna"], ["terra", "gpt-5.6-terra"], ["sol", "gpt-5.6-sol"],
@@ -56,7 +59,7 @@ const VISIBLE_EVENT_TYPES = new Set([
   "approval.requested", "approval.resolved", "approval.server_resolved",
   "browser.environment_blocked",
 ]);
-function permissionConfig(cwd, networkAccess) {
+function permissionConfig(cwd, networkAccess, commonGitDir = null) {
   // Codex 0.147's macOS :minimal preset includes unconditional temp writes.
   // Use system reads without that preset; keep other user/data/temp trees
   // denied. The selected workspace reopens only its own tree. Git metadata is
@@ -73,7 +76,9 @@ function permissionConfig(cwd, networkAccess) {
   const workspace = ['"."="write"', '".git"="write"', '".codex"="read"', '".env"="deny"', '".env.*"="deny"',
     '"**/.env"="deny"', '"**/.env.*"="deny"', '"*.env"="deny"', '"**/*.env"="deny"',
     '".npmrc"="deny"', '"**/.npmrc"="deny"', '".pypirc"="deny"', '"**/.pypirc"="deny"'].join(", ");
-  return `permissions.local-codex-tunnel={description="Local Codex", workspace_roots={${JSON.stringify(cwd)}=true}, filesystem={${reads}, ":workspace_roots"={${workspace}}}, network={enabled=${networkAccess}}}`;
+  const roots = [cwd];
+  if (commonGitDir && commonGitDir !== cwd && !commonGitDir.startsWith(`${cwd}/`)) roots.push(commonGitDir);
+  return `permissions.local-codex-tunnel={description="Local Codex", workspace_roots={${roots.map(root => `${JSON.stringify(root)}=true`).join(", ")}}, filesystem={${reads}, ":workspace_roots"={${workspace}}}, network={enabled=${networkAccess}}}`;
 }
 
 if (!Number.isInteger(PORT) || PORT < 1 || PORT > 65535) {
@@ -88,6 +93,10 @@ if (!Number.isSafeInteger(MAX_CONCURRENCY) || MAX_CONCURRENCY < 1 || MAX_CONCURR
 }
 if (!Number.isSafeInteger(MAX_QUEUE) || MAX_QUEUE < 0 || MAX_QUEUE > 100000) {
   throw new Error("LOCAL_CODEX_MAX_QUEUE must be an integer between 0 and 100000");
+}
+if (!isAbsolute(WORKTREE_ROOT)) throw new Error("LOCAL_CODEX_WORKTREE_ROOT must be absolute");
+if (!Number.isSafeInteger(WORKTREE_RETENTION) || WORKTREE_RETENTION < 1 || WORKTREE_RETENTION > 1000) {
+  throw new Error("LOCAL_CODEX_WORKTREE_RETENTION must be an integer between 1 and 1000");
 }
 
 if (!TOKEN_FILE) {
@@ -104,12 +113,20 @@ const threadNetworkAccess = new Map();
 const threadBrowserAccess = new Map();
 const threadSourceTitles = new Map();
 const threadCodexNames = new Map();
+const threadSourceCwds = new Map();
+const threadWorkspaceKinds = new Map();
+const threadWorktreeIds = new Map();
 let threadState = {};
 await mkdir(dirname(LOG_FILE), { recursive: true, mode: 0o700 });
 appendFileSync(LOG_FILE, "", { mode: 0o600 });
 await mkdir(JOBS_DIR, { recursive: true, mode: 0o700 });
 await mkdir(JOB_EVENTS_DIR, { recursive: true, mode: 0o700 });
 await mkdir(dirname(STATE_FILE), { recursive: true, mode: 0o700 });
+const worktreeManager = await createWorktreeManager({
+  rootDir: WORKTREE_ROOT,
+  stateDir: dirname(STATE_FILE),
+  retention: WORKTREE_RETENTION,
+});
 const jobs = new Map();
 const requests = new Map();
 const waiters = new Map();
@@ -144,6 +161,10 @@ const sourceTitleProperty = {
   type: "string", minLength: 1, maxLength: 200,
   description: "Exact title of the ChatGPT conversation that started this work. Pass it only when the host exposes the exact title; omit it when unavailable. Never invent, summarize, or infer a title.",
 };
+const worktreeProperty = {
+  type: "boolean", default: true,
+  description: "Defaults to true. For Git repositories, run this new thread in its own detached managed worktree created from committed HEAD. Set false only when the user explicitly needs the selected checkout itself. Non-Git and unborn repositories fall back to the selected directory.",
+};
 const newThreadNetworkProperty = {
   type: "boolean", default: false,
   description: "Choose from the user's task intent. Set true whenever completing the request requires outbound command network access, even if the user did not explicitly ask for network access—for example git fetch, git pull, git clone, installing dependencies or packages, curl, HTTP/API access, or downloads. Omit or set false for fully local work. Defaults to false and does not change filesystem access.",
@@ -166,15 +187,16 @@ const tools = [
   {
     name: "codex",
     title: "Local Codex",
-    description: "Start a background Codex job in cwd, any existing absolute folder you choose. Pass sourceTitle only when the host exposes the exact ChatGPT conversation title; otherwise omit it. Choose networkAccess from the user's task intent: set true when completing the request requires outbound command access such as git fetch, git pull, git clone, installing dependencies or packages, curl, HTTP/API access, or downloads, even if the user did not explicitly ask for network access; omit or use false for fully local command work. Choose browserAccess separately when the task needs the official Codex Browser/Chrome backend for navigation, page inspection, interaction, screenshots, or browser-based QA. browserAccess never enables shell-launched Playwright/Chromium, command networking, wider filesystem access, or danger-full-access. No directory allowlist or per-folder approval. Use codex-folders to locate the narrowest relevant folder. Jobs in different canonical folders can run concurrently; jobs for an active folder are serialized through the queue. Returns jobId immediately; poll codex-status with waitMs=20000, never resubmit to check progress. Default Luna/max.",
+    description: "Start a background Codex job from cwd, any existing absolute folder you choose. Git repositories use a dedicated detached worktree from committed HEAD by default. Different canonical folders can run concurrently, and isolated worktrees let different threads from one repository run concurrently too. Set worktree false only when the user explicitly needs the selected checkout, where jobs are serialized through the queue. Replies reuse the thread workspace. Pass sourceTitle only when the host exposes the exact ChatGPT conversation title; otherwise omit it. Choose networkAccess from the user's task intent: set true when completing the request requires outbound command access such as git fetch, git pull, git clone, installing dependencies or packages, curl, HTTP/API access, or downloads, even if the user did not explicitly ask for network access; omit or use false for fully local command work. Choose browserAccess separately when the task needs the official Codex Browser/Chrome backend for navigation, page inspection, interaction, screenshots, or browser-based QA. browserAccess never enables shell-launched Playwright/Chromium, command networking, wider filesystem access, or danger-full-access. Use codex-folders to locate the narrowest relevant folder. Returns jobId immediately; poll codex-status with waitMs=20000, never resubmit to check progress. Default Luna/max.",
     inputSchema: {
       type: "object",
       additionalProperties: false,
       properties: {
         requestId: requestIdProperty,
-        cwd: { type: "string", minLength: 1, maxLength: 4096, description: "Absolute path to an existing working folder. Symlinks resolve to their target; the returned canonical cwd is the write boundary." },
+        cwd: { type: "string", minLength: 1, maxLength: 4096, description: "Absolute path to an existing source folder. Symlinks resolve to their target. Status returns canonical sourceCwd plus the actual execution cwd, which is the write boundary." },
         prompt: { type: "string", minLength: 1, maxLength: 100000 },
         sourceTitle: sourceTitleProperty,
+        worktree: worktreeProperty,
         networkAccess: newThreadNetworkProperty,
         browserAccess: newThreadBrowserProperty,
         ...selectionProperties,
@@ -267,6 +289,7 @@ const server = createServer(async (req, res) => {
         activeJobIds: active.map(job => job.jobId), activeCwds: active.map(job => job.cwd),
         queuedJobIds: jobQueue.map(job => job.jobId), queuedCwds: jobQueue.map(job => job.cwd),
         maxConcurrency: MAX_CONCURRENCY, maxQueue: MAX_QUEUE, scheduling: "fifo-runnable-per-folder",
+        worktreesDefault: true, worktreeRetention: WORKTREE_RETENTION, worktreeRoot: WORKTREE_ROOT,
         browserAccessStatus: "official-backend",
       });
     }
@@ -307,6 +330,7 @@ const server = createServer(async (req, res) => {
 server.listen(PORT, HOST, async () => {
   try {
     await loadThreadState();
+    await worktreeManager.reconcile();
     await loadJobs();
     ready = true;
     process.stderr.write(`local-codex-adapter ready on http://${HOST}:${PORT}/mcp; scope=per_job\n`);
@@ -351,8 +375,29 @@ async function handleMcp(message, signal) {
       return { jsonrpc: "2.0", id: message.id, result: { tools } };
     case "tools/call":
       return callTool(message, signal);
+    case "localCodex/worktreeRestore":
+      return restoreWorktreeForMonitor(message);
     default:
       return rpcError(message.id, -32601, `method not found: ${message.method}`);
+  }
+}
+
+async function restoreWorktreeForMonitor(message) {
+  const jobId = message.params?.jobId;
+  assertIdentifier(jobId, "jobId");
+  const job = jobs.get(jobId);
+  if (!job) return rpcError(message.id, -32602, "unknown job");
+  if (!terminalStatuses.has(job.status)) return rpcError(message.id, -32602, "job is not terminal");
+  if (!job.worktreeId) return { jsonrpc: "2.0", id: message.id, result: { cwd: job.cwd, worktreeState: "direct" } };
+  try {
+    const record = await worktreeManager.prepare(job.worktreeId);
+    job.cwd = record.executionCwd;
+    job.gitCommonDir = record.commonGitDir;
+    job.worktreeState = record.state;
+    persistJob(job);
+    return { jsonrpc: "2.0", id: message.id, result: { cwd: job.cwd, worktreeState: job.worktreeState } };
+  } catch (error) {
+    return rpcError(message.id, -32603, error.message || "worktree restore failed");
   }
 }
 
@@ -370,7 +415,7 @@ async function callTool(message, signal) {
       return toolResult(message.id, await listFolders(args));
     }
     if (name === "codex" || name === "codex-reply") {
-      validateArguments(args, name === "codex" ? ["requestId", "cwd", "prompt", "sourceTitle", "networkAccess", "browserAccess", "model", "reasoningEffort"]
+      validateArguments(args, name === "codex" ? ["requestId", "cwd", "prompt", "sourceTitle", "worktree", "networkAccess", "browserAccess", "model", "reasoningEffort"]
         : ["requestId", "threadId", "prompt", "sourceTitle", "networkAccess", "browserAccess", "model", "reasoningEffort"]);
       const missing = tools.find(tool => tool.name === name).inputSchema.required.filter(field => args[field] === undefined);
       if (missing.length) {
@@ -386,10 +431,13 @@ async function callTool(message, signal) {
       if (args.browserAccess !== undefined && typeof args.browserAccess !== "boolean") {
         throw callError("invalid_request", "browserAccess must be true or false when provided");
       }
+      if (args.worktree !== undefined && typeof args.worktree !== "boolean") {
+        throw callError("invalid_request", "worktree must be true or false when provided");
+      }
       if (name === "codex-reply" && !threadFolders.has(args.threadId)) {
         throw callError("unknown_thread", "threadId was not created by this Local Codex adapter");
       }
-      const cwd = name === "codex" ? await canonicalDirectory(args.cwd, "cwd") : threadFolders.get(args.threadId);
+      const sourceCwd = name === "codex" ? await canonicalDirectory(args.cwd, "cwd") : threadSourceCwds.get(args.threadId) || threadFolders.get(args.threadId);
       const networkAccess = args.networkAccess ?? (name === "codex-reply" ? threadNetworkAccess.get(args.threadId) : false) ?? false;
       const browserAccess = args.browserAccess ?? (name === "codex-reply" ? threadBrowserAccess.get(args.threadId) : false) ?? false;
       const sourceTitle = suppliedSourceTitle ?? (name === "codex-reply" ? threadSourceTitles.get(args.threadId) : null) ?? null;
@@ -399,13 +447,14 @@ async function callTool(message, signal) {
         throw callError("browser_host_context_unavailable", "Official Browser Use requires a live ChatGPT turn context. Refresh Local Codex tools and start the browser job from ChatGPT; no job was started.");
       }
       const key = digest(args.requestId);
-      const fingerprintInput = [cwd, name, args.prompt, args.threadId ?? null,
+      const fingerprintInput = [sourceCwd, name, args.prompt, args.threadId ?? null,
         MODEL_ALIASES.get(args.model) || args.model || null, args.reasoningEffort ?? null];
       // Keep omitted-field fingerprints byte-for-byte compatible with pre-v3.1
       // saved jobs. Explicit capability values are still distinct requests.
       if (args.networkAccess !== undefined) fingerprintInput.push(args.networkAccess);
       if (args.browserAccess !== undefined) fingerprintInput.push(args.browserAccess);
       if (args.sourceTitle !== undefined) fingerprintInput.push(suppliedSourceTitle);
+      if (args.worktree !== undefined) fingerprintInput.push(args.worktree);
       const fingerprint = digest(JSON.stringify(fingerprintInput));
       const prior = requests.get(key);
       if (prior) {
@@ -415,12 +464,44 @@ async function callTool(message, signal) {
       if (!storageHealthy) throw callError("storage_error", "Job storage unavailable; refusing new work");
       if (shuttingDown) throw callError("unavailable", "Adapter is shutting down; no work was started");
       if (signal?.aborted) throw callError("request_cancelled", "Request disconnected before acceptance");
+      const jobId = randomUUID();
+      let workspace;
+      if (name === "codex") {
+        try { workspace = await worktreeManager.plan({ id: jobId, sourceCwd, enabled: args.worktree !== false }); }
+        catch (error) { throw callError(error.code || "worktree_plan_failed", error.message || "Unable to plan worktree"); }
+      } else {
+        const worktreeId = threadWorktreeIds.get(args.threadId);
+        workspace = worktreeId ? worktreeManager.get(worktreeId) : null;
+        if (!workspace) {
+          workspace = {
+            id: null,
+            sourceCwd,
+            executionCwd: threadFolders.get(args.threadId),
+            baseSha: null,
+            commonGitDir: null,
+            state: "direct",
+            reason: "legacy_or_direct",
+          };
+        }
+      }
+      const concurrent = requests.get(key);
+      if (concurrent) {
+        if (workspace.id) await worktreeManager.abandon(workspace.id);
+        if (concurrent.fingerprint !== fingerprint) throw callError("request_conflict", "requestId already belongs to different arguments");
+        return toolResult(message.id, snapshot(concurrent));
+      }
+      const cwd = workspace.executionCwd;
       const startNow = canRunFolder(cwd);
       if (!startNow && jobQueue.length >= MAX_QUEUE) {
+        if (workspace.id) await worktreeManager.abandon(workspace.id);
         throw callError("queue_full", `Local Codex queue is full (${MAX_QUEUE}); retry with the same requestId after another job finishes`);
       }
       const job = {
-        jobId: randomUUID(), requestKey: key, fingerprint, tool: name, cwd,
+        jobId, requestKey: key, fingerprint, tool: name, cwd, sourceCwd,
+        workspaceKind: workspace.id ? "worktree" : "direct",
+        worktreeId: workspace.id, worktreeState: workspace.state,
+        worktreeReason: workspace.reason ?? null, baseSha: workspace.baseSha ?? null,
+        gitCommonDir: workspace.commonGitDir ?? null,
         status: startNow ? "starting" : "queued", threadId: args.threadId ?? null, turnId: null,
         model: null, reasoningEffort: null, networkAccess, browserAccess,
         browserBackend: browserAccess ? "official_codex" : "none", browserTurnMetadata, settingsStatus: "pending",
@@ -430,7 +511,11 @@ async function callTool(message, signal) {
       // Acceptance is durable before work is started or queued. Visible prompts
       // and activity may also be persisted in the private Guard/job-event stream;
       // restart recovery still marks queued/running work interrupted rather than replaying it.
-      persistJob(job);
+      try { persistJob(job); }
+      catch (error) {
+        if (workspace.id) await worktreeManager.abandon(workspace.id);
+        throw error;
+      }
       jobs.set(job.jobId, job);
       requests.set(key, job);
       job.done = new Promise(resolve => { job.resolveDone = resolve; });
@@ -687,6 +772,17 @@ function scheduleJobs() {
 async function executeJob(job, args) {
   try {
     if (job.stopReason) throw callError(job.stopReason, "Job stopped before execution");
+    if (job.worktreeId) {
+      let workspace;
+      try { workspace = await worktreeManager.prepare(job.worktreeId); }
+      catch (error) { throw callError(error.code || "worktree_create_failed", error.message); }
+      job.cwd = workspace.executionCwd;
+      job.sourceCwd = workspace.sourceCwd;
+      job.worktreeState = workspace.state;
+      job.baseSha = workspace.baseSha;
+      job.gitCommonDir = workspace.commonGitDir;
+      persistJob(job);
+    }
     await verifyPinnedDirectory(job.cwd);
     if (job.stopReason) throw callError(job.stopReason, "Job stopped before execution");
     job.status = "running";
@@ -706,6 +802,28 @@ async function executeJob(job, args) {
     activeFolders.delete(job.cwd);
     settleJob(job);
     scheduleJobs();
+    setImmediate(() => {
+      void pruneManagedWorktrees().catch(() => {
+        process.stderr.write("local-codex-adapter worktree pruning deferred\n");
+      });
+    });
+  }
+}
+
+async function pruneManagedWorktrees() {
+  const protectedIds = new Set(
+    [...activeJobs.values(), ...jobQueue]
+      .map(job => job.worktreeId)
+      .filter(Boolean)
+  );
+  const pruned = await worktreeManager.prune(protectedIds);
+  if (!pruned.length) return;
+  for (const record of pruned) {
+    for (const job of jobs.values()) {
+      if (job.worktreeId !== record.id) continue;
+      job.worktreeState = record.state;
+      try { persistJob(job); } catch { storageHealthy = false; }
+    }
   }
 }
 
@@ -719,6 +837,7 @@ function cancelJob(job, reason) {
     job.finishedAt = Date.now();
     const index = jobQueue.indexOf(job);
     if (index >= 0) jobQueue.splice(index, 1);
+    if (job.worktreeId) void worktreeManager.abandon(job.worktreeId);
     try { persistJob(job); }
     finally {
       logCall(`job_${job.status}`, job, job.errorCode);
@@ -743,6 +862,11 @@ function settleJob(job) {
 function snapshot(job) {
   return {
     jobId: job.jobId, status: job.status, cwd: job.cwd, threadId: job.threadId, turnId: job.turnId,
+    sourceCwd: job.sourceCwd || job.cwd,
+    workspaceKind: job.workspaceKind || "direct",
+    ...(job.worktreeId ? { worktreeId: job.worktreeId, worktreeState: job.worktreeState || "planned" } : {}),
+    ...(job.worktreeReason ? { worktreeReason: job.worktreeReason } : {}),
+    ...(job.baseSha ? { baseSha: job.baseSha } : {}),
     model: job.model, reasoningEffort: job.reasoningEffort,
     ...(job.sourceTitle ? { sourceTitle: job.sourceTitle } : {}),
     ...(job.codexThreadName ? { codexThreadName: job.codexThreadName } : {}),
@@ -760,7 +884,8 @@ function snapshot(job) {
 function persistJob(job) {
   job.updatedAt = Date.now();
   const record = { ...snapshot(job), requestKey: job.requestKey, fingerprint: job.fingerprint,
-    tool: job.tool, settingsStatus: job.settingsStatus };
+    tool: job.tool, settingsStatus: job.settingsStatus,
+    ...(job.gitCommonDir ? { gitCommonDir: job.gitCommonDir } : {}) };
   const target = resolve(JOBS_DIR, `${job.jobId}.json`);
   writePrivateJson(target, record);
 }
@@ -797,6 +922,20 @@ async function loadJobs() {
       writePrivateJson(resolve(JOBS_DIR, file), job); // Keep original fingerprint, answer, and timestamps.
     }
     if (typeof job.cwd !== "string" || !isAbsolute(job.cwd)) throw new Error("Invalid job folder");
+    if (job.sourceCwd === undefined) job.sourceCwd = job.cwd;
+    if (typeof job.sourceCwd !== "string" || !isAbsolute(job.sourceCwd)) throw new Error("Invalid job source folder");
+    if (job.workspaceKind === undefined) job.workspaceKind = "direct";
+    if (!["direct", "worktree"].includes(job.workspaceKind)) throw new Error("Invalid job workspace kind");
+    if (job.worktreeId !== undefined && job.worktreeId !== null) {
+      const record = worktreeManager.get(job.worktreeId);
+      if (!record || record.executionCwd !== job.cwd) throw new Error("Invalid job worktree state");
+      job.worktreeState = record.state;
+      job.gitCommonDir = record.commonGitDir;
+    } else {
+      job.worktreeId = null;
+      job.worktreeState = "direct";
+      job.gitCommonDir = null;
+    }
     if (job.networkAccess === undefined) job.networkAccess = false;
     if (typeof job.networkAccess !== "boolean") throw new Error("Invalid job network setting");
     if (job.browserAccess === undefined) job.browserAccess = false;
@@ -822,6 +961,17 @@ async function loadJobs() {
       job.message = "Adapter restarted before completion. Work was not replayed; inspect the thread before requesting new work.";
       job.finishedAt = Date.now();
       persistJob(job);
+    }
+    if (job.worktreeId) {
+      const record = worktreeManager.get(job.worktreeId);
+      if (terminalStatuses.has(job.status) && record && ["planned", "creating", "failed"].includes(record.state)) {
+        await worktreeManager.abandon(job.worktreeId);
+        job.worktreeId = null;
+        job.workspaceKind = "direct";
+        job.worktreeState = "direct";
+        job.cwd = job.sourceCwd;
+        persistJob(job);
+      }
     }
     jobs.set(job.jobId, job);
     requests.set(job.requestKey, job);
@@ -1004,7 +1154,7 @@ async function runCodex(args, existingThreadId, audit) {
   return new Promise((resolvePromise, rejectPromise) => {
     const cwd = audit.cwd;
     const appServerArgs = [
-      "app-server", "--listen", "stdio://", "-c", permissionConfig(cwd, audit.networkAccess),
+      "app-server", "--listen", "stdio://", "-c", permissionConfig(cwd, audit.networkAccess, audit.gitCommonDir),
       "-c", "mcp_servers.node_repl.enabled=false",
       "-c", "mcp_servers.playwright.enabled=false",
     ];
@@ -1108,6 +1258,13 @@ async function runCodex(args, existingThreadId, audit) {
         audit.threadId = threadId;
         if (audit.browserAccess) logCall("browser_backend_ready", audit);
         threadFolders.set(threadId, cwd);
+        threadSourceCwds.set(threadId, audit.sourceCwd || cwd);
+        threadWorkspaceKinds.set(threadId, audit.workspaceKind || "direct");
+        if (audit.worktreeId) {
+          threadWorktreeIds.set(threadId, audit.worktreeId);
+          const bound = await worktreeManager.bindThread(audit.worktreeId, threadId);
+          audit.worktreeState = bound.state;
+        }
         threadNetworkAccess.set(threadId, audit.networkAccess);
         threadBrowserAccess.set(threadId, audit.browserAccess ?? false);
         if (audit.sourceTitle) threadSourceTitles.set(threadId, audit.sourceTitle);
@@ -1558,6 +1715,7 @@ function logCall(event, audit, errorCode) {
     component: "local-codex-adapter", event, adapterVersion: VERSION, schemaFingerprint: SCHEMA_FINGERPRINT,
     jobId: audit.jobId, tool: audit.tool, status: audit.status,
     threadId: audit.threadId, turnId: audit.turnId,
+    workspaceKind: audit.workspaceKind || "direct", worktreeState: audit.worktreeState || null,
     model: audit.model, reasoningEffort: audit.reasoningEffort,
     networkAccess: audit.networkAccess ?? false, browserAccess: audit.browserAccess ?? false,
     browserBackend: audit.browserBackend ?? (audit.browserAccess ? "official_codex" : "none"),
@@ -1587,6 +1745,12 @@ function resultSchema() {
     properties: {
       jobId: { type: "string" },
       cwd: { type: "string" },
+      sourceCwd: { type: "string" },
+      workspaceKind: { type: "string", enum: ["direct", "worktree"] },
+      worktreeId: { type: "string" },
+      worktreeState: { type: "string", enum: ["planned", "creating", "ready", "snapshotted", "failed"] },
+      worktreeReason: { type: "string" },
+      baseSha: { type: "string" },
       status: { type: "string", enum: ["queued", "starting", "running", "cancelling", "completed", "failed", "cancelled", "timed_out", "interrupted", "busy", "error"] },
       activeJobId: { type: "string" },
       threadId: { type: ["string", "null"] },
@@ -1633,13 +1797,22 @@ async function loadThreadState() {
     if (error?.code !== "ENOENT") throw error;
     return;
   }
-  if (!Array.isArray(threadState.threadIds) || (threadState.schemaVersion ?? 1) > 4) throw new Error("Invalid thread state");
+  if (!Array.isArray(threadState.threadIds) || (threadState.schemaVersion ?? 1) > 5) throw new Error("Invalid thread state");
   let migrated = false;
   for (const id of threadState.threadIds) {
     if (typeof id !== "string" || !id) throw new Error("Invalid thread id");
     const saved = threadState.threadCwds?.[id];
     const cwd = saved ?? await legacyCwd();
     if (typeof cwd !== "string" || !isAbsolute(cwd)) throw new Error("Invalid thread folder");
+    const sourceCwd = threadState.threadSourceCwds?.[id] ?? cwd;
+    if (typeof sourceCwd !== "string" || !isAbsolute(sourceCwd)) throw new Error("Invalid thread source folder");
+    const workspaceKind = threadState.threadWorkspaceKinds?.[id] ?? "direct";
+    if (!["direct", "worktree"].includes(workspaceKind)) throw new Error("Invalid thread workspace kind");
+    const worktreeId = threadState.threadWorktreeIds?.[id];
+    if (worktreeId !== undefined) {
+      const record = worktreeManager.get(worktreeId);
+      if (!record || record.threadId !== id || record.executionCwd !== cwd) throw new Error("Invalid thread worktree mapping");
+    }
     const networkAccess = threadState.threadNetworkAccess?.[id] ?? false;
     if (typeof networkAccess !== "boolean") throw new Error("Invalid thread network setting");
     const browserAccess = threadState.threadBrowserAccess?.[id] ?? false;
@@ -1649,21 +1822,26 @@ async function loadThreadState() {
     const codexThreadName = threadState.threadCodexNames?.[id];
     if (codexThreadName !== undefined) validatePersistedTitle(codexThreadName, "thread Codex name");
     threadFolders.set(id, cwd);
+    threadSourceCwds.set(id, sourceCwd);
+    threadWorkspaceKinds.set(id, workspaceKind);
+    if (worktreeId) threadWorktreeIds.set(id, worktreeId);
     threadNetworkAccess.set(id, networkAccess);
     threadBrowserAccess.set(id, browserAccess);
     if (sourceTitle) threadSourceTitles.set(id, sourceTitle);
     if (codexThreadName) threadCodexNames.set(id, codexThreadName);
-    if (saved === undefined || threadState.threadNetworkAccess?.[id] === undefined ||
+    if ((threadState.schemaVersion ?? 1) < 5 || saved === undefined ||
+        threadState.threadNetworkAccess?.[id] === undefined ||
         threadState.threadBrowserAccess?.[id] === undefined) migrated = true;
   }
   if (migrated) saveThreadState();
 }
 
 function saveThreadState() {
-  // browserAccess is an additive optional map in the existing v4 state shape;
-  // keep the version stable so older v4 readers can ignore the new field.
-  threadState = { ...threadState, schemaVersion: 4, threadIds: [...threadFolders.keys()],
+  threadState = { ...threadState, schemaVersion: 5, threadIds: [...threadFolders.keys()],
     threadCwds: Object.fromEntries(threadFolders),
+    threadSourceCwds: Object.fromEntries(threadSourceCwds),
+    threadWorkspaceKinds: Object.fromEntries(threadWorkspaceKinds),
+    threadWorktreeIds: Object.fromEntries(threadWorktreeIds),
     threadNetworkAccess: Object.fromEntries(threadNetworkAccess),
     threadBrowserAccess: Object.fromEntries(threadBrowserAccess),
     threadSourceTitles: Object.fromEntries(threadSourceTitles),

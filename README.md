@@ -32,15 +32,17 @@ See [Monitor from the Mac](#monitor-from-the-mac) for health checks and saved th
 
 ## What it exposes
 
-- `codex(requestId, cwd, prompt, sourceTitle?, networkAccess?, browserAccess?, model?, reasoningEffort?)` starts a background job in any existing folder.
+- `codex(requestId, cwd, prompt, sourceTitle?, worktree?, networkAccess?, browserAccess?, model?, reasoningEffort?)` starts a background job in any existing folder.
 - `codex-reply(requestId, threadId, prompt, sourceTitle?, networkAccess?, browserAccess?, model?, reasoningEffort?)` starts a background reply on an adapter-owned thread.
 - `codex-status(jobId, waitMs?)` reads progress and the saved result. Use `waitMs: 20000` while queued or running.
 - `codex-cancel(jobId)` explicitly stops queued or running work. It does not undo file changes.
 - `codex-folders(path?, cursor?)` lists up to 100 child directory names per page. It defaults to your home directory and never reads file contents.
 
-ChatGPT chooses an existing absolute `cwd` for each new thread, with **no directory allowlist or per-folder approval**. It can use `codex-folders` to locate the narrowest folder relevant to your task. Symlinks resolve to their target; the canonical `cwd` is returned with the job and is its write boundary. Relative, missing, inaccessible, and file paths fail without starting work. Folder discovery includes directory symlinks but omits files and broken links; follow `nextCursor` with the same path to continue the alphabetical listing.
+ChatGPT chooses an existing absolute `cwd` for each new thread, with **no directory allowlist or per-folder approval**. It can use `codex-folders` to locate the narrowest folder relevant to your task. Symlinks resolve to their target. Relative, missing, inaccessible, and file paths fail without starting work. Folder discovery includes directory symlinks but omits files and broken links; follow `nextCursor` with the same path to continue the alphabetical listing.
 
-Replies always use their thread's saved folder and cannot accept a different `cwd`. Start a new thread to change folders. If a saved folder disappears or resolves elsewhere, replies fail without widening access. The caller cannot change the sandbox or permission level.
+Git repositories use a private detached worktree from committed `HEAD` by default. Staged, unstaged, and untracked source-checkout changes are not copied. The returned `sourceCwd` is the selected folder and `cwd` is the actual execution/write boundary inside the managed worktree. Selected subdirectories map to the same relative path. Set `worktree: false` only when the task explicitly needs the selected checkout. Non-Git and unborn repositories fall back to direct execution and report the reason. See [Managed Worktrees](docs/MANAGED_WORKTREES.md).
+
+Replies always reuse their thread's saved worktree or direct folder and cannot accept a different `cwd` or isolation mode. A pruned managed worktree is restored automatically before the reply starts. Start a new thread to change folders. The caller cannot change the sandbox or permission level.
 
 `sourceTitle` is optional source metadata, not a generated summary. ChatGPT must pass it only when the host exposes the exact current conversation title; otherwise it must be omitted. Exact titles persist across replies. The monitor then falls back to Codex's own App Server thread name and finally to a prompt preview, with the fallback source labeled explicitly. Current ChatGPT connector metadata does not include the conversation title automatically.
 
@@ -58,28 +60,30 @@ Host approval prompts are optional and default to **off**. `LOCAL_CODEX_APPROVAL
 2. Poll `codex-status` until `completed`, `failed`, `cancelled`, `timed_out`, or `interrupted`. A job may report `queued` before it starts. Only `completed` contains a successful final answer.
 3. If submission delivery is uncertain, retry with the **same requestId and arguments**. This returns the same saved job. Reusing an ID with different arguments or a different canonical folder fails.
 
-Jobs targeting different canonical folders can run concurrently. `LOCAL_CODEX_MAX_CONCURRENCY` controls the global active-job limit and defaults to **10**. A canonical folder has at most one active job, so work targeting the same folder is serialized. When a job cannot start immediately, it is accepted into a bounded queue instead of returning `busy`; `LOCAL_CODEX_MAX_QUEUE` defaults to **100**. If the queue is full, the request returns `queue_full` without being accepted, so retry later with the same `requestId` and arguments.
+`LOCAL_CODEX_MAX_CONCURRENCY` defaults to **10**. Separate managed worktrees can run concurrently even when they come from one repository. Direct jobs still serialize on the same canonical folder. When a job cannot start immediately, it is accepted into a bounded queue instead of returning `busy`; `LOCAL_CODEX_MAX_QUEUE` defaults to **100**. If the queue is full, retry later with the same `requestId` and arguments.
 
 The scheduling policy is **FIFO among runnable jobs**: the oldest queued job whose folder is not currently locked starts when capacity is available. A queued job blocked by its folder does not unnecessarily block older independent work behind it. `codex-status` and `codex-cancel` work for queued jobs; cancelling a queued job makes it `cancelled` without spawning Codex. `/readyz` reports active/queued counts, job IDs, folders, configured limits, and the scheduling policy.
 
 Jobs run independently of the tunnel's response deadline, with a 30-minute execution limit by default. Set `LOCAL_CODEX_CALL_TIMEOUT_MS` in the local config to change it. Queue wait time does not consume this execution limit. Cancellation first requests `turn/interrupt`, then terminates the job's process group if needed. A folder lock is not released until the old process has exited, so a same-folder successor cannot overlap it.
 
-Job metadata and final results are saved atomically under `LOCAL_CODEX_JOBS_DIR` (default: `jobs` next to `threads.json`), using mode `0700` directories and `0600` files. Request IDs and input fingerprints are hashed; job files do not contain prompts or reasoning. They may contain the optional exact source title and Codex thread name used by the monitor. Codex's own session history is separate and may contain the original input. Saved results are retained until explicitly removed. On adapter restart, unfinished active **and queued** jobs become `interrupted` and are never replayed; inspect their threads before starting replacement work.
+Job metadata and final results are saved atomically under `LOCAL_CODEX_JOBS_DIR` using mode `0700` directories and `0600` files. Request IDs and input fingerprints are hashed; job files do not contain prompts or reasoning. Managed worktree metadata and private snapshots live beside thread state. The newest 15 worktrees are retained by default; older inactive worktrees are snapshotted and can be restored automatically. Saved results and snapshot bundles are retained until explicitly removed. On adapter restart, unfinished active and queued jobs become `interrupted` and are never replayed.
 
 ## Security boundary
 
 - The adapter listens only on `127.0.0.1`.
 - A generated bearer token protects the local MCP endpoint.
-- The canonical `cwd` is always the write boundary.
+- The returned execution `cwd` is the file write boundary. `sourceCwd` identifies the selected checkout.
 - With networking disabled, jobs receive system read access and write access only to the chosen canonical folder. On macOS, other user folders, mounted volumes, and temporary trees are denied unless they are inside the chosen folder.
 - With networking enabled, reads and developer-auth environment are intentionally terminal-like so normal `gh`, Git credential, Keychain, SSH-agent, and developer environment workflows work. This is a broader trust mode; use it only for tasks and repositories you trust.
 - The macOS hardened profile deliberately avoids Codex 0.147's `:minimal` preset, which grants unconditional system-temp writes. Tools that need writable scratch space must use the chosen folder.
 - `.codex` stays read-only. `.git` is writable inside the selected folder because fetch, clone, commit, and related Git operations require metadata writes.
+- A linked worktree also receives write access to its validated shared Git metadata directory. Original checkout files remain outside the write boundary, but Git refs and objects are shared by Git's worktree design.
 - Common credential files inside every selected folder are denied to sandboxed commands: `.env`, `.env.*`, `*.env`, `.npmrc`, and `.pypirc`, including nested copies.
 - The authenticated folder lookup tool can list directory names elsewhere; it does not grant a network-disabled running job access to those folders.
 - Commands run without network access by default. `networkAccess: true` enables broad direct command network access without a domain allowlist and also enables normal host developer authentication. A network-enabled job can send readable host/workspace data to external services and can act with credentials available to your normal developer session. With the default `LOCAL_CODEX_APPROVAL_MODE=off`, that capability is not separately host-approved.
 - Network-disabled jobs use a small environment allowlist with secret-name filtering. Network-enabled jobs inherit the normal host developer environment, except `LOCAL_CODEX_*` and `TUNNEL_CLIENT_*` variables are removed so the bridge's own control/runtime credentials are not exposed.
 - Thread replies are accepted only for thread IDs created by this adapter.
+- Worktree creation uses deterministic adapter-owned paths, detached `HEAD`, disabled checkout hooks, and no shell command strings. Pruning never targets unregistered worktrees and never deletes before a private bundle and overlay are verified.
 - Native TUI handoff is allowed only for terminal jobs with a saved adapter-owned thread. The secure wrapper authenticates the monitor with the private adapter token, reapplies the job's workspace/network boundary, strips bridge variables, and uses `never` or native `untrusted` CLI approvals according to `LOCAL_CODEX_APPROVAL_MODE`.
 - ChatGPT's job-scoped Browser context is not transferred to a standalone CLI resume. Browser-enabled jobs require a second `o` confirmation in the monitor.
 - No inbound public port is required.
@@ -91,6 +95,7 @@ These controls reduce accidental credential exposure for network-disabled jobs. 
 ## Requirements
 
 - macOS
+- Git
 - Node.js 22 or newer
 - Codex CLI 0.138.0 or newer, logged in; latest stable is recommended because permission profiles are beta
 - Official OpenAI `tunnel-client`
@@ -215,6 +220,8 @@ v3.1.1 clarifies the MCP contract so ChatGPT chooses `networkAccess` from the us
 v3.2 adds concurrent jobs across different canonical folders, same-folder serialization, bounded queueing, and configurable concurrency/queue limits. Existing saved request fingerprints and completed results remain compatible. Restart recovery does not replay queued or active work; unfinished jobs become `interrupted`.
 
 v3.3 routes `browserAccess: true` through the official bundled Codex Browser runtime on every platform. Before starting a model turn, Local Codex verifies managed policy, the enabled Browser plugin, the trusted `node_repl` transport, and Browser runtime setup. Browser-enabled replies inherit the capability unless explicitly disabled. Refresh Local Codex's tools and start a fresh conversation after upgrading.
+
+v3.4 makes detached per-thread worktrees the default for Git repositories, raises default concurrency to 10, adds worktree snapshots/restoration, and adds prompt-source/native-TUI monitor integration. Existing threads migrate as direct workspaces. Refresh Local Codex's tools and start a fresh ChatGPT conversation before using `worktree`.
 
 The current `main` behavior additionally makes host approvals optional through `LOCAL_CODEX_APPROVAL_MODE=off|host`, defaulting to `off`. Network-enabled jobs remain terminal-like for host reads and developer authentication; network-disabled jobs remain hardened and the tunnel's own runtime/control variables stay filtered. It also adds optional exact `sourceTitle` metadata, Codex-name/prompt fallbacks in the monitor, and guarded `o` handoff to `codex resume` for terminal jobs. Refresh Local Codex's tools and use a fresh ChatGPT conversation before expecting `sourceTitle` in the tool schema.
 

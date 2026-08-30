@@ -5,7 +5,7 @@ import {
   appendFileSync, closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync,
   readdirSync, realpathSync, renameSync, rmSync, writeFileSync,
 } from "node:fs";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { homedir } from "node:os";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -33,7 +33,7 @@ const GUARD_PROXY = fileURLToPath(new URL("./local-codex-guard-proxy.mjs", impor
 // even when the selected workspace is an ancestor such as the user's home.
 // Network-enabled jobs still deliberately widen ordinary host read/env access
 // to match the user's terminal, but never to this host-authority directory.
-function permissionConfig(cwd, networkAccess, trustedHostAccess = false, protectedControlDir = null) {
+function permissionConfig(cwd, networkAccess, trustedHostAccess = false, protectedControlDir = null, commonGitDir = null) {
   const denied = ["/Users", "/System/Volumes/Data/Users", "/Volumes", "/private/tmp", "/tmp", "/private/var/tmp", "/var/tmp", "/private/var/folders", "/var/folders"];
   const inside = path => cwd === "/" || path === cwd || path.startsWith(`${cwd}/`);
   let readRules;
@@ -52,7 +52,9 @@ function permissionConfig(cwd, networkAccess, trustedHostAccess = false, protect
   const workspace = ['"."="write"', '".git"="write"', '".codex"="read"', '".env"="deny"', '".env.*"="deny"',
     '"**/.env"="deny"', '"**/.env.*"="deny"', '"*.env"="deny"', '"**/*.env"="deny"',
     '".npmrc"="deny"', '"**/.npmrc"="deny"', '".pypirc"="deny"', '"**/.pypirc"="deny"'].join(", ");
-  return `permissions.local-codex-tunnel={description="Local Codex", workspace_roots={${JSON.stringify(cwd)}=true}, filesystem={${reads}, ":workspace_roots"={${workspace}}}, network={enabled=${networkAccess}}}`;
+  const roots = [cwd];
+  if (commonGitDir && commonGitDir !== cwd && !commonGitDir.startsWith(`${cwd}/`)) roots.push(commonGitDir);
+  return `permissions.local-codex-tunnel={description="Local Codex", workspace_roots={${roots.map(root => `${JSON.stringify(root)}=true`).join(", ")}}, filesystem={${reads}, ":workspace_roots"={${workspace}}}, network={enabled=${networkAccess}}}`;
 }
 
 function probePermissionConfig(cwd, protectedControlDir = null) {
@@ -139,13 +141,14 @@ if (networkMatches.length !== 1) {
   throw new Error("Local Codex permission profile must select exactly one network state");
 }
 const networkAccess = networkMatches[0].includes("true");
+const commonGitDir = gitCommonDirectory(cwd);
 if (PROBE_MODE && networkAccess) {
   throw new Error("Local Codex probe mode cannot enable command network access");
 }
 // Validate only the adapter-owned input profile. The wrapper-owned CONTROL_DIR
 // deny and host capability gate are applied after this exact validation and
 // cannot be supplied, removed, or redirected by the caller.
-const expectedPermission = PROBE_MODE ? probePermissionConfig(cwd) : permissionConfig(cwd, networkAccess);
+const expectedPermission = PROBE_MODE ? probePermissionConfig(cwd) : permissionConfig(cwd, networkAccess, false, null, commonGitDir);
 if (permission !== expectedPermission) {
   throw new Error(PROBE_MODE
     ? "Local Codex probe profile does not match the read-only browser diagnostic policy"
@@ -160,7 +163,7 @@ if (args.includes("--sandbox") || args.some(value => value.includes("sandbox_mod
 // workspace read-only, so App Server/plugin startup behavior cannot mutate it.
 args[permissionIndex] = PROBE_MODE
   ? probePermissionConfig(cwd, CONTROL_DIR)
-  : permissionConfig(cwd, networkAccess, networkAccess, CONTROL_DIR);
+  : permissionConfig(cwd, networkAccess, networkAccess, CONTROL_DIR, commonGitDir);
 if (networkAccess) {
   for (const config of TRUSTED_SHELL_ENV_CONFIGS) args.push("-c", config);
 } else {
@@ -285,6 +288,21 @@ function authorizedResume(value) {
   const actualBuffer = Buffer.from(value);
   const expectedBuffer = Buffer.from(expected);
   return actualBuffer.length === expectedBuffer.length && timingSafeEqual(actualBuffer, expectedBuffer);
+}
+
+function gitCommonDirectory(cwd) {
+  const result = spawnSync("git", ["-C", cwd, "rev-parse", "--path-format=absolute", "--git-common-dir"], {
+    encoding: "utf8",
+    env: {
+      ...process.env,
+      GIT_CONFIG_NOSYSTEM: "1",
+      GIT_CONFIG_GLOBAL: "/dev/null",
+      GIT_TERMINAL_PROMPT: "0",
+    },
+  });
+  if (result.status !== 0 || typeof result.stdout !== "string" || !result.stdout.trim()) return null;
+  try { return realpathSync(result.stdout.trim()); }
+  catch { throw new Error("Invalid Git common directory for Local Codex workspace"); }
 }
 
 async function waitForNetworkCapabilityApproval() {

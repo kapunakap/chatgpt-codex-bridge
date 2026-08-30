@@ -363,6 +363,28 @@ async function openInCodex(job) {
     return showNotice("Unable to authorize secure Codex resume.");
   }
 
+  let resumeCwd = job.cwd;
+  if (job.worktreeId) {
+    try {
+      const response = await fetch("http://" + host + ":" + String(port) + "/mcp", {
+        method: "POST",
+        headers: { Authorization: authorization, "Content-Type": "application/json" },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id: "watch-restore-" + String(Date.now()),
+          method: "localCodex/worktreeRestore",
+          params: { jobId: job.jobId },
+        }),
+        signal: AbortSignal.timeout(30000),
+      });
+      const result = await response.json();
+      if (!response.ok || result.error || typeof result.result?.cwd !== "string") throw new Error();
+      resumeCwd = result.result.cwd;
+    } catch {
+      return showNotice("Unable to restore this job's worktree.");
+    }
+  }
+
   handoffActive = true;
   clearNotice();
   restoreTerminal();
@@ -372,7 +394,7 @@ async function openInCodex(job) {
   try {
     exitCode = await new Promise((resolve, reject) => {
       const child = spawn(secureBin, ["resume", job.threadId], {
-        cwd: job.cwd,
+        cwd: resumeCwd,
         stdio: "inherit",
         env: {
           ...process.env,

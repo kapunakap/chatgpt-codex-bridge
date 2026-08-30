@@ -41,6 +41,7 @@ async function setup(t, mode = "") {
         ...process.env, LOCAL_CODEX_ROOT: root, LOCAL_CODEX_PORT: String(port),
         LOCAL_CODEX_TOKEN_FILE: tokenFile, LOCAL_CODEX_STATE_FILE: stateFile,
         LOCAL_CODEX_LOG_FILE: logFile,
+        LOCAL_CODEX_WORKTREE_ROOT: join(root, "worktrees"), LOCAL_CODEX_WORKTREE_RETENTION: "15",
         LOCAL_CODEX_BIN: join(cwd, "test/fixtures/codex-app-server.mjs"),
         LOCAL_CODEX_CALL_TIMEOUT_MS: mode === "timeout" ? "1500" : "8000",
         MOCK_CODEX_STATE_FILE: mockState, MOCK_CODEX_TRACE_FILE: trace, MOCK_CODEX_MODE: mode,

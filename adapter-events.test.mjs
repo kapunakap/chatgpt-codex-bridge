@@ -27,6 +27,8 @@ async function setup(t) {
     LOCAL_CODEX_TOKEN_FILE: tokenFile,
     LOCAL_CODEX_STATE_FILE: join(root, "threads.json"),
     LOCAL_CODEX_LOG_FILE: join(root, "audit.log"),
+    LOCAL_CODEX_WORKTREE_ROOT: join(root, "worktrees"),
+    LOCAL_CODEX_WORKTREE_RETENTION: "15",
     LOCAL_CODEX_JOBS_DIR: join(root, "jobs"),
     LOCAL_CODEX_JOB_EVENTS_DIR: eventsDir,
     LOCAL_CODEX_BIN: fake,

@@ -28,6 +28,8 @@ async function setup(t, mode = "available") {
     LOCAL_CODEX_TOKEN_FILE: tokenFile,
     LOCAL_CODEX_STATE_FILE: join(root, "threads.json"),
     LOCAL_CODEX_LOG_FILE: join(root, "audit.log"),
+    LOCAL_CODEX_WORKTREE_ROOT: join(root, "worktrees"),
+    LOCAL_CODEX_WORKTREE_RETENTION: "15",
     LOCAL_CODEX_JOBS_DIR: join(root, "jobs"),
     LOCAL_CODEX_JOB_EVENTS_DIR: join(root, "job-events"),
     LOCAL_CODEX_BIN: fake,
@@ -159,7 +161,7 @@ test("browserAccess selects the official Browser backend without widening shell 
   assert.equal(turn.params.additionalContext["local-codex-browser-access"].kind, "application");
 
   const state = JSON.parse(await readFile(join(f.root, "threads.json"), "utf8"));
-  assert.equal(state.schemaVersion, 4);
+  assert.equal(state.schemaVersion, 5);
   assert.equal(state.threadBrowserAccess[done.threadId], true);
   assert.equal(state.threadNetworkAccess[done.threadId], false);
 
