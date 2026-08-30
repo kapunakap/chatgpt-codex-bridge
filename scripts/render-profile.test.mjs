@@ -43,6 +43,7 @@ test("fresh installation dry run does not require a fixed root", { skip: process
   assert.match(output, /scope=per_job/);
   assert.match(output, /legacy_root=\n/);
   assert.match(output, /codex_wrapper=.*local-codex-tunnel\/codex-secure\.mjs/);
+  assert.match(output, /watch_renderer=.*local-codex-tunnel\/local-codex-watch-render\.mjs/);
 });
 
 test("legacy installation dry run retains the migration root and secure wrapper", { skip: process.platform !== "darwin" }, async () => {

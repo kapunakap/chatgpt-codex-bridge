@@ -53,8 +53,8 @@ child.on("exit", (code, signal) => {
   session.exitCode = code;
   session.signal = signal;
   persistSession();
+  cancelPendingApprovals("session_ended");
   emit("session.ended", { exitCode: code, signal });
-  for (const pending of pendingApprovals.values()) clearInterval(pending.timer);
   process.exit(signal ? 1 : (code ?? 1));
 });
 child.stdin.on("error", () => {});
@@ -228,6 +228,16 @@ function holdApproval(message) {
   }, 100);
   timer.unref?.();
   pendingApprovals.set(approvalId, { timer, pendingFile, decisionFile });
+}
+
+function cancelPendingApprovals(reason) {
+  for (const [approvalId, pending] of pendingApprovals) {
+    clearInterval(pending.timer);
+    rmSync(pending.pendingFile, { force: true });
+    rmSync(pending.decisionFile, { force: true });
+    emit("approval.resolved", { approvalId, decision: "cancel", reason });
+  }
+  pendingApprovals.clear();
 }
 
 function extractInputText(input) {

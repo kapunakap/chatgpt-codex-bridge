@@ -61,11 +61,10 @@ test("watch shows network and host credentials as pending before Codex exists", 
 
   assert.equal(code, 0);
   assert.match(stdout, /APPROVAL REQUIRED/);
-  assert.match(stdout, /Enable network access \+ host developer credentials/);
+  assert.match(stdout, /Enable outbound command network access and terminal-like/);
   assert.match(stdout, /OFF → ON/);
-  assert.match(stdout, /FILTERED → AVAILABLE/);
-  assert.match(stdout, /NETWORK.*PENDING/s);
-  assert.match(stdout, /host auth.*pending host approval/s);
-  assert.match(stdout, /No network-enabled Codex process will start until approved/);
+  assert.match(stdout, /Host credentials.*AVAILABLE/s);
+  assert.match(stdout, /NETWORK.*ON/s);
+  assert.match(stdout, /No action will execute until approved/);
   assert.match(stdout, /! HOLD/);
 });

@@ -14,13 +14,21 @@ This is an unofficial local bridge. It keeps the MCP backend private and opens o
 (not the same request as on ChatGPT side)
 ## Watch it working
 
-Want to see ChatGPT reaching your Mac? In another terminal, follow the shared tunnel/adapter log:
+Want to see ChatGPT reaching your Mac? Open the structured terminal monitor:
+
+```bash
+local-codex-watch
+```
+
+It keeps the selected job visible across running and terminal states, shows persisted conversation activity, and lists compact relative `AGE` values while the Inspector keeps exact execution `ELAPSED` time.
+
+For the raw shared tunnel/adapter log:
 
 ```bash
 tail -f "$HOME/Library/Application Support/tunnel-client/logs/local-codex.log"
 ```
 
-Requests and adapter events appear here as ChatGPT uses Local Codex. See [Monitor from the Mac](#monitor-from-the-mac) for filtering, event details, and health checks.
+See [Monitor from the Mac](#monitor-from-the-mac) for health checks and saved thread history.
 
 ## What it exposes
 
@@ -216,7 +224,13 @@ For an existing installation, stop new work and wait for active jobs to finish. 
 
 ## Monitor from the Mac
 
-Follow tunnel traffic:
+Run the interactive monitor:
+
+```bash
+local-codex-watch
+```
+
+Follow raw tunnel traffic:
 
 ```bash
 tail -f "$HOME/Library/Application Support/tunnel-client/logs/local-codex.log"

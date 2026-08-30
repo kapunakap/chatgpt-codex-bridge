@@ -66,3 +66,53 @@ test("guard proxy forces native approvals, hides reasoning, and blocks until hos
   assert.deepEqual(finalTrace.find(message => message.id === "approval-1")?.result, { decision: "accept" });
   assert.ok(output.some(message => message.method === "turn/completed"));
 });
+
+test("guard proxy clears pending approvals when the guarded process exits", async () => {
+  const temp = await mkdtemp(join(tmpdir(), "local-codex-guard-exit-"));
+  const guardDir = join(temp, "guard");
+  const trace = join(temp, "trace.jsonl");
+  const child = spawn(process.execPath, [
+    proxy,
+    "--real-bin", fixture,
+    "--guard-dir", guardDir,
+    "--network-access", "false",
+    "--",
+    "--trace", trace,
+    "--exit-while-held",
+  ], {
+    cwd: temp,
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  const output = [];
+  readline.createInterface({ input: child.stdout }).on("line", line => output.push(JSON.parse(line)));
+  child.stdin.write(JSON.stringify({
+    id: 1,
+    method: "initialize",
+    params: { clientInfo: { name: "test", version: "1" } },
+  }) + "\n");
+  child.stdin.write(JSON.stringify({
+    id: 2,
+    method: "turn/start",
+    params: {
+      threadId: "thread-1",
+      approvalPolicy: "never",
+      input: [{ type: "text", text: "Exit while held" }],
+    },
+  }) + "\n");
+
+  const exitCode = await new Promise((resolve, reject) => {
+    child.once("error", reject);
+    child.once("exit", resolve);
+  });
+  assert.equal(exitCode, 0);
+  const approvalFiles = await readdir(join(guardDir, "approvals"));
+  assert.deepEqual(approvalFiles, []);
+  const eventFile = join(guardDir, "events", (await readdir(join(guardDir, "events")))[0]);
+  const events = (await readFile(eventFile, "utf8")).trim().split("\n").map(JSON.parse);
+  assert.ok(events.some(event => event.type === "approval.requested"));
+  assert.ok(events.some(event =>
+    event.type === "approval.resolved" &&
+    event.data?.decision === "cancel" &&
+    event.data?.reason === "session_ended"
+  ));
+});

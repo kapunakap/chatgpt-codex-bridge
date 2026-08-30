@@ -3,6 +3,7 @@ import { appendFileSync } from "node:fs";
 import readline from "node:readline";
 
 const trace = process.argv[process.argv.indexOf("--trace") + 1];
+const exitWhileHeld = process.argv.includes("--exit-while-held");
 const send = value => process.stdout.write(`${JSON.stringify(value)}\n`);
 readline.createInterface({ input: process.stdin }).on("line", line => {
   const message = JSON.parse(line);
@@ -20,6 +21,7 @@ readline.createInterface({ input: process.stdin }).on("line", line => {
     send({ id: "approval-1", method: "item/commandExecution/requestApproval", params: {
       threadId: "thread-1", turnId: "turn-1", itemId: "cmd-1", command: ["git", "push", "origin", "main"], cwd: process.cwd(), reason: "Publish branch", availableDecisions: ["accept", "acceptForSession", "decline", "cancel"],
     } });
+    if (exitWhileHeld) setTimeout(() => process.exit(0), 20);
     return;
   }
   if (message.id === "approval-1") {

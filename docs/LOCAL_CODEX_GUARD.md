@@ -19,7 +19,7 @@ After installing or reinstalling the bridge:
 local-codex-watch
 ```
 
-The UI follows the existing design mocks: jobs on the left, conversation/activity in the center, and a job/capability inspector on the right. When an action is held, the center becomes the dominant approval view.
+The normal screen is labeled LOCAL CODEX MONITOR and follows the existing design mock: jobs on the left, conversation/activity in the center, and a job/capability inspector on the right. It uses a bounded three-pane frame, separate view and shortcut rows, and repaints from the real terminal dimensions so resizing does not wrap or corrupt the display. When an action is held, the center becomes the dominant approval view.
 
 Controls:
 
@@ -38,6 +38,10 @@ q          quit
 ```
 
 Long command output is collapsed by default so the conversation stays readable; `l` expands it. Search applies to the same sanitized visible event stream used by the three views. Follow mode is on by default; turning it off freezes the current event sequence while new events continue to be recorded.
+
+The selected job remains selected by job ID when its status changes and the list reorders. Active and queued jobs stay first; terminal jobs follow in most-recent order. Completed, failed, cancelled, and timed-out jobs keep their persisted job event history visible. Pending approvals affect the UI only while their job or Guard session is active, and the Guard proxy clears unresolved approval files when its process exits.
+
+The Jobs pane's `AGE` value is relative: active and queued jobs count from their start, while terminal jobs count from their finish or last update. It uses compact seconds, minutes, hours, or days. The Inspector's `ELAPSED` field remains the execution duration.
 
 The approval view shows the exact action and reason plus the effective security context that can be inferred safely at the host boundary: network state/delta, possible remote write, host credential availability, workspace writes, external target, and any additional permissions supplied by Codex. `d` reveals the full sanitized native approval request for inspection.
 
