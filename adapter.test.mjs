@@ -105,6 +105,10 @@ test("discovery, authentication, schemas, and validation", async t => {
   assert.deepEqual(listed.result.tools[0].inputSchema.required, ["requestId", "cwd", "prompt"]);
   const codex = listed.result.tools[0];
   const reply = listed.result.tools[1];
+  assert.equal(codex.inputSchema.properties.sourceTitle.maxLength, 200);
+  assert.match(codex.inputSchema.properties.sourceTitle.description, /exact title/i);
+  assert.match(codex.inputSchema.properties.sourceTitle.description, /never invent/i);
+  assert.equal(reply.inputSchema.properties.sourceTitle.maxLength, 200);
   assert.equal(codex.inputSchema.properties.networkAccess.type, "boolean");
   assert.equal(codex.inputSchema.properties.networkAccess.default, false);
   assert.match(codex.description, /different canonical folders can run concurrently/i);
@@ -130,6 +134,9 @@ test("discovery, authentication, schemas, and validation", async t => {
   assert.equal((await f.call("codex", { requestId: "r", prompt: "hello", permissions: "all" })).errorCode, "invalid_request");
   for (const networkAccess of [null, 1, "true", {}]) {
     assert.equal((await f.call("codex", { requestId: `network-${JSON.stringify(networkAccess)}`, prompt: "hello", networkAccess })).errorCode, "invalid_request");
+  }
+  for (const sourceTitle of ["", "line one\nline two", "x".repeat(201), 7]) {
+    assert.equal((await f.call("codex", { requestId: `title-${JSON.stringify(sourceTitle)}`, prompt: "hello", sourceTitle })).errorCode, "invalid_request");
   }
   const missing = await f.call("codex", { requestId: "r", prompt: "hello", cwd: undefined });
   assert.equal(missing.errorCode, "schema_outdated"); assert.match(missing.message, /cwd/);
@@ -182,6 +189,36 @@ test("durable immediate acceptance, duplicate retries, same-folder queueing, and
   assert.equal((await stat(jobFile)).mode & 0o777, 0o600);
   assert.equal((await stat(join(f.root, "jobs"))).mode & 0o777, 0o700);
   assert.ok(!(await readFile(jobFile, "utf8")).includes(args.prompt));
+});
+
+test("exact ChatGPT source titles persist while Codex names and replies provide honest fallbacks", async t => {
+  const f = await fixture(t);
+  const sourceTitle = "Monitor source and CLI handoff";
+  const firstArgs = { requestId: "source-exact", prompt: "name-notification", sourceTitle };
+  const first = await f.finished((await f.call("codex", firstArgs)).jobId);
+  assert.equal(first.sourceTitle, sourceTitle);
+  assert.equal(first.codexThreadName, "Codex generated title");
+  assert.equal((await f.call("codex", firstArgs)).jobId, first.jobId);
+  assert.equal((await f.call("codex", { ...firstArgs, sourceTitle: "Different exact title" })).errorCode, "request_conflict");
+
+  const jobRecord = JSON.parse(await readFile(join(f.root, "jobs", `${first.jobId}.json`), "utf8"));
+  assert.equal(jobRecord.sourceTitle, sourceTitle);
+  assert.equal(jobRecord.codexThreadName, "Codex generated title");
+  assert.ok(!JSON.stringify(jobRecord).includes(firstArgs.prompt), "job metadata must not duplicate the prompt");
+
+  await f.stop();
+  await f.start();
+  const inherited = await f.finished((await f.call("codex-reply", {
+    requestId: "source-inherited", threadId: first.threadId, prompt: "hello",
+  })).jobId);
+  assert.equal(inherited.sourceTitle, sourceTitle);
+  assert.equal(inherited.codexThreadName, "Codex generated title");
+
+  const finalRead = await f.finished((await f.call("codex", {
+    requestId: "source-final-read", prompt: "name-read",
+  })).jobId);
+  assert.equal(finalRead.sourceTitle, undefined);
+  assert.equal(finalRead.codexThreadName, "Codex title from final read");
 });
 
 test("different folders run concurrently while same-folder jobs serialize", async t => {
@@ -587,15 +624,20 @@ input.on('line',line=>{
  case 'thread/start':
   threadId=randomUUID(); settings={cwd:p.cwd,model:p.model,reasoningEffort:p.config.model_reasoning_effort}; save();
   reply({thread:{id:threadId,cwd:settings.cwd},...settings}); break;
- case 'thread/resume': threadId=p.threadId; settings=load()[threadId]; reply({thread:{id:threadId,cwd:settings.cwd},...settings}); break;
+ case 'thread/resume': threadId=p.threadId; settings=load()[threadId]; reply({thread:{id:threadId,cwd:settings.cwd,...(settings.name?{name:settings.name}:{})},...settings}); break;
+ case 'thread/read': settings=load()[p.threadId]||settings; reply({thread:{id:p.threadId,cwd:settings.cwd,...(settings.name?{name:settings.name}:{})}}); break;
  case 'turn/start':
   mode=p.input[0].text;
   if(mode==='upstream-error-secret'){send({id:m.id,error:{message:'UPSTREAM_SECRET'}});break;}
   if(mode==='crash'){process.exit(9);}
-  settings={cwd:p.cwd,model:p.model,reasoningEffort:p.effort};save();turnId=randomUUID();
+  settings={cwd:p.cwd,model:p.model,reasoningEffort:p.effort,...(settings.name?{name:settings.name}:{})};
+  if(mode==='name-notification')settings.name='Codex generated title';
+  if(mode==='name-read')settings.name='Codex title from final read';
+  save();turnId=randomUUID();
   reply({turn:{id:turnId}});
   notify('thread/settings/updated',{threadId,threadSettings:{model:p.model,effort:p.effort}});
   notify('turn/started',{threadId,turn:{id:turnId}});
+  if(mode==='name-notification')notify('thread/name/updated',{threadId,name:settings.name});
   notify('item/reasoning/textDelta',{threadId,delta:'PRIVATE_REASONING'});
   if(mode==='stubborn')process.on('SIGTERM',()=>{});
   if(mode==='hold'||mode==='stubborn')break;

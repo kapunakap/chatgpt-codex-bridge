@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 
+import { spawn } from "node:child_process";
 import { existsSync, readFileSync, readdirSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import process from "node:process";
@@ -38,16 +39,18 @@ let approvalDetails = false;
 let searching = false;
 let searchQuery = "";
 let terminalRestored = false;
+let handoffActive = false;
+let openConfirmationJobId = null;
+let notice = "";
+let noticeTimer = null;
 let latest = { jobs: [], sessions: [], approvals: [] };
 
 process.stdin.setEncoding("utf8");
-if (process.stdin.isTTY) process.stdin.setRawMode(true);
 process.stdin.resume();
-process.stdout.write("\x1b[?1049h\x1b[?25l");
+enterMonitorTerminal();
 process.on("exit", restoreTerminal);
-for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"]) {
-  process.on(signal, () => quit());
-}
+process.on("SIGINT", () => { if (!handoffActive) quit(); });
+for (const signal of ["SIGTERM", "SIGHUP"]) process.on(signal, () => quit());
 process.stdout.on("resize", () => {
   dirty = true;
 });
@@ -56,14 +59,16 @@ process.stdin.on("data", data => {
 });
 
 setInterval(() => {
+  if (handoffActive) return;
   refresh();
   dirty = true;
 }, 250).unref();
 setInterval(() => {
+  if (handoffActive) return;
   void probeReady();
 }, 1500).unref();
 setInterval(() => {
-  if (dirty) render();
+  if (dirty && !handoffActive) render();
 }, 80).unref();
 
 await probeReady();
@@ -255,12 +260,13 @@ function render() {
     heldCount: latest.approvals.length,
     threadCount,
     homeDir: process.env.HOME || "",
+    notice,
   });
   process.stdout.write(serializeMonitorFrame(lines));
 }
 
 async function handleKey(data) {
-  if (quitting) return;
+  if (quitting || handoffActive) return;
   if (searching) {
     if (data === "\r" || data === "\n") {
       searching = false;
@@ -282,6 +288,7 @@ async function handleKey(data) {
     dirty = true;
     return;
   }
+  if (data !== "o") openConfirmationJobId = null;
   if (data === "q" || data === "\u0003") return quit();
   if (data === "\t") {
     view = (view + 1) % VIEW_NAMES.length;
@@ -330,10 +337,85 @@ async function handleKey(data) {
   }
   const job = selectedJob();
   const approval = approvalsFor(job)[0];
+  if (data === "o") return openInCodex(job);
   if (data === "a" && approval) return decide(approval, "accept");
   if (data === "A" && approval) return decide(approval, "acceptForSession");
   if (data === "r" && approval) return decide(approval, "decline");
   if (data === "x" && job) return cancelJob(job.jobId);
+}
+
+async function openInCodex(job) {
+  if (!job) return showNotice("No selected job to open.");
+  if (!terminalStatuses.has(job.status)) return showNotice("Wait for this job to finish before opening Codex CLI.");
+  if (!job.threadId) return showNotice("This job has no saved Codex thread.");
+  if (job.browserAccess && openConfirmationJobId !== job.jobId) {
+    openConfirmationJobId = job.jobId;
+    return showNotice("ChatGPT Browser context is unavailable in CLI. Press o again to open.", 0);
+  }
+  openConfirmationJobId = null;
+  const secureBin = process.env.LOCAL_CODEX_BIN;
+  if (!secureBin) return showNotice("Secure Codex resume is not configured.");
+
+  let authorization;
+  try {
+    authorization = readFileSync(tokenFile, "utf8").trim();
+  } catch {
+    return showNotice("Unable to authorize secure Codex resume.");
+  }
+
+  handoffActive = true;
+  clearNotice();
+  restoreTerminal();
+  process.stdin.pause();
+  let exitCode = null;
+  let failed = false;
+  try {
+    exitCode = await new Promise((resolve, reject) => {
+      const child = spawn(secureBin, ["resume", job.threadId], {
+        cwd: job.cwd,
+        stdio: "inherit",
+        env: {
+          ...process.env,
+          LOCAL_CODEX_INTERACTIVE_RESUME: "1",
+          LOCAL_CODEX_RESUME_TOKEN: authorization,
+          LOCAL_CODEX_RESUME_NETWORK_ACCESS: String(job.networkAccess === true),
+        },
+      });
+      child.once("error", reject);
+      child.once("exit", code => resolve(code));
+    });
+  } catch {
+    failed = true;
+  } finally {
+    process.stdin.resume();
+    enterMonitorTerminal();
+    handoffActive = false;
+    refresh();
+    dirty = true;
+  }
+  if (failed) showNotice("Unable to start Codex CLI.");
+  else if (exitCode !== 0) showNotice("Codex CLI exited with status " + String(exitCode) + ".");
+  else showNotice("Returned from Codex CLI.");
+}
+
+function showNotice(message, duration = 3500) {
+  clearTimeout(noticeTimer);
+  notice = message;
+  dirty = true;
+  if (duration > 0) {
+    noticeTimer = setTimeout(() => {
+      notice = "";
+      noticeTimer = null;
+      dirty = true;
+    }, duration);
+    noticeTimer.unref();
+  }
+}
+
+function clearNotice() {
+  clearTimeout(noticeTimer);
+  noticeTimer = null;
+  notice = "";
 }
 
 function decide(approval, decision) {
@@ -387,5 +469,15 @@ function restoreTerminal() {
   } catch {}
   try {
     process.stdout.write("\x1b[?25h\x1b[?1049l");
+  } catch {}
+}
+
+function enterMonitorTerminal() {
+  terminalRestored = false;
+  try {
+    if (process.stdin.isTTY) process.stdin.setRawMode(true);
+  } catch {}
+  try {
+    process.stdout.write("\x1b[?1049h\x1b[?25l");
   } catch {}
 }

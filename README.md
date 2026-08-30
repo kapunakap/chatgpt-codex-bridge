@@ -20,7 +20,7 @@ Want to see ChatGPT reaching your Mac? Open the structured terminal monitor:
 local-codex-watch
 ```
 
-It keeps the selected job visible across running and terminal states, shows persisted conversation activity, and lists compact relative `AGE` values while the Inspector keeps exact execution `ELAPSED` time.
+It keeps the selected job visible across running and terminal states, shows persisted conversation activity, and lists compact relative `AGE` values while the Inspector keeps exact execution `ELAPSED` time. The center pane and Inspector identify the prompt source as an exact `CHATGPT` title when supplied, or as a clearly marked `CODEX (fallback)` / `PROMPT (fallback)`. Press `o` on a terminal job to resume its saved thread in Codex CLI; the monitor returns when the native TUI exits.
 
 For the raw shared tunnel/adapter log:
 
@@ -32,8 +32,8 @@ See [Monitor from the Mac](#monitor-from-the-mac) for health checks and saved th
 
 ## What it exposes
 
-- `codex(requestId, cwd, prompt, networkAccess?, model?, reasoningEffort?)` starts a background job in any existing folder.
-- `codex-reply(requestId, threadId, prompt, networkAccess?, model?, reasoningEffort?)` starts a background reply on an adapter-owned thread.
+- `codex(requestId, cwd, prompt, sourceTitle?, networkAccess?, browserAccess?, model?, reasoningEffort?)` starts a background job in any existing folder.
+- `codex-reply(requestId, threadId, prompt, sourceTitle?, networkAccess?, browserAccess?, model?, reasoningEffort?)` starts a background reply on an adapter-owned thread.
 - `codex-status(jobId, waitMs?)` reads progress and the saved result. Use `waitMs: 20000` while queued or running.
 - `codex-cancel(jobId)` explicitly stops queued or running work. It does not undo file changes.
 - `codex-folders(path?, cursor?)` lists up to 100 child directory names per page. It defaults to your home directory and never reads file contents.
@@ -41,6 +41,8 @@ See [Monitor from the Mac](#monitor-from-the-mac) for health checks and saved th
 ChatGPT chooses an existing absolute `cwd` for each new thread, with **no directory allowlist or per-folder approval**. It can use `codex-folders` to locate the narrowest folder relevant to your task. Symlinks resolve to their target; the canonical `cwd` is returned with the job and is its write boundary. Relative, missing, inaccessible, and file paths fail without starting work. Folder discovery includes directory symlinks but omits files and broken links; follow `nextCursor` with the same path to continue the alphabetical listing.
 
 Replies always use their thread's saved folder and cannot accept a different `cwd`. Start a new thread to change folders. If a saved folder disappears or resolves elsewhere, replies fail without widening access. The caller cannot change the sandbox or permission level.
+
+`sourceTitle` is optional source metadata, not a generated summary. ChatGPT must pass it only when the host exposes the exact current conversation title; otherwise it must be omitted. Exact titles persist across replies. The monitor then falls back to Codex's own App Server thread name and finally to a prompt preview, with the fallback source labeled explicitly. Current ChatGPT connector metadata does not include the conversation title automatically.
 
 New jobs default to **gpt-5.6-luna / max**. Optional model IDs or aliases (`luna`, `terra`, `sol`) and reasoning levels are checked against Codex's model catalog. Unsupported combinations fail without fallback. Replies inherit the thread's last settings unless overridden.
 
@@ -62,7 +64,7 @@ The scheduling policy is **FIFO among runnable jobs**: the oldest queued job who
 
 Jobs run independently of the tunnel's response deadline, with a 30-minute execution limit by default. Set `LOCAL_CODEX_CALL_TIMEOUT_MS` in the local config to change it. Queue wait time does not consume this execution limit. Cancellation first requests `turn/interrupt`, then terminates the job's process group if needed. A folder lock is not released until the old process has exited, so a same-folder successor cannot overlap it.
 
-Job metadata and final results are saved atomically under `LOCAL_CODEX_JOBS_DIR` (default: `jobs` next to `threads.json`), using mode `0700` directories and `0600` files. Request IDs and input fingerprints are hashed; job files do not contain prompts or reasoning. Codex's own session history is separate and may contain the original input. Saved results are retained until explicitly removed. On adapter restart, unfinished active **and queued** jobs become `interrupted` and are never replayed; inspect their threads before starting replacement work.
+Job metadata and final results are saved atomically under `LOCAL_CODEX_JOBS_DIR` (default: `jobs` next to `threads.json`), using mode `0700` directories and `0600` files. Request IDs and input fingerprints are hashed; job files do not contain prompts or reasoning. They may contain the optional exact source title and Codex thread name used by the monitor. Codex's own session history is separate and may contain the original input. Saved results are retained until explicitly removed. On adapter restart, unfinished active **and queued** jobs become `interrupted` and are never replayed; inspect their threads before starting replacement work.
 
 ## Security boundary
 
@@ -78,6 +80,8 @@ Job metadata and final results are saved atomically under `LOCAL_CODEX_JOBS_DIR`
 - Commands run without network access by default. `networkAccess: true` enables broad direct command network access without a domain allowlist and also enables normal host developer authentication. A network-enabled job can send readable host/workspace data to external services and can act with credentials available to your normal developer session. With the default `LOCAL_CODEX_APPROVAL_MODE=off`, that capability is not separately host-approved.
 - Network-disabled jobs use a small environment allowlist with secret-name filtering. Network-enabled jobs inherit the normal host developer environment, except `LOCAL_CODEX_*` and `TUNNEL_CLIENT_*` variables are removed so the bridge's own control/runtime credentials are not exposed.
 - Thread replies are accepted only for thread IDs created by this adapter.
+- Native TUI handoff is allowed only for terminal jobs with a saved adapter-owned thread. The secure wrapper authenticates the monitor with the private adapter token, reapplies the job's workspace/network boundary, strips bridge variables, and uses `never` or native `untrusted` CLI approvals according to `LOCAL_CODEX_APPROVAL_MODE`.
+- ChatGPT's job-scoped Browser context is not transferred to a standalone CLI resume. Browser-enabled jobs require a second `o` confirmation in the monitor.
 - No inbound public port is required.
 
 The adapter uses `codex app-server`, which OpenAI recommends in place of the deprecated `codex mcp-server` command.
@@ -212,7 +216,7 @@ v3.2 adds concurrent jobs across different canonical folders, same-folder serial
 
 v3.3 routes `browserAccess: true` through the official bundled Codex Browser runtime on every platform. Before starting a model turn, Local Codex verifies managed policy, the enabled Browser plugin, the trusted `node_repl` transport, and Browser runtime setup. Browser-enabled replies inherit the capability unless explicitly disabled. Refresh Local Codex's tools and start a fresh conversation after upgrading.
 
-The current `main` behavior additionally makes `networkAccess: true` terminal-like for host reads and developer authentication, while leaving network-disabled jobs hardened and keeping the tunnel's own runtime/control variables filtered.
+The current `main` behavior additionally makes host approvals optional through `LOCAL_CODEX_APPROVAL_MODE=off|host`, defaulting to `off`. Network-enabled jobs remain terminal-like for host reads and developer authentication; network-disabled jobs remain hardened and the tunnel's own runtime/control variables stay filtered. It also adds optional exact `sourceTitle` metadata, Codex-name/prompt fallbacks in the monitor, and guarded `o` handoff to `codex resume` for terminal jobs. Refresh Local Codex's tools and use a fresh ChatGPT conversation before expecting `sourceTitle` in the tool schema.
 
 ### If ChatGPT reports missing `requestId` or `cwd`
 
@@ -231,6 +235,8 @@ Run the interactive monitor:
 ```bash
 local-codex-watch
 ```
+
+Source precedence is `CHATGPT` exact title, `CODEX (fallback)` thread name, then `PROMPT (fallback)` preview. Press `o` on a completed, failed, cancelled, timed-out, or interrupted job to open its saved thread in the native Codex CLI TUI. Active and queued jobs cannot be opened concurrently. The secure handoff keeps the saved workspace/network setting and approval mode, but native CLI continuation is not appended to the already-terminal bridge job event log. Jobs that used ChatGPT Browser show a warning because that host turn context cannot be transferred.
 
 Follow raw tunnel traffic:
 

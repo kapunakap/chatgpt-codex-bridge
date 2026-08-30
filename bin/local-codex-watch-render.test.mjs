@@ -174,20 +174,54 @@ test("renderer matches the three-pane monitor at the reported 118x47 size", () =
   assert.match(plain, /✓ DONE\s+upwork-api-jobs\s+0s/);
   assert.match(plain, /✕ FAIL\s+instill-proxy\s+0s/);
   assert.match(plain, /■ STOP\s+chatgpt-codex-brid…\s+0s/);
-  assert.match(plain, /ChatGPT ↔ Local Codex · Conversation/);
+  assert.match(plain, /PROMPT \(fallback\): Inspect issue #14/);
   assert.match(plain, /command output 6 lines/);
   assert.match(plain, /JOB INSPECTOR/);
   assert.match(plain, /~\/dev\/gta-labin/);
   assert.match(plain, /folder lock│ gta-labin/);
   assert.match(plain, /Conversation\s+Events\s+Raw log/);
   assert.match(plain, /↑↓\/jk select/);
+  assert.match(plain, /o open/);
   assert.match(lines.join(""), /\x1b\[44;97;1m/);
 });
 
-test("renderer stays bounded at minimum and wide terminal sizes", () => {
-  for (const [width, height] of [[80, 24], [160, 55], [118, 47]]) {
+test("renderer stays bounded at minimum, reported, and wide terminal sizes", () => {
+  for (const [width, height] of [[80, 24], [83, 26], [160, 55], [118, 47]]) {
     const lines = buildMonitorFrame(fixture({ width, height }));
     assertGeometry(lines, width, height);
+  }
+});
+
+test("source provenance prefers exact ChatGPT title, then Codex title, then prompt preview", () => {
+  const exactJobs = fixture().jobs.map((job, index) => index === 0
+    ? { ...job, sourceTitle: "Exact ChatGPT conversation", codexThreadName: "Local Codex title" }
+    : job);
+  const exact = buildMonitorFrame(fixture({ jobs: exactJobs, job: exactJobs[0] }))
+    .map(stripVTControlCharacters).join("\n");
+  assert.match(exact, /CHATGPT: Exact ChatGPT conversation/);
+  assert.doesNotMatch(exact, /CODEX \(fallback\): Local Codex title/);
+
+  const codexJobs = fixture().jobs.map((job, index) => index === 0
+    ? { ...job, codexThreadName: "Local Codex title" }
+    : job);
+  const codex = buildMonitorFrame(fixture({ jobs: codexJobs, job: codexJobs[0] }))
+    .map(stripVTControlCharacters).join("\n");
+  assert.match(codex, /CODEX \(fallback\): Local Codex title/);
+
+  const prompt = buildMonitorFrame(fixture()).map(stripVTControlCharacters).join("\n");
+  assert.match(prompt, /PROMPT \(fallback\): Inspect issue #14/);
+});
+
+test("source labels strip terminal controls and remain bounded", () => {
+  const jobs = fixture().jobs.map((job, index) => index === 0
+    ? { ...job, sourceTitle: "Safe\u001b[2J title" }
+    : job);
+  for (const [width, height] of [[80, 24], [83, 26], [118, 47]]) {
+    const lines = buildMonitorFrame(fixture({ width, height, jobs, job: jobs[0] }));
+    assertGeometry(lines, width, height);
+    const plain = lines.map(stripVTControlCharacters).join("\n");
+    assert.match(plain, /CHATGPT: Safe title/);
+    assert.doesNotMatch(lines.join(""), /\x1b\[2J/);
   }
 });
 

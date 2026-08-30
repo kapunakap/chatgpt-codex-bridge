@@ -44,6 +44,7 @@ export function buildMonitorFrame(options = {}) {
     job,
     session: options.session || null,
     approvals,
+    events,
     ready: options.ready || null,
     width: rightWidth,
     height: bodyHeight,
@@ -84,6 +85,7 @@ export function buildMonitorFrame(options = {}) {
     approvals,
     searching: Boolean(options.searching),
     searchQuery: String(options.searchQuery || ""),
+    notice: String(options.notice || ""),
   }), width - 2) + "│");
   lines.push("└" + "─".repeat(width - 2) + "┘");
   return normalizeFrame(lines, width, height);
@@ -189,7 +191,7 @@ function renderCenter({
 
   const output = [
     cyan(bold(basename(job.cwd || "?"))),
-    dim("ChatGPT ↔ Local Codex · " + VIEW_NAMES[view]),
+    renderSource(sourceFor(job, events)),
     dim("┄".repeat(width)),
   ];
   if (!session && !events.length) {
@@ -279,6 +281,7 @@ function renderInspector({
   job,
   session,
   approvals,
+  events,
   ready,
   width,
   height,
@@ -291,9 +294,11 @@ function renderInspector({
   const output = [bold("JOB INSPECTOR"), dim("─".repeat(width))];
   if (!job) return output;
   const status = approvals.length ? amber("HOLD") : colorState(longStateLabel(job.status), job.status);
+  const source = sourceFor(job, events);
   const fields = [
     ["STATUS", status],
     ["WORKSPACE", displayPath(job.cwd || "?", homeDir)],
+    ["SOURCE", source.kind + ": " + source.text],
     ["MODEL", job.model || "pending"],
     ["REASONING", job.reasoningEffort || "pending"],
     ["NETWORK", job.networkAccess ? amber("ON") : green("OFF")],
@@ -405,14 +410,39 @@ function renderTabs({ width, view, follow, searchQuery }) {
   return joinLeftRight(tabs, state, width);
 }
 
-function renderShortcuts({ approvals, searching, searchQuery }) {
+function renderShortcuts({ approvals, searching, searchQuery, notice }) {
+  if (notice) return amber(notice);
   if (searching) {
     return amber("SEARCH") + " /" + searchQuery + "█  " + dim("Enter apply  Esc cancel  Backspace edit");
   }
   if (approvals.length) {
-    return dim("↑↓/jk select  Tab view  d details  a/A approve  r reject  x kill  q quit");
+    return dim("↑↓/jk select  o open  Tab view  d details  a/A approve  r reject  x kill  q quit");
   }
-  return dim("↑↓/jk select  Tab view  f follow  / search  l output  d details  a/A/r approve  x kill  q quit");
+  return dim("↑↓/jk select  o open  Tab view  f follow  / search  l output  d details  a/A/r approve  x kill  q quit");
+}
+
+function sourceFor(job, events) {
+  const exact = cleanDisplayText(job?.sourceTitle);
+  if (exact) return { kind: "CHATGPT", text: exact };
+  const codex = cleanDisplayText(job?.codexThreadName);
+  if (codex) return { kind: "CODEX (fallback)", text: codex };
+  const prompt = (events || []).find(event => event?.type === "chatgpt.prompt")?.data?.text;
+  const preview = cleanDisplayText(prompt);
+  if (preview) return { kind: "PROMPT (fallback)", text: preview };
+  return { kind: "SOURCE", text: "unavailable" };
+}
+
+function renderSource(source) {
+  const label = source.kind === "CHATGPT" ? cyan(source.kind) : amber(source.kind);
+  return label + ": " + source.text;
+}
+
+function cleanDisplayText(value) {
+  if (typeof value !== "string") return "";
+  return stripVTControlCharacters(value)
+    .replace(/[\u0000-\u001f\u007f-\u009f]/gu, " ")
+    .replace(/\s+/gu, " ")
+    .trim();
 }
 
 function renderTooSmall(width, height) {

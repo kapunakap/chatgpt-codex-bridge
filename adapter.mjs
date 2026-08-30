@@ -102,6 +102,8 @@ if (!expectedAuthorization) {
 const threadFolders = new Map();
 const threadNetworkAccess = new Map();
 const threadBrowserAccess = new Map();
+const threadSourceTitles = new Map();
+const threadCodexNames = new Map();
 let threadState = {};
 await mkdir(dirname(LOG_FILE), { recursive: true, mode: 0o700 });
 appendFileSync(LOG_FILE, "", { mode: 0o600 });
@@ -138,6 +140,10 @@ const requestIdProperty = {
   type: "string", minLength: 1, maxLength: 200,
   description: "Generate a unique ID for new work. Reuse this exact ID and arguments on retries; never retry with a new ID.",
 };
+const sourceTitleProperty = {
+  type: "string", minLength: 1, maxLength: 200,
+  description: "Exact title of the ChatGPT conversation that started this work. Pass it only when the host exposes the exact title; omit it when unavailable. Never invent, summarize, or infer a title.",
+};
 const newThreadNetworkProperty = {
   type: "boolean", default: false,
   description: "Choose from the user's task intent. Set true whenever completing the request requires outbound command network access, even if the user did not explicitly ask for network access—for example git fetch, git pull, git clone, installing dependencies or packages, curl, HTTP/API access, or downloads. Omit or set false for fully local work. Defaults to false and does not change filesystem access.",
@@ -160,7 +166,7 @@ const tools = [
   {
     name: "codex",
     title: "Local Codex",
-    description: "Start a background Codex job in cwd, any existing absolute folder you choose. Choose networkAccess from the user's task intent: set true when completing the request requires outbound command access such as git fetch, git pull, git clone, installing dependencies or packages, curl, HTTP/API access, or downloads, even if the user did not explicitly ask for network access; omit or use false for fully local command work. Choose browserAccess separately when the task needs the official Codex Browser/Chrome backend for navigation, page inspection, interaction, screenshots, or browser-based QA. browserAccess never enables shell-launched Playwright/Chromium, command networking, wider filesystem access, or danger-full-access. No directory allowlist or per-folder approval. Use codex-folders to locate the narrowest relevant folder. Jobs in different canonical folders can run concurrently; jobs for an active folder are serialized through the queue. Returns jobId immediately; poll codex-status with waitMs=20000, never resubmit to check progress. Default Luna/max.",
+    description: "Start a background Codex job in cwd, any existing absolute folder you choose. Pass sourceTitle only when the host exposes the exact ChatGPT conversation title; otherwise omit it. Choose networkAccess from the user's task intent: set true when completing the request requires outbound command access such as git fetch, git pull, git clone, installing dependencies or packages, curl, HTTP/API access, or downloads, even if the user did not explicitly ask for network access; omit or use false for fully local command work. Choose browserAccess separately when the task needs the official Codex Browser/Chrome backend for navigation, page inspection, interaction, screenshots, or browser-based QA. browserAccess never enables shell-launched Playwright/Chromium, command networking, wider filesystem access, or danger-full-access. No directory allowlist or per-folder approval. Use codex-folders to locate the narrowest relevant folder. Jobs in different canonical folders can run concurrently; jobs for an active folder are serialized through the queue. Returns jobId immediately; poll codex-status with waitMs=20000, never resubmit to check progress. Default Luna/max.",
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -168,6 +174,7 @@ const tools = [
         requestId: requestIdProperty,
         cwd: { type: "string", minLength: 1, maxLength: 4096, description: "Absolute path to an existing working folder. Symlinks resolve to their target; the returned canonical cwd is the write boundary." },
         prompt: { type: "string", minLength: 1, maxLength: 100000 },
+        sourceTitle: sourceTitleProperty,
         networkAccess: newThreadNetworkProperty,
         browserAccess: newThreadBrowserProperty,
         ...selectionProperties,
@@ -185,7 +192,7 @@ const tools = [
   {
     name: "codex-reply",
     title: "Local Codex Reply",
-    description: "Start a background reply on an adapter-owned thread in its saved folder. Omit networkAccess to inherit: enabled stays enabled and disabled stays disabled. Set true when this reply newly requires outbound command access, even if the user only implies it; set false when command networking must be disabled again. Omit browserAccess to inherit the saved official Browser capability; set true when the reply needs the official Codex Browser/Chrome backend and false to disable it. browserAccess is independent of networkAccess and never enables shell Chromium or a wider sandbox. Folder changes are not allowed; use codex for a new folder. Replies use the same per-folder queue. Returns jobId; poll codex-status with waitMs=20000. Omitted model/reasoningEffort retain thread settings; overrides persist. Reuse requestId on retries.",
+    description: "Start a background reply on an adapter-owned thread in its saved folder. Pass sourceTitle only when the host exposes the exact ChatGPT conversation title; omit it to inherit any exact title already saved for the thread. Omit networkAccess to inherit: enabled stays enabled and disabled stays disabled. Set true when this reply newly requires outbound command access, even if the user only implies it; set false when command networking must be disabled again. Omit browserAccess to inherit the saved official Browser capability; set true when the reply needs the official Codex Browser/Chrome backend and false to disable it. browserAccess is independent of networkAccess and never enables shell Chromium or a wider sandbox. Folder changes are not allowed; use codex for a new folder. Replies use the same per-folder queue. Returns jobId; poll codex-status with waitMs=20000. Omitted model/reasoningEffort retain thread settings; overrides persist. Reuse requestId on retries.",
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -193,6 +200,7 @@ const tools = [
         requestId: requestIdProperty,
         threadId: { type: "string", minLength: 1, maxLength: 200 },
         prompt: { type: "string", minLength: 1, maxLength: 100000 },
+        sourceTitle: sourceTitleProperty,
         networkAccess: replyNetworkProperty,
         browserAccess: replyBrowserProperty,
         ...selectionProperties,
@@ -362,14 +370,15 @@ async function callTool(message, signal) {
       return toolResult(message.id, await listFolders(args));
     }
     if (name === "codex" || name === "codex-reply") {
-      validateArguments(args, name === "codex" ? ["requestId", "cwd", "prompt", "networkAccess", "browserAccess", "model", "reasoningEffort"]
-        : ["requestId", "threadId", "prompt", "networkAccess", "browserAccess", "model", "reasoningEffort"]);
+      validateArguments(args, name === "codex" ? ["requestId", "cwd", "prompt", "sourceTitle", "networkAccess", "browserAccess", "model", "reasoningEffort"]
+        : ["requestId", "threadId", "prompt", "sourceTitle", "networkAccess", "browserAccess", "model", "reasoningEffort"]);
       const missing = tools.find(tool => tool.name === name).inputSchema.required.filter(field => args[field] === undefined);
       if (missing.length) {
         throw callError("schema_outdated", `Local Codex ${VERSION} is missing required fields: ${missing.join(", ")}. In ChatGPT, open Local Codex > Manage > Refresh, then start a fresh chat. No job was started.`);
       }
       assertIdentifier(args.requestId, "requestId");
       assertPrompt(args.prompt);
+      const suppliedSourceTitle = args.sourceTitle === undefined ? null : normalizeSourceTitle(args.sourceTitle);
       assertSelectionArguments(args);
       if (args.networkAccess !== undefined && typeof args.networkAccess !== "boolean") {
         throw callError("invalid_request", "networkAccess must be true or false when provided");
@@ -383,6 +392,8 @@ async function callTool(message, signal) {
       const cwd = name === "codex" ? await canonicalDirectory(args.cwd, "cwd") : threadFolders.get(args.threadId);
       const networkAccess = args.networkAccess ?? (name === "codex-reply" ? threadNetworkAccess.get(args.threadId) : false) ?? false;
       const browserAccess = args.browserAccess ?? (name === "codex-reply" ? threadBrowserAccess.get(args.threadId) : false) ?? false;
+      const sourceTitle = suppliedSourceTitle ?? (name === "codex-reply" ? threadSourceTitles.get(args.threadId) : null) ?? null;
+      const codexThreadName = name === "codex-reply" ? threadCodexNames.get(args.threadId) ?? null : null;
       const browserTurnMetadata = browserAccess ? extractBrowserTurnMetadata(message.params?._meta) : null;
       if (browserAccess && !browserTurnMetadata) {
         throw callError("browser_host_context_unavailable", "Official Browser Use requires a live ChatGPT turn context. Refresh Local Codex tools and start the browser job from ChatGPT; no job was started.");
@@ -394,6 +405,7 @@ async function callTool(message, signal) {
       // saved jobs. Explicit capability values are still distinct requests.
       if (args.networkAccess !== undefined) fingerprintInput.push(args.networkAccess);
       if (args.browserAccess !== undefined) fingerprintInput.push(args.browserAccess);
+      if (args.sourceTitle !== undefined) fingerprintInput.push(suppliedSourceTitle);
       const fingerprint = digest(JSON.stringify(fingerprintInput));
       const prior = requests.get(key);
       if (prior) {
@@ -412,6 +424,7 @@ async function callTool(message, signal) {
         status: startNow ? "starting" : "queued", threadId: args.threadId ?? null, turnId: null,
         model: null, reasoningEffort: null, networkAccess, browserAccess,
         browserBackend: browserAccess ? "official_codex" : "none", browserTurnMetadata, settingsStatus: "pending",
+        sourceTitle, codexThreadName,
         startedAt: Date.now(), updatedAt: Date.now(), eventSeq: 0,
       };
       // Acceptance is durable before work is started or queued. Visible prompts
@@ -731,6 +744,8 @@ function snapshot(job) {
   return {
     jobId: job.jobId, status: job.status, cwd: job.cwd, threadId: job.threadId, turnId: job.turnId,
     model: job.model, reasoningEffort: job.reasoningEffort,
+    ...(job.sourceTitle ? { sourceTitle: job.sourceTitle } : {}),
+    ...(job.codexThreadName ? { codexThreadName: job.codexThreadName } : {}),
     networkAccess: job.networkAccess ?? false, browserAccess: job.browserAccess ?? false,
     browserBackend: job.browserBackend ?? (job.browserAccess ? "official_codex" : "none"),
     startedAt: job.startedAt, updatedAt: job.updatedAt,
@@ -788,8 +803,16 @@ async function loadJobs() {
     if (typeof job.browserAccess !== "boolean") throw new Error("Invalid job browser setting");
     if (job.browserBackend === undefined) job.browserBackend = job.browserAccess ? "official_codex" : "none";
     if (!["none", "official_codex"].includes(job.browserBackend)) throw new Error("Invalid job browser backend");
+    if (job.sourceTitle !== undefined) job.sourceTitle = validatePersistedTitle(job.sourceTitle, "job source title");
+    if (job.codexThreadName !== undefined) job.codexThreadName = validatePersistedTitle(job.codexThreadName, "job Codex thread name");
     if (job.threadId && threadFolders.has(job.threadId) && threadFolders.get(job.threadId) !== job.cwd) {
       throw new Error("Job and thread folder mismatch");
+    }
+    if (job.threadId && job.sourceTitle && !threadSourceTitles.has(job.threadId)) {
+      threadSourceTitles.set(job.threadId, job.sourceTitle);
+    }
+    if (job.threadId && job.codexThreadName && !threadCodexNames.has(job.threadId)) {
+      threadCodexNames.set(job.threadId, job.codexThreadName);
     }
     job.eventSeq = await loadEventSeq(job.jobId);
     job.eventWaiting = new Set();
@@ -1007,6 +1030,7 @@ async function runCodex(args, existingThreadId, audit) {
     let turnSubmitted = false;
     let turnConfirmed = false;
     let turnCompleted = false;
+    let finalMetadataRequested = false;
     let requestSequence = 0;
     const pending = new Map();
     let interruptTimer;
@@ -1086,6 +1110,8 @@ async function runCodex(args, existingThreadId, audit) {
         threadFolders.set(threadId, cwd);
         threadNetworkAccess.set(threadId, audit.networkAccess);
         threadBrowserAccess.set(threadId, audit.browserAccess ?? false);
+        if (audit.sourceTitle) threadSourceTitles.set(threadId, audit.sourceTitle);
+        updateCodexThreadName(audit, threadResponse?.thread?.name);
         saveThreadState();
         persistJob(audit);
         if (!existingThreadId) confirmSettings(threadResponse.model, threadResponse.reasoningEffort);
@@ -1100,6 +1126,7 @@ async function runCodex(args, existingThreadId, audit) {
         // immediately. Its thread/start response already confirmed both fields.
         if (existingThreadId) {
           const effective = await request("thread/resume", threadParams(cwd, audit.networkAccess, audit.browserAccess, threadId));
+          updateCodexThreadName(audit, effective?.thread?.name);
           confirmSettings(effective.model, effective.reasoningEffort);
         }
         turnConfirmed = true;
@@ -1129,6 +1156,9 @@ async function runCodex(args, existingThreadId, audit) {
       const method = message.method;
       const params = message.params || {};
       if (params.threadId && threadId && params.threadId !== threadId) return;
+      if (method === "thread/name/updated") {
+        updateCodexThreadName(audit, params.name ?? params.thread?.name);
+      }
       if (method === "turn/started") {
         turnId = params.turn?.id || params.turnId || turnId;
         audit.turnId = turnId;
@@ -1185,10 +1215,29 @@ async function runCodex(args, existingThreadId, audit) {
     }
 
     function completeIfReady() {
-      if (turnCompleted && turnConfirmed) {
+      if (!turnCompleted || !turnConfirmed || finalMetadataRequested) return;
+      finalMetadataRequested = true;
+      void refreshFinalMetadata().finally(() => {
+        if (settled) return;
         const values = [...messages.values()];
         const final = values.filter(item => item.phase === "final_answer");
         finish(null, { threadId, content: (final.length ? final : values).map(item => item.text).join("\n").trim() });
+      });
+    }
+
+    async function refreshFinalMetadata() {
+      try {
+        const result = await Promise.race([
+          request("thread/read", { threadId, includeTurns: false }),
+          new Promise(resolve => {
+            const timeout = setTimeout(() => resolve(null), 300);
+            timeout.unref();
+          }),
+        ]);
+        updateCodexThreadName(audit, result?.thread?.name);
+      } catch {
+        // Older App Servers may not support thread/read. The visible prompt
+        // remains an honest fallback and job completion must not depend on a title.
       }
     }
 
@@ -1439,6 +1488,40 @@ function assertPrompt(value) {
   }
 }
 
+function normalizeSourceTitle(value) {
+  if (typeof value !== "string" || /[\u0000-\u001f\u007f-\u009f]/u.test(value)) {
+    throw callError("invalid_request", "sourceTitle must be a single-line exact title without control characters");
+  }
+  const title = value.trim();
+  if (!title || Array.from(title).length > 200) {
+    throw callError("invalid_request", "sourceTitle must be between 1 and 200 characters");
+  }
+  return title;
+}
+
+function validatePersistedTitle(value, label) {
+  if (typeof value !== "string" || !value || Array.from(value).length > 200 ||
+      /[\u0000-\u001f\u007f-\u009f]/u.test(value)) {
+    throw new Error(`Invalid ${label}`);
+  }
+  return value;
+}
+
+function sanitizeCodexThreadName(value) {
+  if (typeof value !== "string") return null;
+  const clean = value.replace(/[\u0000-\u001f\u007f-\u009f]/gu, " ").replace(/\s+/gu, " ").trim();
+  return Array.from(clean).slice(0, 200).join("") || null;
+}
+
+function updateCodexThreadName(job, value) {
+  const title = sanitizeCodexThreadName(value);
+  if (!title || job.codexThreadName === title) return;
+  job.codexThreadName = title;
+  if (job.threadId) threadCodexNames.set(job.threadId, title);
+  saveThreadState();
+  persistJob(job);
+}
+
 function assertSelectionArguments(args) {
   for (const [key, max] of [["model", 200], ["reasoningEffort", 32]]) {
     if (args[key] !== undefined && (typeof args[key] !== "string" ||
@@ -1510,6 +1593,8 @@ function resultSchema() {
       turnId: { type: ["string", "null"] },
       model: { type: ["string", "null"] },
       reasoningEffort: { type: ["string", "null"] },
+      sourceTitle: { type: "string" },
+      codexThreadName: { type: "string" },
       networkAccess: { type: "boolean" },
       browserAccess: { type: "boolean" },
       browserBackend: { type: "string", enum: ["none", "official_codex"] },
@@ -1559,9 +1644,15 @@ async function loadThreadState() {
     if (typeof networkAccess !== "boolean") throw new Error("Invalid thread network setting");
     const browserAccess = threadState.threadBrowserAccess?.[id] ?? false;
     if (typeof browserAccess !== "boolean") throw new Error("Invalid thread browser setting");
+    const sourceTitle = threadState.threadSourceTitles?.[id];
+    if (sourceTitle !== undefined) validatePersistedTitle(sourceTitle, "thread source title");
+    const codexThreadName = threadState.threadCodexNames?.[id];
+    if (codexThreadName !== undefined) validatePersistedTitle(codexThreadName, "thread Codex name");
     threadFolders.set(id, cwd);
     threadNetworkAccess.set(id, networkAccess);
     threadBrowserAccess.set(id, browserAccess);
+    if (sourceTitle) threadSourceTitles.set(id, sourceTitle);
+    if (codexThreadName) threadCodexNames.set(id, codexThreadName);
     if (saved === undefined || threadState.threadNetworkAccess?.[id] === undefined ||
         threadState.threadBrowserAccess?.[id] === undefined) migrated = true;
   }
@@ -1574,7 +1665,9 @@ function saveThreadState() {
   threadState = { ...threadState, schemaVersion: 4, threadIds: [...threadFolders.keys()],
     threadCwds: Object.fromEntries(threadFolders),
     threadNetworkAccess: Object.fromEntries(threadNetworkAccess),
-    threadBrowserAccess: Object.fromEntries(threadBrowserAccess) };
+    threadBrowserAccess: Object.fromEntries(threadBrowserAccess),
+    threadSourceTitles: Object.fromEntries(threadSourceTitles),
+    threadCodexNames: Object.fromEntries(threadCodexNames) };
   writePrivateJson(STATE_FILE, threadState);
 }
 

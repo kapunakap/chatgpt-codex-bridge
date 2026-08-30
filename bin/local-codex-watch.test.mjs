@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, realpath, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -9,6 +9,17 @@ import test from "node:test";
 const root = fileURLToPath(new URL("..", import.meta.url));
 const watch = join(root, "bin/local-codex-watch.mjs");
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+async function readWhenPresent(file, timeoutMs = 1500) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    try { return await readFile(file, "utf8"); }
+    catch (error) {
+      if (error.code !== "ENOENT" || Date.now() >= deadline) throw error;
+    }
+    await delay(25);
+  }
+}
 
 async function fixture({ approval = false, commandOutput = false } = {}) {
   const temp = await mkdtemp(join(tmpdir(), "local-codex-watch-"));
@@ -19,6 +30,7 @@ async function fixture({ approval = false, commandOutput = false } = {}) {
   const jobId = "11111111-1111-1111-1111-111111111111";
   const jobFile = join(jobsDir, jobId + ".json");
   const sessionFile = join(guard, "sessions", "session-1.json");
+  await mkdir(join(temp, "gta-labin"), { recursive: true });
   await writeFile(join(temp, "token"), "Bearer test\n");
   await writeFile(jobFile, JSON.stringify({
     jobId, status: "running", cwd: join(temp, "gta-labin"), threadId: "thread-1", model: "gpt-5.6-luna",
@@ -53,7 +65,7 @@ async function fixture({ approval = false, commandOutput = false } = {}) {
   return { temp, jobsDir, jobEventsDir, guard, jobId, jobFile, sessionFile, events };
 }
 
-function startWatch(f, args = []) {
+function startWatch(f, args = [], env = {}) {
   const child = spawn(process.execPath, [watch, ...args], {
     env: {
       ...process.env,
@@ -61,6 +73,7 @@ function startWatch(f, args = []) {
       LOCAL_CODEX_STATE_FILE: join(f.temp, "threads.json"),
       LOCAL_CODEX_TOKEN_FILE: join(f.temp, "token"),
       LOCAL_CODEX_PORT: "1",
+      ...env,
     },
     stdio: ["pipe", "pipe", "pipe"],
   });
@@ -68,6 +81,111 @@ function startWatch(f, args = []) {
   child.stdout.on("data", chunk => { stdout += chunk; });
   return { child, read: () => stdout };
 }
+
+test("watch opens only terminal jobs through the configured secure resume handoff", async t => {
+  const f = await fixture();
+  const recordFile = join(f.temp, "resume-record.json");
+  const fakeSecure = join(f.temp, "fake-secure-resume.mjs");
+  await writeFile(fakeSecure, `#!/usr/bin/env node
+import { writeFileSync } from "node:fs";
+writeFileSync(process.env.TEST_RESUME_RECORD, JSON.stringify({
+  args: process.argv.slice(2), cwd: process.cwd(),
+  network: process.env.LOCAL_CODEX_RESUME_NETWORK_ACCESS,
+  token: process.env.LOCAL_CODEX_RESUME_TOKEN,
+  interactive: process.env.LOCAL_CODEX_INTERACTIVE_RESUME,
+}));
+`);
+  await chmod(fakeSecure, 0o755);
+  const { child, read } = startWatch(f, [], {
+    LOCAL_CODEX_BIN: fakeSecure,
+    TEST_RESUME_RECORD: recordFile,
+  });
+  t.after(() => { if (child.exitCode === null) child.kill("SIGTERM"); });
+  await delay(300);
+
+  const activeAt = read().length;
+  child.stdin.write("o");
+  await delay(160);
+  assert.match(read().slice(activeAt), /Wait for this job to finish before opening Codex CLI/);
+  await assert.rejects(readFile(recordFile, "utf8"), { code: "ENOENT" });
+
+  const completedAt = Date.now();
+  await writeFile(f.jobFile, JSON.stringify({
+    jobId: f.jobId, status: "completed", cwd: join(f.temp, "gta-labin"), threadId: "thread-1",
+    model: "gpt-5.6-luna", reasoningEffort: "high", networkAccess: true,
+    startedAt: completedAt - 12000, updatedAt: completedAt, finishedAt: completedAt,
+  }));
+  await delay(350);
+  const openAt = read().length;
+  child.stdin.write("o");
+  await delay(350);
+  const record = JSON.parse(await readWhenPresent(recordFile));
+  assert.deepEqual(record.args, ["resume", "thread-1"]);
+  assert.equal(record.cwd, await realpath(join(f.temp, "gta-labin")));
+  assert.equal(record.network, "true");
+  assert.equal(record.token, "Bearer test");
+  assert.equal(record.interactive, "1");
+  await delay(160);
+  assert.match(read().slice(openAt), /Returned from Codex CLI/);
+  assert.match(read().slice(openAt), /\x1b\[\?25h\x1b\[\?1049l/);
+  assert.match(read().slice(openAt), /\x1b\[\?1049h\x1b\[\?25l/);
+
+  child.stdin.write("q");
+  await new Promise((resolve, reject) => { child.once("error", reject); child.once("exit", resolve); });
+});
+
+test("browser jobs warn before native CLI handoff and launch on the second o", async t => {
+  const f = await fixture();
+  const completedAt = Date.now();
+  await writeFile(f.jobFile, JSON.stringify({
+    jobId: f.jobId, status: "completed", cwd: join(f.temp, "gta-labin"), threadId: "thread-1",
+    model: "gpt-5.6-luna", reasoningEffort: "high", networkAccess: false, browserAccess: true,
+    startedAt: completedAt - 12000, updatedAt: completedAt, finishedAt: completedAt,
+  }));
+  const recordFile = join(f.temp, "browser-resume.json");
+  const fakeSecure = join(f.temp, "fake-browser-resume.mjs");
+  await writeFile(fakeSecure, `#!/usr/bin/env node
+import { writeFileSync } from "node:fs";
+writeFileSync(process.env.TEST_RESUME_RECORD, JSON.stringify(process.argv.slice(2)));
+`);
+  await chmod(fakeSecure, 0o755);
+  const { child, read } = startWatch(f, [], {
+    LOCAL_CODEX_BIN: fakeSecure,
+    TEST_RESUME_RECORD: recordFile,
+  });
+  t.after(() => { if (child.exitCode === null) child.kill("SIGTERM"); });
+  await delay(300);
+  const warningAt = read().length;
+  child.stdin.write("o");
+  await delay(160);
+  assert.match(read().slice(warningAt), /ChatGPT Browser context is unavailable in CLI/);
+  await assert.rejects(readFile(recordFile, "utf8"), { code: "ENOENT" });
+  child.stdin.write("o");
+  assert.deepEqual(JSON.parse(await readWhenPresent(recordFile)), ["resume", "thread-1"]);
+  child.stdin.write("q");
+  await new Promise((resolve, reject) => { child.once("error", reject); child.once("exit", resolve); });
+});
+
+test("watch restores the monitor after secure resume launch failure", async t => {
+  const f = await fixture();
+  const completedAt = Date.now();
+  await writeFile(f.jobFile, JSON.stringify({
+    jobId: f.jobId, status: "completed", cwd: join(f.temp, "gta-labin"), threadId: "thread-1",
+    model: "gpt-5.6-luna", reasoningEffort: "high", networkAccess: false,
+    startedAt: completedAt - 12000, updatedAt: completedAt, finishedAt: completedAt,
+  }));
+  const { child, read } = startWatch(f, [], { LOCAL_CODEX_BIN: join(f.temp, "missing-secure-wrapper") });
+  t.after(() => { if (child.exitCode === null) child.kill("SIGTERM"); });
+  await delay(300);
+  const failedAt = read().length;
+  child.stdin.write("o");
+  await delay(300);
+  const output = read().slice(failedAt);
+  assert.match(output, /Unable to start Codex CLI/);
+  assert.match(output, /\x1b\[\?1049h\x1b\[\?25l/);
+  child.stdin.write("q");
+  await new Promise((resolve, reject) => { child.once("error", reject); child.once("exit", resolve); });
+});
 
 test("watch renders the mock-driven monitor layout and dominant approval state", async () => {
   const f = await fixture({ approval: true });

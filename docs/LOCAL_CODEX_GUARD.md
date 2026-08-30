@@ -31,6 +31,7 @@ f          toggle live follow / freeze current event cursor
 /          search the selected job's visible event stream
 l          expand/collapse long command output
 d          toggle sanitized approval details/raw context
+o          open a terminal job's saved thread in Codex CLI
 a          approve once
 A          approve for the current Codex session/job
 r          reject
