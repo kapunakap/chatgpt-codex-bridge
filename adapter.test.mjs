@@ -32,7 +32,7 @@ async function fixture(t, options = {}) {
     LOCAL_CODEX_TOKEN_FILE: tokenFile, LOCAL_CODEX_STATE_FILE: join(root, "threads.json"),
     LOCAL_CODEX_LOG_FILE: join(root, "audit.log"), LOCAL_CODEX_JOBS_DIR: join(root, "jobs"),
     LOCAL_CODEX_BIN: options.missingBin ? join(root, "missing") : fake, LOCAL_CODEX_CALL_TIMEOUT_MS: String(options.timeout || 10000),
-    LOCAL_CODEX_MAX_CONCURRENCY: String(options.maxConcurrency ?? 4), LOCAL_CODEX_MAX_QUEUE: String(options.maxQueue ?? 100),
+    LOCAL_CODEX_MAX_CONCURRENCY: String(options.maxConcurrency ?? 10), LOCAL_CODEX_MAX_QUEUE: String(options.maxQueue ?? 100),
     FAKE_ROOT: root,
   };
   async function start() {
@@ -159,7 +159,7 @@ test("durable immediate acceptance, duplicate retries, same-folder queueing, and
   assert.equal((await f.call("codex", { requestId: "other", prompt: "hello" })).jobId, queued.jobId);
   const ready = await (await fetch(`http://127.0.0.1:${f.port}/readyz`)).json();
   assert.equal(ready.activeCalls, 1); assert.equal(ready.queuedCalls, 1);
-  assert.equal(ready.maxConcurrency, 4); assert.equal(ready.maxQueue, 100);
+  assert.equal(ready.maxConcurrency, 10); assert.equal(ready.maxQueue, 100);
   assert.deepEqual(ready.queuedJobIds, [queued.jobId]);
   assert.equal((await f.call("codex-status", { jobId, waitMs: 20001 })).errorCode, "invalid_wait");
   const result = await f.finished(jobId);

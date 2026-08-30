@@ -47,7 +47,7 @@ const selectionProperties = {
 };
 const MAX_BODY = 1024 * 1024;
 const CALL_TIMEOUT_MS = Number(process.env.LOCAL_CODEX_CALL_TIMEOUT_MS || "1800000");
-const MAX_CONCURRENCY = Number(process.env.LOCAL_CODEX_MAX_CONCURRENCY || "4");
+const MAX_CONCURRENCY = Number(process.env.LOCAL_CODEX_MAX_CONCURRENCY || "10");
 const MAX_QUEUE = Number(process.env.LOCAL_CODEX_MAX_QUEUE || "100");
 const VISIBLE_EVENT_TYPES = new Set([
   "session.started", "session.error", "session.ended",

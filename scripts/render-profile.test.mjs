@@ -70,6 +70,8 @@ test("approval mode defaults to off in launcher, installer, and example config",
   assert.match(watchLauncher, /LOCAL_CODEX_REAL_BIN=.*:-codex/);
   assert.match(installer, /LOCAL_CODEX_APPROVAL_MODE=%q/);
   assert.match(example, /^LOCAL_CODEX_APPROVAL_MODE=off$/m);
+  assert.match(installer, /LOCAL_CODEX_MAX_CONCURRENCY=%q\\n' "10"/);
+  assert.match(example, /^LOCAL_CODEX_MAX_CONCURRENCY=10$/m);
 });
 
 function run(args, executable = process.execPath) {
