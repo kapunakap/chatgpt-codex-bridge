@@ -70,10 +70,13 @@ test("approval mode defaults to off in launcher, installer, and example config",
   assert.match(watchLauncher, /LOCAL_CODEX_APPROVAL_MODE=.*:-off/);
   assert.match(watchLauncher, /LOCAL_CODEX_BIN=.*:-codex/);
   assert.match(watchLauncher, /LOCAL_CODEX_REAL_BIN=.*:-codex/);
+  assert.match(launcher, /LOCAL_CODEX_POLL_LEASE_MS=.*:-90000/);
   assert.match(installer, /LOCAL_CODEX_APPROVAL_MODE=%q/);
   assert.match(example, /^LOCAL_CODEX_APPROVAL_MODE=off$/m);
   assert.match(installer, /LOCAL_CODEX_MAX_CONCURRENCY=%q\\n' "10"/);
   assert.match(example, /^LOCAL_CODEX_MAX_CONCURRENCY=10$/m);
+  assert.match(installer, /LOCAL_CODEX_POLL_LEASE_MS=%q\\n' "90000"/);
+  assert.match(example, /^LOCAL_CODEX_POLL_LEASE_MS=90000$/m);
   assert.match(installer, /LOCAL_CODEX_WORKTREE_RETENTION=%q/);
   assert.match(example, /^LOCAL_CODEX_WORKTREE_RETENTION=15$/m);
   assert.match(example, /^LOCAL_CODEX_WORKTREE_ROOT=.*local-codex-worktrees$/m);

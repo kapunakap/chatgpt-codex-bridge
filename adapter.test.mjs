@@ -30,7 +30,9 @@ async function fixture(t, options = {}) {
   await writeFile(fake, fakeSource, { mode: 0o700 });
   const deniedGroup = join(root, "deny-group-signals.mjs");
   await writeFile(deniedGroup, `const original = process.kill; process.kill = function(pid, signal) {
-    if (pid < 0) throw Object.assign(new Error('protected hook'), {code:'EPERM'});
+    if (pid < 0 && (signal !== 0 || process.env.TEST_DENY_GROUP_PROBE === '1')) {
+      throw Object.assign(new Error('protected hook'), {code:'EPERM'});
+    }
     return original.call(process, pid, signal);
   };`);
   let child;
@@ -41,17 +43,20 @@ async function fixture(t, options = {}) {
     LOCAL_CODEX_LOG_FILE: join(root, "audit.log"), LOCAL_CODEX_JOBS_DIR: join(root, "jobs"),
     LOCAL_CODEX_WORKTREE_ROOT: join(root, "worktrees"), LOCAL_CODEX_WORKTREE_RETENTION: "15",
     LOCAL_CODEX_BIN: options.missingBin ? join(root, "missing") : fake, LOCAL_CODEX_CALL_TIMEOUT_MS: String(options.timeout || 10000),
+    LOCAL_CODEX_POLL_LEASE_MS: String(options.pollLease ?? 90000),
     LOCAL_CODEX_MAX_CONCURRENCY: String(options.maxConcurrency ?? 10), LOCAL_CODEX_MAX_QUEUE: String(options.maxQueue ?? 100),
-    FAKE_ROOT: root,
+    FAKE_ROOT: root, TEST_DENY_GROUP_PROBE: options.deniedGroupProbe ? "1" : "0",
   };
   async function start() {
     child = spawn(process.execPath, [...(options.deniedGroup ? ["--import", deniedGroup] : []), "adapter.mjs"], { cwd: repo, env, stdio: ["ignore", "ignore", "pipe"] });
     await new Promise((resolve, reject) => {
+      let startupStderr = "";
       const timeout = setTimeout(() => reject(new Error("adapter did not start")), 5000);
       child.stderr.on("data", chunk => {
-        if (chunk.toString().includes("ready on")) { clearTimeout(timeout); resolve(); }
+        startupStderr += chunk.toString();
+        if (startupStderr.includes("ready on")) { clearTimeout(timeout); resolve(); }
       });
-      child.once("exit", code => { clearTimeout(timeout); reject(new Error(`adapter exited ${code}`)); });
+      child.once("exit", code => { clearTimeout(timeout); reject(new Error(`adapter exited ${code}: ${startupStderr.trim()}`)); });
     });
   }
   async function stop(signal = "SIGTERM") {
@@ -105,7 +110,7 @@ test("discovery, authentication, schemas, and validation", async t => {
   assert.equal(discover.error.code, -32601);
   const initialized = await f.rpc({ jsonrpc: "2.0", id: "i", method: "initialize", params: { protocolVersion: "2025-11-25" } });
   assert.equal(initialized.result.protocolVersion, "2025-11-25");
-  assert.equal(initialized.result.serverInfo.version, "3.4.0");
+  assert.equal(initialized.result.serverInfo.version, "3.5.0");
   const listed = await f.rpc({ jsonrpc: "2.0", id: "l", method: "tools/list" });
   assert.deepEqual(listed.result.tools.map(t => t.name), ["codex", "codex-reply", "codex-status", "codex-cancel", "codex-browser-status", "codex-folders"]);
   const browserStatus = listed.result.tools.find(t => t.name === "codex-browser-status");
@@ -121,6 +126,9 @@ test("discovery, authentication, schemas, and validation", async t => {
   assert.equal(codex.inputSchema.properties.worktree.type, "boolean");
   assert.equal(codex.inputSchema.properties.worktree.default, true);
   assert.equal(reply.inputSchema.properties.worktree, undefined);
+  assert.match(codex.description, /continue until terminal/i);
+  assert.match(reply.description, /continue until terminal/i);
+  assert.match(listed.result.tools[2].description, /renew its polling lease/i);
   assert.equal(codex.inputSchema.properties.networkAccess.type, "boolean");
   assert.equal(codex.inputSchema.properties.networkAccess.default, false);
   assert.match(codex.description, /different canonical folders can run concurrently/i);
@@ -167,6 +175,8 @@ test("durable immediate acceptance, duplicate retries, same-folder queueing, and
   const results = await Promise.all(Array.from({ length: 8 }, () => f.call("codex", args)));
   assert.ok(Date.now() - before < 450, "acceptance must not wait for generation");
   assert.equal(new Set(results.map(r => r.jobId)).size, 1);
+  assert.equal(results[0].pollLeaseMs, 90000);
+  assert.ok(results[0].leaseExpiresAt > before);
   const { jobId } = results[0];
   assert.equal((await f.call("codex", { ...args, prompt: "different" })).errorCode, "request_conflict");
   const queued = await f.call("codex", { requestId: "other", prompt: "hello" });
@@ -175,6 +185,7 @@ test("durable immediate acceptance, duplicate retries, same-folder queueing, and
   const ready = await (await fetch(`http://127.0.0.1:${f.port}/readyz`)).json();
   assert.equal(ready.activeCalls, 1); assert.equal(ready.queuedCalls, 1);
   assert.equal(ready.maxConcurrency, 10); assert.equal(ready.maxQueue, 100);
+  assert.equal(ready.pollLeaseMs, 90000);
   assert.equal(ready.worktreesDefault, true); assert.equal(ready.worktreeRetention, 15);
   assert.deepEqual(ready.queuedJobIds, [queued.jobId]);
   assert.equal((await f.call("codex-status", { jobId, waitMs: 20001 })).errorCode, "invalid_wait");
@@ -460,7 +471,7 @@ test("network access is opt-in; replies inherit and persist explicit overrides",
 });
 
 test("status cancellation and disconnect do not cancel accepted work", async t => {
-  const f = await fixture(t);
+  const f = await fixture(t, { pollLease: 2000 });
   const job = await f.call("codex", { requestId: "hold", prompt: "hold" });
   await f.started(job.jobId);
   const ac = new AbortController();
@@ -469,7 +480,9 @@ test("status cancellation and disconnect do not cancel accepted work", async t =
   const poll = f.call("codex-status", { jobId: job.jobId, waitMs: 20000 }, undefined, "poll-id");
   await delay(40);
   await f.rpc({ jsonrpc: "2.0", method: "notifications/cancelled", params: { requestId: "poll-id" } });
-  assert.equal((await poll).status, "running");
+  const renewed = await poll;
+  assert.equal(renewed.status, "running");
+  assert.ok(renewed.leaseExpiresAt > Date.now());
   assert.equal((await f.records()).filter(r => r.method === "turn/interrupt").length, 0);
   const state = JSON.parse(await readFile(join(f.root, "threads.json"), "utf8"));
   assert.equal(state.threadIds.length, 1, "register the thread before completion");
@@ -478,6 +491,44 @@ test("status cancellation and disconnect do not cancel accepted work", async t =
   assert.equal((await f.call("codex-cancel", { jobId: job.jobId })).status, "cancelled");
   assert.equal((await f.records()).filter(r => r.method === "turn/interrupt").length, 1);
   for (const r of (await f.records()).filter(r => r.event === "spawn")) assert.throws(() => process.kill(r.pid, 0), /ESRCH/);
+});
+
+test("unpolled running and queued jobs expire and cancel", async t => {
+  const f = await fixture(t, { pollLease: 1500, maxConcurrency: 1 });
+  const active = await f.call("codex", { requestId: "lease-active", prompt: "hold" });
+  await f.started(active.jobId);
+  const queued = await f.call("codex", { requestId: "lease-queued", prompt: "hello" });
+  assert.equal(queued.status, "queued");
+  await delay(2200);
+  const activeResult = await f.finished(active.jobId);
+  const queuedResult = await f.finished(queued.jobId);
+  for (const result of [activeResult, queuedResult]) {
+    assert.equal(result.status, "cancelled");
+    assert.equal(result.errorCode, "polling_expired");
+    assert.equal(result.leaseExpiresAt, undefined);
+  }
+  assert.equal((await f.records()).filter(r => r.method === "turn/start").length, 1);
+});
+
+test("idempotent submission retries renew the job lease", async t => {
+  const f = await fixture(t, { pollLease: 10000 });
+  const args = { requestId: "lease-retry", prompt: "hold" };
+  const created = await f.call("codex", args);
+  await delay(50);
+  const retried = await f.call("codex", args);
+  assert.ok(retried.leaseExpiresAt > created.leaseExpiresAt, JSON.stringify({ created, retried }));
+  await f.call("codex-cancel", { jobId: created.jobId });
+  const result = await f.finished(created.jobId);
+  assert.equal(result.status, "cancelled");
+});
+
+test("regular status polling keeps a job alive beyond one lease", async t => {
+  const f = await fixture(t, { pollLease: 3000 });
+  const created = await f.call("codex", { requestId: "lease-polling", prompt: "delay:6500" });
+  const result = await f.finished(created.jobId);
+  assert.equal(result.status, "completed");
+  assert.equal(result.content, "FINAL_OK");
+  assert.ok(result.elapsedMs > result.pollLeaseMs);
 });
 
 test("timeout, stubborn child cleanup, server failure, and missing executable", async t => {
@@ -493,6 +544,16 @@ test("timeout, stubborn child cleanup, server failure, and missing executable", 
   const missing = await fixture(t, { missingBin: true });
   const failed = await missing.finished((await missing.call("codex", { requestId: "missing", prompt: "hello" })).jobId);
   assert.equal(failed.status, "failed"); assert.equal(failed.errorCode, "spawn_failed");
+});
+
+test("completion waits until descendant processes are gone", async t => {
+  const f = await fixture(t);
+  const result = await f.finished((await f.call("codex", { requestId: "descendant", prompt: "descendant" })).jobId);
+  assert.equal(result.status, "completed");
+  const records = await f.records();
+  const pids = records.filter(record => ["spawn", "descendant"].includes(record.event)).map(record => record.pid);
+  assert.equal(pids.length, 2);
+  for (const pid of pids) assert.throws(() => process.kill(pid, 0), /ESRCH/);
 });
 
 test("acceptance fails closed when job storage cannot be written", async t => {
@@ -547,6 +608,16 @@ test("protected macOS completion hooks do not poison readiness after child exit"
   await f.started(held.jobId); await f.call("codex-cancel", { jobId: held.jobId });
   assert.equal((await f.finished(held.jobId)).status, "cancelled");
   for (const r of (await f.records()).filter(r => r.event === "spawn")) assert.throws(() => process.kill(r.pid, 0), /ESRCH/);
+});
+
+test("unverifiable process-group cleanup fails closed", async t => {
+  const f = await fixture(t, { deniedGroup: true, deniedGroupProbe: true });
+  const result = await f.finished((await f.call("codex", { requestId: "cleanup-failure", prompt: "hello" })).jobId);
+  assert.equal(result.status, "failed");
+  assert.equal(result.errorCode, "process_cleanup_failed");
+  assert.equal((await fetch(`http://127.0.0.1:${f.port}/readyz`)).status, 503);
+  const audit = await readFile(join(f.root, "audit.log"), "utf8");
+  assert.match(audit, /"event":"job_cleanup_failed"/);
 });
 
 test("jobs choose arbitrary canonical folders; replies keep their original folder", async t => {
@@ -686,6 +757,7 @@ test("native macOS sandbox enforces the command network toggle", {
 
 const fakeSource = String.raw`#!/usr/bin/env node
 import { createInterface } from 'node:readline';
+import { spawn } from 'node:child_process';
 import { appendFileSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
@@ -727,6 +799,10 @@ input.on('line',line=>{
   notify('turn/started',{threadId,turn:{id:turnId}});
   if(mode==='name-notification')notify('thread/name/updated',{threadId,name:settings.name});
   notify('item/reasoning/textDelta',{threadId,delta:'PRIVATE_REASONING'});
+  if(mode==='descendant'){
+   const descendant=spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{stdio:'ignore'});
+   log({event:'descendant',pid:descendant.pid});
+  }
   if(mode==='stubborn')process.on('SIGTERM',()=>{});
   if(mode==='hold'||mode==='stubborn')break;
   setTimeout(()=>{

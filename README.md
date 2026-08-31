@@ -34,7 +34,7 @@ See [Monitor from the Mac](#monitor-from-the-mac) for health checks and saved th
 
 - `codex(requestId, cwd, prompt, sourceTitle?, worktree?, networkAccess?, browserAccess?, model?, reasoningEffort?)` starts a background job in any existing folder.
 - `codex-reply(requestId, threadId, prompt, sourceTitle?, networkAccess?, browserAccess?, model?, reasoningEffort?)` starts a background reply on an adapter-owned thread.
-- `codex-status(jobId, waitMs?)` reads progress and the saved result. Use `waitMs: 20000` while queued or running.
+- `codex-status(jobId, waitMs?)` reads progress, renews the job lease, and returns the saved result. Use `waitMs: 20000` continuously while queued or running.
 - `codex-cancel(jobId)` explicitly stops queued or running work. It does not undo file changes.
 - `codex-folders(path?, cursor?)` lists up to 100 child directory names per page. It defaults to your home directory and never reads file contents.
 
@@ -57,14 +57,16 @@ Host approval prompts are optional and default to **off**. `LOCAL_CODEX_APPROVAL
 ### Background job flow (v2)
 
 1. Choose `cwd`, generate a unique `requestId`, and submit once. The response contains a `jobId` and canonical `cwd`, not the answer.
-2. Poll `codex-status` until `completed`, `failed`, `cancelled`, `timed_out`, or `interrupted`. A job may report `queued` before it starts. Only `completed` contains a successful final answer.
+2. Start polling `codex-status` immediately and continue until `completed`, `failed`, `cancelled`, `timed_out`, or `interrupted`. A job may report `queued` before it starts. Only `completed` contains a successful final answer. Every valid poll renews the job lease.
 3. If submission delivery is uncertain, retry with the **same requestId and arguments**. This returns the same saved job. Reusing an ID with different arguments or a different canonical folder fails.
 
 `LOCAL_CODEX_MAX_CONCURRENCY` defaults to **10**. Separate managed worktrees can run concurrently even when they come from one repository. Direct jobs still serialize on the same canonical folder. When a job cannot start immediately, it is accepted into a bounded queue instead of returning `busy`; `LOCAL_CODEX_MAX_QUEUE` defaults to **100**. If the queue is full, retry later with the same `requestId` and arguments.
 
 The scheduling policy is **FIFO among runnable jobs**: the oldest queued job whose folder is not currently locked starts when capacity is available. A queued job blocked by its folder does not unnecessarily block older independent work behind it. `codex-status` and `codex-cancel` work for queued jobs; cancelling a queued job makes it `cancelled` without spawning Codex. `/readyz` reports active/queued counts, job IDs, folders, configured limits, and the scheduling policy.
 
-Jobs run independently of the tunnel's response deadline, with a 30-minute execution limit by default. Set `LOCAL_CODEX_CALL_TIMEOUT_MS` in the local config to change it. Queue wait time does not consume this execution limit. Cancellation first requests `turn/interrupt`, then terminates the job's process group if needed. A folder lock is not released until the old process has exited, so a same-folder successor cannot overlap it.
+Jobs run independently of the tunnel's response deadline, with a 30-minute execution limit by default. Set `LOCAL_CODEX_CALL_TIMEOUT_MS` in the local config to change it. Queue wait time does not consume this execution limit. Queued and running jobs also have a renewable polling lease, controlled by `LOCAL_CODEX_POLL_LEASE_MS` and defaulting to 90 seconds. If ChatGPT stops polling longer than that, the job is cancelled with `polling_expired`; retrying the original submission with the same request ID also renews the lease.
+
+Cancellation first requests `turn/interrupt`, then terminates the job's process group if needed. Successful completion is not saved or shown as `DONE` until the process group is confirmed absent. If cleanup cannot be verified after `SIGTERM` and `SIGKILL`, the job fails with `process_cleanup_failed`, `/readyz` becomes unavailable, and no queued work starts until the adapter is restarted. A folder lock is not released before cleanup verification finishes, so a same-folder successor cannot overlap it.
 
 Job metadata and final results are saved atomically under `LOCAL_CODEX_JOBS_DIR` using mode `0700` directories and `0600` files. Request IDs and input fingerprints are hashed; job files do not contain prompts or reasoning. Managed worktree metadata and private snapshots live beside thread state. The newest 15 worktrees are retained by default; older inactive worktrees are snapshotted and can be restored automatically. Saved results and snapshot bundles are retained until explicitly removed. On adapter restart, unfinished active and queued jobs become `interrupted` and are never replayed.
 
@@ -222,6 +224,8 @@ v3.2 adds concurrent jobs across different canonical folders, same-folder serial
 v3.3 routes `browserAccess: true` through the official bundled Codex Browser runtime on every platform. Before starting a model turn, Local Codex verifies managed policy, the enabled Browser plugin, the trusted `node_repl` transport, and Browser runtime setup. Browser-enabled replies inherit the capability unless explicitly disabled. Refresh Local Codex's tools and start a fresh conversation after upgrading.
 
 v3.4 makes detached per-thread worktrees the default for Git repositories, raises default concurrency to 10, adds worktree snapshots/restoration, and adds prompt-source/native-TUI monitor integration. Existing threads migrate as direct workspaces. Refresh Local Codex's tools and start a fresh ChatGPT conversation before using `worktree`.
+
+v3.5 adds a renewable polling lease for queued and running jobs, cancels abandoned work with `polling_expired`, and withholds successful completion until the Codex process group is confirmed absent. Refresh Local Codex's tools and start a fresh ChatGPT conversation so the host receives the lease-aware tool descriptions and result fields.
 
 The current `main` behavior additionally makes host approvals optional through `LOCAL_CODEX_APPROVAL_MODE=off|host`, defaulting to `off`. Network-enabled jobs remain terminal-like for host reads and developer authentication; network-disabled jobs remain hardened and the tunnel's own runtime/control variables stay filtered. It also adds optional exact `sourceTitle` metadata, Codex-name/prompt fallbacks in the monitor, and guarded `o` handoff to `codex resume` for terminal jobs. Refresh Local Codex's tools and use a fresh ChatGPT conversation before expecting `sourceTitle` in the tool schema.
 

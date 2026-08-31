@@ -33,7 +33,7 @@ const JOBS_DIR = process.env.LOCAL_CODEX_JOBS_DIR || resolve(dirname(STATE_FILE)
 const JOB_EVENTS_DIR = process.env.LOCAL_CODEX_JOB_EVENTS_DIR || resolve(dirname(STATE_FILE), "job-events");
 const WORKTREE_ROOT = process.env.LOCAL_CODEX_WORKTREE_ROOT || resolve(homedir(), "Library/Application Support/local-codex-worktrees");
 const WORKTREE_RETENTION = Number(process.env.LOCAL_CODEX_WORKTREE_RETENTION || "15");
-const VERSION = "3.4.0";
+const VERSION = "3.5.0";
 const DEFAULT_SETTINGS = { model: "gpt-5.6-luna", reasoningEffort: "max" };
 const MODEL_ALIASES = new Map([
   ["luna", "gpt-5.6-luna"], ["terra", "gpt-5.6-terra"], ["sol", "gpt-5.6-sol"],
@@ -50,8 +50,12 @@ const selectionProperties = {
 };
 const MAX_BODY = 1024 * 1024;
 const CALL_TIMEOUT_MS = Number(process.env.LOCAL_CODEX_CALL_TIMEOUT_MS || "1800000");
+const POLL_LEASE_MS = Number(process.env.LOCAL_CODEX_POLL_LEASE_MS || "90000");
 const MAX_CONCURRENCY = Number(process.env.LOCAL_CODEX_MAX_CONCURRENCY || "10");
 const MAX_QUEUE = Number(process.env.LOCAL_CODEX_MAX_QUEUE || "100");
+const PROCESS_TERM_GRACE_MS = 2000;
+const PROCESS_KILL_VERIFY_MS = 2000;
+const PROCESS_CHECK_INTERVAL_MS = 25;
 const VISIBLE_EVENT_TYPES = new Set([
   "session.started", "session.error", "session.ended",
   "chatgpt.prompt", "thread.started", "turn.requested", "turn.started", "turn.completed", "turn.interrupt_requested",
@@ -87,6 +91,9 @@ if (!Number.isInteger(PORT) || PORT < 1 || PORT > 65535) {
 if (HOST !== "127.0.0.1" && HOST !== "::1") throw new Error("LOCAL_CODEX_HOST must be loopback");
 if (!Number.isSafeInteger(CALL_TIMEOUT_MS) || CALL_TIMEOUT_MS <= 0 || CALL_TIMEOUT_MS > 2147483647) {
   throw new Error("LOCAL_CODEX_CALL_TIMEOUT_MS must be a positive timer-safe integer");
+}
+if (!Number.isSafeInteger(POLL_LEASE_MS) || POLL_LEASE_MS <= 0 || POLL_LEASE_MS > 2147483647) {
+  throw new Error("LOCAL_CODEX_POLL_LEASE_MS must be a positive timer-safe integer");
 }
 if (!Number.isSafeInteger(MAX_CONCURRENCY) || MAX_CONCURRENCY < 1 || MAX_CONCURRENCY > 1024) {
   throw new Error("LOCAL_CODEX_MAX_CONCURRENCY must be an integer between 1 and 1024");
@@ -153,6 +160,7 @@ const browserMcpTools = officialBrowserDynamicTools()[0].tools.map(tool => {
 let ready = false;
 let shuttingDown = false;
 let storageHealthy = true;
+let runtimeHealthy = true;
 const requestIdProperty = {
   type: "string", minLength: 1, maxLength: 200,
   description: "Generate a unique ID for new work. Reuse this exact ID and arguments on retries; never retry with a new ID.",
@@ -187,7 +195,7 @@ const tools = [
   {
     name: "codex",
     title: "Local Codex",
-    description: "Start a background Codex job from cwd, any existing absolute folder you choose. Git repositories use a dedicated detached worktree from committed HEAD by default. Different canonical folders can run concurrently, and isolated worktrees let different threads from one repository run concurrently too. Set worktree false only when the user explicitly needs the selected checkout, where jobs are serialized through the queue. Replies reuse the thread workspace. Pass sourceTitle only when the host exposes the exact ChatGPT conversation title; otherwise omit it. Choose networkAccess from the user's task intent: set true when completing the request requires outbound command access such as git fetch, git pull, git clone, installing dependencies or packages, curl, HTTP/API access, or downloads, even if the user did not explicitly ask for network access; omit or use false for fully local command work. Choose browserAccess separately when the task needs the official Codex Browser/Chrome backend for navigation, page inspection, interaction, screenshots, or browser-based QA. browserAccess never enables shell-launched Playwright/Chromium, command networking, wider filesystem access, or danger-full-access. Use codex-folders to locate the narrowest relevant folder. Returns jobId immediately; poll codex-status with waitMs=20000, never resubmit to check progress. Default Luna/max.",
+    description: "Start a background Codex job from cwd, any existing absolute folder you choose. Git repositories use a dedicated detached worktree from committed HEAD by default. Different canonical folders can run concurrently, and isolated worktrees let different threads from one repository run concurrently too. Set worktree false only when the user explicitly needs the selected checkout, where jobs are serialized through the queue. Replies reuse the thread workspace. Pass sourceTitle only when the host exposes the exact ChatGPT conversation title; otherwise omit it. Choose networkAccess from the user's task intent: set true when completing the request requires outbound command access such as git fetch, git pull, git clone, installing dependencies or packages, curl, HTTP/API access, or downloads, even if the user did not explicitly ask for network access; omit or use false for fully local command work. Choose browserAccess separately when the task needs the official Codex Browser/Chrome backend for navigation, page inspection, interaction, screenshots, or browser-based QA. browserAccess never enables shell-launched Playwright/Chromium, command networking, wider filesystem access, or danger-full-access. Use codex-folders to locate the narrowest relevant folder. Returns jobId immediately; start polling codex-status with waitMs=20000 and continue until terminal. Each valid status poll renews a 90-second default lease; if polling stops, queued or running work is cancelled. Never resubmit to check progress. Default Luna/max.",
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -214,7 +222,7 @@ const tools = [
   {
     name: "codex-reply",
     title: "Local Codex Reply",
-    description: "Start a background reply on an adapter-owned thread in its saved folder. Pass sourceTitle only when the host exposes the exact ChatGPT conversation title; omit it to inherit any exact title already saved for the thread. Omit networkAccess to inherit: enabled stays enabled and disabled stays disabled. Set true when this reply newly requires outbound command access, even if the user only implies it; set false when command networking must be disabled again. Omit browserAccess to inherit the saved official Browser capability; set true when the reply needs the official Codex Browser/Chrome backend and false to disable it. browserAccess is independent of networkAccess and never enables shell Chromium or a wider sandbox. Folder changes are not allowed; use codex for a new folder. Replies use the same per-folder queue. Returns jobId; poll codex-status with waitMs=20000. Omitted model/reasoningEffort retain thread settings; overrides persist. Reuse requestId on retries.",
+    description: "Start a background reply on an adapter-owned thread in its saved folder. Pass sourceTitle only when the host exposes the exact ChatGPT conversation title; omit it to inherit any exact title already saved for the thread. Omit networkAccess to inherit: enabled stays enabled and disabled stays disabled. Set true when this reply newly requires outbound command access, even if the user only implies it; set false when command networking must be disabled again. Omit browserAccess to inherit the saved official Browser capability; set true when the reply needs the official Codex Browser/Chrome backend and false to disable it. browserAccess is independent of networkAccess and never enables shell Chromium or a wider sandbox. Folder changes are not allowed; use codex for a new folder. Replies use the same per-folder queue. Returns jobId; start polling codex-status with waitMs=20000 and continue until terminal. Each valid status poll renews a 90-second default lease; if polling stops, queued or running work is cancelled. Omitted model/reasoningEffort retain thread settings; overrides persist. Reuse requestId on retries.",
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -239,7 +247,7 @@ const tools = [
   },
   {
     name: "codex-status", title: "Local Codex Job Status",
-    description: "Read a saved job. For normal completion polling, optionally wait up to 20 seconds with waitMs=20000. For incremental visible activity, start with afterEventSeq=0 and waitMs=20000; the call returns as soon as a new event arrives or the job becomes terminal. Pass nextEventSeq back as afterEventSeq on the next poll. Events include externally visible prompts/messages/commands/results/approval state and never hidden reasoning. Known macOS Chromium sandbox failures are classified as execution-environment failures in the job snapshot/events.",
+    description: "Read a saved job and renew its polling lease while it is queued or running. Start immediately after submission and keep polling until completed, failed, cancelled, timed_out, or interrupted; stopping for longer than the configured lease cancels the job. For normal completion polling, optionally wait up to 20 seconds with waitMs=20000. For incremental visible activity, start with afterEventSeq=0 and waitMs=20000; the call returns as soon as a new event arrives or the job becomes terminal. Pass nextEventSeq back as afterEventSeq on the next poll. Events include externally visible prompts/messages/commands/results/approval state and never hidden reasoning. Known macOS Chromium sandbox failures are classified as execution-environment failures in the job snapshot/events.",
     inputSchema: { type: "object", additionalProperties: false, properties: {
       jobId: { type: "string", minLength: 1, maxLength: 200 },
       waitMs: { type: "integer", minimum: 0, maximum: 20000, default: 0 },
@@ -280,7 +288,7 @@ const server = createServer(async (req, res) => {
       return json(res, 200, { status: "ok" });
     }
     if (req.method === "GET" && req.url === "/readyz") {
-      const healthy = ready && storageHealthy && !shuttingDown;
+      const healthy = ready && storageHealthy && runtimeHealthy && !shuttingDown;
       const active = [...activeJobs.values()];
       return json(res, healthy ? 200 : 503, {
         status: healthy ? "ready" : "unavailable", scope: "per_job", version: VERSION, schemaFingerprint: SCHEMA_FINGERPRINT,
@@ -289,6 +297,7 @@ const server = createServer(async (req, res) => {
         activeJobIds: active.map(job => job.jobId), activeCwds: active.map(job => job.cwd),
         queuedJobIds: jobQueue.map(job => job.jobId), queuedCwds: jobQueue.map(job => job.cwd),
         maxConcurrency: MAX_CONCURRENCY, maxQueue: MAX_QUEUE, scheduling: "fifo-runnable-per-folder",
+        pollLeaseMs: POLL_LEASE_MS,
         worktreesDefault: true, worktreeRetention: WORKTREE_RETENTION, worktreeRoot: WORKTREE_ROOT,
         browserAccessStatus: "official-backend",
       });
@@ -459,9 +468,11 @@ async function callTool(message, signal) {
       const prior = requests.get(key);
       if (prior) {
         if (prior.fingerprint !== fingerprint) throw callError("request_conflict", "requestId already belongs to different arguments");
+        renewJobLease(prior);
         return toolResult(message.id, snapshot(prior));
       }
       if (!storageHealthy) throw callError("storage_error", "Job storage unavailable; refusing new work");
+      if (!runtimeHealthy) throw callError("unavailable", "Job process cleanup could not be verified; restart the adapter before starting new work");
       if (shuttingDown) throw callError("unavailable", "Adapter is shutting down; no work was started");
       if (signal?.aborted) throw callError("request_cancelled", "Request disconnected before acceptance");
       const jobId = randomUUID();
@@ -488,6 +499,7 @@ async function callTool(message, signal) {
       if (concurrent) {
         if (workspace.id) await worktreeManager.abandon(workspace.id);
         if (concurrent.fingerprint !== fingerprint) throw callError("request_conflict", "requestId already belongs to different arguments");
+        renewJobLease(concurrent);
         return toolResult(message.id, snapshot(concurrent));
       }
       const cwd = workspace.executionCwd;
@@ -507,6 +519,7 @@ async function callTool(message, signal) {
         browserBackend: browserAccess ? "official_codex" : "none", browserTurnMetadata, settingsStatus: "pending",
         sourceTitle, codexThreadName,
         startedAt: Date.now(), updatedAt: Date.now(), eventSeq: 0,
+        pollLeaseMs: POLL_LEASE_MS, leaseExpiresAt: Date.now() + POLL_LEASE_MS,
       };
       // Acceptance is durable before work is started or queued. Visible prompts
       // and activity may also be persisted in the private Guard/job-event stream;
@@ -522,6 +535,7 @@ async function callTool(message, signal) {
       job.waiting = new Set();
       job.eventWaiting = new Set();
       job.runtimeArgs = args;
+      scheduleJobLease(job);
       logCall("job_accepted", job);
       if (startNow) activateJob(job, false);
       else {
@@ -553,9 +567,11 @@ async function callTool(message, signal) {
         if (!Number.isInteger(eventLimit) || eventLimit < 1 || eventLimit > 100) {
           throw callError("invalid_event_limit", "eventLimit must be an integer between 1 and 100");
         }
+        renewJobLease(job);
         await waitForJobEvents(job, afterEventSeq, waitMs, message.id, signal);
         return toolResult(message.id, { ...snapshot(job), ...(await eventSnapshot(job, afterEventSeq, eventLimit)) });
       }
+      renewJobLease(job);
       await waitForJob(job, waitMs, message.id, signal);
       return toolResult(message.id, snapshot(job));
     }
@@ -726,6 +742,41 @@ function canRunFolder(cwd) {
   return activeJobs.size < MAX_CONCURRENCY && !activeFolders.has(cwd);
 }
 
+function scheduleJobLease(job) {
+  clearTimeout(job.leaseTimer);
+  delete job.leaseTimer;
+  if (terminalStatuses.has(job.status) || job.stopReason || job.cleanupStarted || !job.leaseExpiresAt) return;
+  const remaining = Math.max(0, job.leaseExpiresAt - Date.now());
+  job.leaseTimer = setTimeout(() => {
+    delete job.leaseTimer;
+    if (terminalStatuses.has(job.status) || job.stopReason || job.cleanupStarted) return;
+    logCall("job_polling_expired", job, "polling_expired");
+    try {
+      cancelJob(job, "cancelled", {
+        errorCode: "polling_expired",
+        message: `Job cancelled because codex-status was not polled within ${POLL_LEASE_MS} milliseconds`,
+      });
+    } catch {
+      storageHealthy = false;
+    }
+  }, remaining);
+  job.leaseTimer.unref();
+}
+
+function renewJobLease(job) {
+  if (terminalStatuses.has(job.status) || job.stopReason || job.cleanupStarted) return;
+  job.pollLeaseMs = POLL_LEASE_MS;
+  job.leaseExpiresAt = Date.now() + POLL_LEASE_MS;
+  persistJob(job);
+  scheduleJobLease(job);
+}
+
+function clearJobLease(job) {
+  clearTimeout(job.leaseTimer);
+  delete job.leaseTimer;
+  delete job.leaseExpiresAt;
+}
+
 function activateJob(job, updatePersistentStatus = true) {
   if (shuttingDown || terminalStatuses.has(job.status) || job.stopReason) return;
   if (!canRunFolder(job.cwd)) {
@@ -748,7 +799,7 @@ function activateJob(job, updatePersistentStatus = true) {
 }
 
 function scheduleJobs() {
-  if (shuttingDown || !storageHealthy) return;
+  if (shuttingDown || !storageHealthy || !runtimeHealthy) return;
   while (activeJobs.size < MAX_CONCURRENCY) {
     const index = jobQueue.findIndex(job => job.status === "queued" && !activeFolders.has(job.cwd));
     if (index < 0) return;
@@ -791,10 +842,17 @@ async function executeJob(job, args) {
     job.content = result.content;
     job.status = "completed";
   } catch (error) {
-    job.status = job.stopReason || (error.callCode === "timeout" ? "timed_out" : "failed");
-    job.errorCode = error.callCode || "job_failed";
-    job.message = safeError(error);
+    if (error.callCode === "process_cleanup_failed") {
+      job.status = "failed";
+      job.errorCode = error.callCode;
+      job.message = safeError(error);
+    } else {
+      job.status = job.stopReason || (error.callCode === "timeout" ? "timed_out" : "failed");
+      job.errorCode ||= error.callCode || "job_failed";
+      job.message ||= safeError(error);
+    }
   } finally {
+    clearJobLease(job);
     job.finishedAt = Date.now();
     try { persistJob(job); } catch { storageHealthy = false; }
     logCall(`job_${job.status}`, job, job.errorCode);
@@ -827,13 +885,14 @@ async function pruneManagedWorktrees() {
   }
 }
 
-function cancelJob(job, reason) {
+function cancelJob(job, reason, details = {}) {
   if (terminalStatuses.has(job.status) || job.stopReason) return;
+  clearJobLease(job);
   if (job.status === "queued") {
     job.stopReason = reason;
     job.status = reason;
-    job.errorCode = reason;
-    job.message = reason === "cancelled" ? "Job cancelled before execution" : "Job interrupted before execution";
+    job.errorCode = details.errorCode || reason;
+    job.message = details.message || (reason === "cancelled" ? "Job cancelled before execution" : "Job interrupted before execution");
     job.finishedAt = Date.now();
     const index = jobQueue.indexOf(job);
     if (index >= 0) jobQueue.splice(index, 1);
@@ -848,12 +907,15 @@ function cancelJob(job, reason) {
   }
   job.stopReason = reason;
   job.status = "cancelling";
+  job.errorCode = details.errorCode || job.errorCode;
+  job.message = details.message || job.message;
   // Cancellation must still stop the child if the disk is full.
   try { persistJob(job); } finally { job.stop?.(reason); }
   logCall("job_cancelling", job);
 }
 
 function settleJob(job) {
+  clearJobLease(job);
   for (const finish of job.waiting || []) finish();
   for (const finish of job.eventWaiting || []) finish();
   job.resolveDone?.();
@@ -873,6 +935,8 @@ function snapshot(job) {
     networkAccess: job.networkAccess ?? false, browserAccess: job.browserAccess ?? false,
     browserBackend: job.browserBackend ?? (job.browserAccess ? "official_codex" : "none"),
     startedAt: job.startedAt, updatedAt: job.updatedAt,
+    pollLeaseMs: job.pollLeaseMs ?? POLL_LEASE_MS,
+    ...(job.leaseExpiresAt ? { leaseExpiresAt: job.leaseExpiresAt } : {}),
     elapsedMs: (job.finishedAt ?? Date.now()) - job.startedAt,
     ...(job.finishedAt ? { finishedAt: job.finishedAt } : {}),
     ...(job.content !== undefined ? { content: job.content } : {}),
@@ -955,6 +1019,7 @@ async function loadJobs() {
     }
     job.eventSeq = await loadEventSeq(job.jobId);
     job.eventWaiting = new Set();
+    clearJobLease(job);
     if (!terminalStatuses.has(job.status)) {
       job.status = "interrupted";
       job.errorCode = "adapter_restarted";
@@ -1042,7 +1107,7 @@ async function shutdown() {
   await Promise.all(active.map(job => job.done));
   server.closeAllConnections();
   await closed;
-  process.exit(storageHealthy ? 0 : 1);
+  process.exit(storageHealthy && runtimeHealthy ? 0 : 1);
 }
 
 async function canonicalDirectory(value, label = "path") {
@@ -1430,24 +1495,61 @@ async function runCodex(args, existingThreadId, audit) {
     function finish(error, value) {
       if (settled) return;
       settled = true;
+      audit.cleanupStarted = true;
+      clearJobLease(audit);
       clearTimeout(timer);
       clearTimeout(interruptTimer);
       delete audit.stop;
       for (const entry of pending.values()) entry.reject(error || new Error("Codex call ended"));
       pending.clear();
-      const resolveAfterExit = async () => {
-        clearTimeout(killTimer);
-        signalChild("SIGKILL"); // Remove any remaining children before releasing this folder lock.
-        if (browserSession) await disposeBrowserSession(browserSession);
-        if (error) rejectPromise(error);
-        else resolvePromise(value);
-      };
       signalChild("SIGTERM");
-      const killTimer = setTimeout(() => {
-        signalChild("SIGKILL");
-      }, 2000);
-      if (exited || !child.pid) void resolveAfterExit();
-      else child.once("exit", () => { void resolveAfterExit(); });
+      void finishAfterCleanup(error, value);
+    }
+
+    async function finishAfterCleanup(error, value) {
+      let finalError = error;
+      let gone = false;
+      try {
+        gone = await waitForProcessGroupExit(PROCESS_TERM_GRACE_MS);
+        if (!gone) {
+          signalChild("SIGKILL");
+          gone = await waitForProcessGroupExit(PROCESS_KILL_VERIFY_MS);
+        }
+      } catch {
+        gone = false;
+      }
+      if (!gone) {
+        runtimeHealthy = false;
+        finalError = callError("process_cleanup_failed", "Codex process-group cleanup could not be verified; the adapter is unavailable until restarted");
+        logCall("job_cleanup_failed", audit, finalError.callCode);
+      }
+      try {
+        if (browserSession) await disposeBrowserSession(browserSession);
+      } catch {
+        if (!finalError) finalError = callError("browser_cleanup_failed", "Official Browser cleanup failed");
+      }
+      delete audit.cleanupStarted;
+      if (finalError) rejectPromise(finalError);
+      else resolvePromise(value);
+    }
+
+    async function waitForProcessGroupExit(waitMs) {
+      if (!child.pid) return true;
+      const deadline = Date.now() + waitMs;
+      for (;;) {
+        if (process.platform === "win32") {
+          if (exited || child.exitCode !== null || child.signalCode !== null) return true;
+        } else {
+          try {
+            process.kill(-child.pid, 0);
+          } catch (error) {
+            if (error.code === "ESRCH") return true;
+            if (error.code !== "EPERM") throw error;
+          }
+        }
+        if (Date.now() >= deadline) return false;
+        await new Promise(resolvePromise => setTimeout(resolvePromise, Math.min(PROCESS_CHECK_INTERVAL_MS, deadline - Date.now())));
+      }
     }
 
     function signalChild(signal) {
@@ -1463,9 +1565,9 @@ async function runCodex(args, existingThreadId, audit) {
         if (error.code === "EPERM") {
           logCall("job_cleanup_group_denied", audit);
           if (!exited) {
-            try { child.kill(signal); } catch { storageHealthy = false; }
+            try { child.kill(signal); } catch { /* verification below decides health */ }
           }
-        } else storageHealthy = false;
+        } else logCall("job_cleanup_signal_failed", audit, "process_cleanup_failed");
       }
     }
   });
@@ -1764,6 +1866,8 @@ function resultSchema() {
       browserBackend: { type: "string", enum: ["none", "official_codex"] },
       startedAt: { type: "number" },
       updatedAt: { type: "number" },
+      pollLeaseMs: { type: "number" },
+      leaseExpiresAt: { type: "number" },
       finishedAt: { type: "number" },
       elapsedMs: { type: "number" },
       content: { type: "string" },

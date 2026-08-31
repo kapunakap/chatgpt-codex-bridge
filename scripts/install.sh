@@ -165,6 +165,7 @@ config_tmp=$(mktemp "${STATE_DIR}/config.env.XXXXXX")
   printf 'LOCAL_CODEX_WORKTREE_RETENTION=%q\n' "15"
   printf 'LOCAL_CODEX_APPROVAL_MODE=%q\n' "off"
   printf 'LOCAL_CODEX_CALL_TIMEOUT_MS=%q\n' "1800000"
+  printf 'LOCAL_CODEX_POLL_LEASE_MS=%q\n' "90000"
   printf 'LOCAL_CODEX_MAX_CONCURRENCY=%q\n' "10"
   printf 'LOCAL_CODEX_MAX_QUEUE=%q\n' "100"
   printf 'LOCAL_CODEX_HOST=%q\n' "127.0.0.1"
