@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { homedir, tmpdir } from "node:os";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 
@@ -241,11 +241,14 @@ test("secure wrapper validates and preserves the shared Git metadata root for li
   assert.equal(await runCommand("git", ["-C", worktree, "status", "--short"]), "");
 });
 
-test("network-disabled macOS profiles allow workspace ancestors but deny unrelated user paths", {
+test("network-disabled macOS profiles stay bounded while preserving fixed denies", {
   skip: process.platform !== "darwin",
 }, async t => {
-  const workspace = await realpath(await mkdtemp(join(repoRoot, ".local-codex-profile-test-")));
-  t.after(() => rm(workspace, { recursive: true, force: true }));
+  const parent = await realpath(await mkdtemp(join(repoRoot, ".local-codex-profile-parent-")));
+  const workspace = await realpath(await mkdtemp(join(parent, "workspace-")));
+  const siblingPaths = Array.from({ length: 256 }, (_, index) => join(parent, `sibling-${index}`));
+  t.after(() => rm(parent, { recursive: true, force: true }));
+  await Promise.all(siblingPaths.map(path => mkdir(path)));
   await runCommand("git", ["-C", workspace, "init"]);
   const commonGitDir = await realpath(join(workspace, ".git"));
   const result = await runWrapper(t, [permissionConfig(workspace, false, commonGitDir)], [], workspace);
@@ -253,17 +256,44 @@ test("network-disabled macOS profiles allow workspace ancestors but deny unrelat
   const effective = result.record.args.find(value => value.startsWith("permissions.local-codex-tunnel="));
   assert.doesNotMatch(effective, /"\/Users"="deny"/);
   assert.doesNotMatch(effective, /"\/System\/Volumes\/Data\/Users"="deny"/);
-  assert.ok(effective.includes('"/Users/onin/.gitconfig"="deny"'));
+  assert.ok(effective.includes(`${JSON.stringify(join(homedir(), ".gitconfig"))}="deny"`));
+  assert.ok(effective.includes(`${JSON.stringify(join(homedir(), ".zshenv"))}="deny"`));
+  assert.ok(effective.includes(`${JSON.stringify(join("/System/Volumes/Data", homedir().slice(1), ".gitconfig"))}="deny"`));
+  assert.ok(effective.includes(`${JSON.stringify(join("/System/Volumes/Data", homedir().slice(1), ".zshenv"))}="deny"`));
+  assert.equal(siblingPaths.some(path => effective.includes(JSON.stringify(path))), false);
+  assert.ok(effective.length < 8000, `effective profile grew to ${effective.length} bytes`);
   assert.ok(effective.includes(`${JSON.stringify(workspace)}="write"`));
   assert.equal(result.record.env.scratchWritable, true);
   await assert.rejects(stat(result.record.env.tmpdir), error => error?.code === "ENOENT");
+});
+
+test("network-disabled native Codex command startup stays below five seconds", {
+  skip: process.platform !== "darwin" || process.env.LOCAL_CODEX_NATIVE_TEST !== "1",
+}, async t => {
+  const { workspace, profile } = await prepareNativeProfile(t, 512);
+  const result = await runNativeSandbox(workspace, profile, ["/usr/bin/true"]);
+  assert.equal(result.timedOut, false, result.stderr);
+  assert.equal(result.code, 0, result.stderr);
+  assert.ok(result.elapsedMs < 5000, `network-disabled startup took ${result.elapsedMs}ms`);
+});
+
+test("network-disabled native zsh heredocs use the authorized job scratch directory", {
+  skip: process.platform !== "darwin" || process.env.LOCAL_CODEX_NATIVE_TEST !== "1",
+}, async t => {
+  const { workspace, profile } = await prepareNativeProfile(t);
+  const result = await runNativeSandbox(workspace, profile, [
+    "/bin/zsh", "-c", "cat <<'EOF'\nHEREDOC_OK\nEOF",
+  ]);
+  assert.equal(result.timedOut, false, result.stderr);
+  assert.equal(result.code, 0, result.stderr);
+  assert.equal(result.stdout, "HEREDOC_OK\n");
 });
 
 test("secure wrapper keeps network-disabled jobs hardened and denies host-authority state", async t => {
   const workspace = await realpath(await mkdtemp(join(tmpdir(), "local-codex-profile-")));
   t.after(() => rm(workspace, { recursive: true, force: true }));
   const permission = permissionConfig(workspace, false);
-  const result = await runWrapper(t, [permission], [], workspace);
+  const result = await runWrapper(t, [permission], ["--test-zsh-heredoc"], workspace);
   assert.equal(result.exitCode, 0);
   const configs = result.record.args
     .map((value, index) => result.record.args[index - 1] === "-c" ? value : null)
@@ -281,6 +311,7 @@ test("secure wrapper keeps network-disabled jobs hardened and denies host-author
   assert.ok(environmentSet.includes('"GIT_CONFIG_SYSTEM"="/dev/null"'));
   assert.ok(environmentSet.includes('"GIT_CONFIG_NOSYSTEM"="1"'));
   assert.ok(environmentSet.includes('"GIT_TERMINAL_PROMPT"="0"'));
+  assert.ok(environmentSet.includes('"TMPPREFIX"='));
 
   assert.equal(result.record.env.pathPresent, true);
   assert.equal(result.record.env.homePresent, true);
@@ -308,6 +339,8 @@ test("secure wrapper keeps network-disabled jobs hardened and denies host-author
   assert.ok(result.record.env.tmpdir.startsWith(`${workspace}/.local-codex-tmp-`));
   assert.equal(result.record.env.tmp, result.record.env.tmpdir);
   assert.equal(result.record.env.temp, result.record.env.tmpdir);
+  assert.equal(result.record.env.tmpprefix, `${result.record.env.tmpdir}/zsh-`);
+  assert.deepEqual(result.record.zshHeredoc, { status: 0, stdout: "HEREDOC_OK\n", stderr: "" });
   await assert.rejects(stat(result.record.env.tmpdir), error => error?.code === "ENOENT");
 });
 
@@ -329,6 +362,7 @@ test("default off mode grants network capability without approval files", async 
   assert.equal(result.record.env.path, process.env.PATH);
   assert.equal(result.record.env.scratchMode, 0o700);
   assert.equal(result.record.env.scratchWritable, true);
+  assert.equal(result.record.env.tmpprefix, `${result.record.env.tmpdir}/zsh-`);
   await assert.rejects(stat(result.record.env.tmpdir), error => error?.code === "ENOENT");
   assert.equal(result.audit.some(entry => entry.capability === "networkAccess"), false);
   let approvalFiles = [];
@@ -360,6 +394,7 @@ test("host approval mode holds network-enabled jobs before spawn", async t => {
   assert.ok(configs.some(value => value === 'shell_environment_policy.filters={"LOCAL_CODEX_*"="exclude","TUNNEL_CLIENT_*"="exclude"}'));
   const environmentSet = configs.find(value => value.startsWith("shell_environment_policy.set="));
   assert.ok(environmentSet.includes('"TMPDIR"='));
+  assert.ok(environmentSet.includes('"TMPPREFIX"='));
   assert.doesNotMatch(environmentSet, /GIT_CONFIG/);
 
   assert.equal(result.record.env.pathPresent, true);
@@ -443,4 +478,54 @@ async function runCommand(command, args) {
   });
   assert.equal(code, 0, stderr);
   return stdout;
+}
+
+async function prepareNativeProfile(t, siblingCount = 0) {
+  const parent = await realpath(await mkdtemp(join(repoRoot, ".local-codex-native-parent-")));
+  const workspace = await realpath(await mkdtemp(join(parent, "workspace-")));
+  t.after(() => rm(parent, { recursive: true, force: true }));
+  await Promise.all(Array.from({ length: siblingCount }, (_, index) => mkdir(join(parent, `sibling-${index}`))));
+  await runCommand("git", ["-C", workspace, "init"]);
+  const commonGitDir = await realpath(join(workspace, ".git"));
+  const result = await runWrapper(t, [permissionConfig(workspace, false, commonGitDir)], [], workspace);
+  assert.equal(result.exitCode, 0, result.stderr);
+  const profile = result.record.args.find(value => value.startsWith("permissions.local-codex-tunnel="));
+  assert.ok(profile);
+  return { workspace, profile };
+}
+
+async function runNativeSandbox(workspace, profile, command) {
+  const scratch = join(workspace, ".local-codex-native-tmp");
+  await mkdir(scratch, { recursive: true, mode: 0o700 });
+  return new Promise(resolvePromise => {
+    const env = {
+      ...process.env,
+      TMPDIR: scratch,
+      TMP: scratch,
+      TEMP: scratch,
+      TMPPREFIX: join(scratch, "zsh-"),
+    };
+    const startedAt = Date.now();
+    const child = spawn("codex", [
+      "sandbox", "-P", "local-codex-tunnel", "-C", workspace, "-c", profile, "--", ...command,
+    ], { cwd: workspace, env, stdio: ["ignore", "pipe", "pipe"] });
+    let stdout = "";
+    let stderr = "";
+    let settled = false;
+    let timedOut = false;
+    const finish = result => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolvePromise({ ...result, stdout, stderr, elapsedMs: Date.now() - startedAt, timedOut });
+    };
+    child.stdout.on("data", chunk => { stdout += chunk; });
+    child.stderr.on("data", chunk => { stderr += chunk; });
+    child.once("error", error => finish({ code: null, signal: null, error }));
+    child.once("exit", (code, signal) => finish({ code, signal }));
+    const timer = setTimeout(() => {
+      timedOut = true;
+      child.kill("SIGKILL");
+    }, 8000);
+  });
 }

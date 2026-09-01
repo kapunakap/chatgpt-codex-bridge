@@ -30,9 +30,17 @@ const gitAcceptance = args.includes("--test-git-acceptance") ? {
   revParse: runGit(["rev-parse", "--show-toplevel"]),
   status: runGit(["status", "--short"]),
 } : null;
+const zshHeredoc = args.includes("--test-zsh-heredoc") ? (() => {
+  const result = spawnSync("/bin/zsh", ["-c", "cat <<'EOF'\nHEREDOC_OK\nEOF"], {
+    encoding: "utf8",
+    env: process.env,
+  });
+  return { status: result.status, stdout: result.stdout || "", stderr: result.stderr || "" };
+})() : null;
 writeFileSync(recordFile, JSON.stringify({
   args,
   gitAcceptance,
+  zshHeredoc,
   env: {
     pathPresent: typeof process.env.PATH === "string",
     path: process.env.PATH || null,
@@ -49,6 +57,7 @@ writeFileSync(recordFile, JSON.stringify({
     tmpdir: process.env.TMPDIR || null,
     tmp: process.env.TMP || null,
     temp: process.env.TEMP || null,
+    tmpprefix: process.env.TMPPREFIX || null,
     scratchMode,
     scratchWritable,
     gitConfigNosystem: process.env.GIT_CONFIG_NOSYSTEM || null,

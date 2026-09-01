@@ -7,7 +7,7 @@ import {
 } from "node:fs";
 import { spawn, spawnSync } from "node:child_process";
 import { homedir } from "node:os";
-import { dirname, relative, resolve } from "node:path";
+import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import process from "node:process";
 
@@ -33,14 +33,17 @@ const GUARD_PROXY = fileURLToPath(new URL("./local-codex-guard-proxy.mjs", impor
 // even when the selected workspace is an ancestor such as the user's home.
 // Network-enabled jobs still deliberately widen ordinary host read/env access
 // to match the user's terminal, but never to this host-authority directory.
-function permissionConfig(cwd, networkAccess, trustedHostAccess = false, protectedControlDir = null, commonGitDir = null, allowWorkspaceAncestors = false) {
+// Network-disabled macOS jobs retain the workspace write boundary and fixed
+// sensitive-path denies, but use a bounded read policy so profile generation
+// does not depend on the number of sibling entries in the user tree.
+function permissionConfig(cwd, networkAccess, trustedHostAccess = false, protectedControlDir = null, commonGitDir = null, effectiveHardenedProfile = false) {
   const denied = ["/Users", "/System/Volumes/Data/Users", "/Volumes", "/private/tmp", "/tmp", "/private/var/tmp", "/var/tmp", "/private/var/folders", "/var/folders"];
   const inside = path => cwd === "/" || path === cwd || path.startsWith(`${cwd}/`);
   let readRules;
   if (process.platform === "darwin") {
     readRules = trustedHostAccess
       ? ['":root"="read"']
-      : macHardenedReadRules(denied, inside, allowWorkspaceAncestors ? [cwd, commonGitDir].filter(Boolean) : []);
+      : macHardenedReadRules(denied, inside, effectiveHardenedProfile, [cwd, commonGitDir].filter(Boolean));
   } else {
     readRules = [trustedHostAccess ? '":root"="read"' : '":minimal"="read"'];
   }
@@ -191,6 +194,7 @@ const commandEnvOverrides = scratchDir ? {
   TMPDIR: scratchDir,
   TMP: scratchDir,
   TEMP: scratchDir,
+  TMPPREFIX: resolve(scratchDir, "zsh-"),
   ...(!networkAccess ? { ...HARDENED_GIT_ENV, ...developerGitEnvironment() } : {}),
 } : {};
 if (Object.keys(commandEnvOverrides).length > 0) {
@@ -214,7 +218,7 @@ if (networkAccess) {
   // from Codex state under HOME/CODEX_HOME, not ambient API-key variables.
   const ALLOWED_ENV = new Set([
     "PATH", "HOME", "USER", "LOGNAME", "SHELL",
-    "TMPDIR", "TMP", "TEMP",
+    "TMPDIR", "TMP", "TEMP", "TMPPREFIX",
     "LANG", "LC_ALL", "LC_CTYPE",
     "TERM", "COLORTERM", "NO_COLOR",
     "CODEX_HOME",
@@ -373,69 +377,34 @@ function developerGitEnvironment() {
     PATH: `${developerBin}:${process.env.PATH || "/usr/bin:/bin:/usr/sbin:/sbin"}`,
     DEVELOPER_DIR: resolve(developerBin, "../.."),
     // The leading empty entry tells Git the following ceiling path does not
-    // need symlink resolution. This prevents repository discovery from
-    // probing the deliberately denied /Users ancestor.
+    // need symlink resolution. This keeps repository discovery from probing
+    // above the selected user's workspace tree.
     GIT_CEILING_DIRECTORIES: ":/Users",
   };
 }
 
-function macHardenedReadRules(denied, inside, authorizedRoots) {
+function macHardenedReadRules(denied, inside, effectiveHardenedProfile, authorizedRoots) {
   const userTrees = ["/Users", "/System/Volumes/Data/Users"];
   const rules = ['":root"="read"'];
   for (const path of denied) {
-    if (authorizedRoots.length > 0 && userTrees.includes(path)) continue;
+    if (effectiveHardenedProfile && userTrees.includes(path)) continue;
     const canonical = path.replace(/^\/System\/Volumes\/Data(?=\/)/, "").replace(/^\/tmp$/, "/private/tmp").replace(/^\/var(?=\/)/, "/private/var");
     if (!inside(path) && !inside(canonical)) rules.push(`${JSON.stringify(path)}="deny"`);
   }
-  if (authorizedRoots.length === 0) return rules;
-  for (const tree of userTrees) {
-    const targets = authorizedRoots.map(root => {
-      const canonical = root.replace(/^\/System\/Volumes\/Data(?=\/)/, "");
-      return canonical === "/Users" || canonical.startsWith("/Users/")
-        ? `${tree}${canonical.slice("/Users".length)}`
-        : null;
-    }).filter(Boolean);
-    if (targets.length === 0) {
-      rules.push(`${JSON.stringify(tree)}="deny"`);
-      continue;
-    }
-    // The macOS sandbox needs readable directory ancestors for getcwd and
-    // Git discovery. Deny unrelated entries beneath those ancestors instead
-    // of denying the ancestors themselves.
-    rules.push(...denyUnrelatedUserPaths(tree, targets));
+  if (effectiveHardenedProfile) {
+    for (const path of macHardenedCredentialPaths()) rules.push(`${JSON.stringify(path)}="deny"`);
+    for (const root of authorizedRoots) rules.push(`${JSON.stringify(root)}="write"`);
   }
-  for (const root of authorizedRoots) rules.push(`${JSON.stringify(root)}="write"`);
   return rules;
 }
 
-function denyUnrelatedUserPaths(tree, targets) {
-  const rules = [];
-  const minimalTargets = targets.filter(target => !targets.some(other => other !== target && target.startsWith(`${other}/`)));
-  const visit = (directory, activeTargets) => {
-    // Once an authorized root is reached, keep its complete subtree readable
-    // (Git worktree metadata lives below the common Git directory). Unrelated
-    // entries are denied only while walking the ancestors toward that root.
-    if (activeTargets.some(target => target === directory)) return;
-    const nextTargets = new Map();
-    for (const target of activeTargets) {
-      const remainder = relative(directory, target);
-      if (!remainder || remainder.startsWith("..")) continue;
-      const name = remainder.split("/")[0];
-      if (!nextTargets.has(name)) nextTargets.set(name, []);
-      nextTargets.get(name).push(target);
-    }
-    let entries;
-    try { entries = readdirSync(directory, { withFileTypes: true }); }
-    catch { throw new Error("Unable to build the hardened Local Codex user-path boundary"); }
-    for (const entry of entries) {
-      const child = resolve(directory, entry.name);
-      const childTargets = nextTargets.get(entry.name);
-      if (childTargets) visit(child, childTargets);
-      else rules.push(`${JSON.stringify(child)}="deny"`);
-    }
-  };
-  visit(tree, minimalTargets);
-  return rules;
+function macHardenedCredentialPaths() {
+  const paths = [resolve(homedir(), ".gitconfig"), resolve(homedir(), ".zshenv")];
+  for (const path of [...paths]) {
+    const canonical = path.replace(/^\/System\/Volumes\/Data(?=\/)/, "");
+    if (canonical.startsWith("/Users/")) paths.push(`/System/Volumes/Data${canonical}`);
+  }
+  return [...new Set(paths)];
 }
 
 function createScratchDirectory(cwd, commonGitDir) {
