@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 
@@ -10,6 +10,12 @@ const repoRoot = fileURLToPath(new URL("..", import.meta.url));
 const wrapper = join(repoRoot, "bin/local-codex-secure.mjs");
 const fixture = join(repoRoot, "test/fixtures/record-codex-env.mjs");
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
+const TEST_GIT_ENV = {
+  GIT_CONFIG_NOSYSTEM: "1",
+  GIT_CONFIG_GLOBAL: "/dev/null",
+  GIT_CONFIG_SYSTEM: "/dev/null",
+  GIT_TERMINAL_PROMPT: "0",
+};
 
 function permissionConfig(cwd, networkAccess, commonGitDir = null) {
   const denied = ["/Users", "/System/Volumes/Data/Users", "/Volumes", "/private/tmp", "/tmp", "/private/var/tmp", "/var/tmp", "/private/var/folders", "/var/folders"];
@@ -29,10 +35,10 @@ function permissionConfig(cwd, networkAccess, commonGitDir = null) {
 }
 
 async function runWrapper(t, configs, extraArgs = [], cwd, capabilityDecision = "accept", approvalMode = "off") {
-  assert.ok(cwd, "test cwd is required so control state can be placed inside the selected workspace");
+  assert.ok(cwd, "test cwd is required");
   const root = await mkdtemp(join(tmpdir(), "local-codex-secure-"));
   const recordFile = join(root, "record.json");
-  const controlDir = join(cwd, ".local-codex-control");
+  const controlDir = join(root, "control");
   const jobsDir = join(controlDir, "jobs");
   const approvalsDir = join(controlDir, "guard", "approvals");
   await mkdir(jobsDir, { recursive: true, mode: 0o700 });
@@ -49,7 +55,7 @@ async function runWrapper(t, configs, extraArgs = [], cwd, capabilityDecision = 
   args.push(...extraArgs, "--test-record-file", recordFile);
   const child = spawn(process.execPath, args, {
     cwd,
-    stdio: ["ignore", "pipe", "ignore"],
+    stdio: ["ignore", "pipe", "pipe"],
     env: {
       ...process.env,
       LOCAL_CODEX_STATE_FILE: join(controlDir, "threads.json"),
@@ -65,8 +71,14 @@ async function runWrapper(t, configs, extraArgs = [], cwd, capabilityDecision = 
       LOCAL_CODEX_TOKEN_FILE: join(controlDir, "adapter-token"),
       TUNNEL_CLIENT_RUNTIME_API_KEY: "marker",
       TEST_PASSWORD: "marker",
+      GIT_CONFIG_NOSYSTEM: "host-value",
+      GIT_CONFIG_GLOBAL: "/host/global-config",
+      GIT_CONFIG_SYSTEM: "/host/system-config",
+      GIT_TERMINAL_PROMPT: "host-value",
     },
   });
+  let childStderr = "";
+  child.stderr.on("data", chunk => { childStderr += chunk; });
   let pending;
   if (networkEnabled && approvalMode === "host") {
     for (let i = 0; i < 150; i++) {
@@ -98,7 +110,7 @@ async function runWrapper(t, configs, extraArgs = [], cwd, capabilityDecision = 
   let audit = [];
   try { audit = (await readFile(join(root, "audit.log"), "utf8")).trim().split("\n").filter(Boolean).map(JSON.parse); }
   catch (error) { if (error.code !== "ENOENT") throw error; }
-  return { exitCode, record, controlDir, approvalsDir, pending, audit };
+  return { exitCode, record, controlDir, approvalsDir, pending, audit, stderr: childStderr };
 }
 
 async function runInteractiveResume(t, { networkAccess, approvalMode = "off", token = "Bearer resume-secret" }) {
@@ -156,7 +168,7 @@ writeFileSync(${JSON.stringify(recordFile)}, JSON.stringify({
 
 test("interactive resume keeps a real TTY path with the original disabled-network boundary", async t => {
   const result = await runInteractiveResume(t, { networkAccess: false });
-  assert.equal(result.exitCode, 0);
+  assert.equal(result.exitCode, 0, result.stderr);
   assert.equal(result.record.cwd.endsWith("/workspace"), true);
   assert.deepEqual(result.record.args.slice(0, 2), ["resume", "11111111-1111-1111-1111-111111111111"]);
   assert.ok(result.record.args.includes("--include-non-interactive"));
@@ -210,11 +222,41 @@ test("secure wrapper validates and preserves the shared Git metadata root for li
   await runCommand("git", ["-C", repo, "commit", "-m", "initial"]);
   await runCommand("git", ["-C", repo, "worktree", "add", "--detach", worktree, "HEAD"]);
   const commonGitDir = await realpath(join(repo, ".git"));
-  const result = await runWrapper(t, [permissionConfig(worktree, false, commonGitDir)], [], worktree);
+  const result = await runWrapper(t, [permissionConfig(worktree, false, commonGitDir)], ["--test-git-acceptance"], worktree);
   assert.equal(result.exitCode, 0);
   const permission = result.record.args.find(value => value.startsWith("permissions.local-codex-tunnel="));
   assert.ok(permission.includes(`${JSON.stringify(worktree)}=true`));
   assert.ok(permission.includes(`${JSON.stringify(commonGitDir)}=true`));
+  assert.equal(result.record.env.scratchMode, 0o700);
+  assert.equal(result.record.env.scratchWritable, true);
+  assert.ok(result.record.env.tmpdir.startsWith(`${commonGitDir}/worktrees/`));
+  assert.equal(result.record.env.tmp, result.record.env.tmpdir);
+  assert.equal(result.record.env.temp, result.record.env.tmpdir);
+  assert.equal(result.record.gitAcceptance.revParse.status, 0, result.record.gitAcceptance.revParse.stderr);
+  assert.equal(result.record.gitAcceptance.revParse.stdout.trim(), worktree);
+  assert.equal(result.record.gitAcceptance.status.status, 0, result.record.gitAcceptance.status.stderr);
+  assert.equal(result.record.gitAcceptance.status.stdout, "");
+  assert.doesNotMatch(result.record.gitAcceptance.status.stderr, /xcrun_db|\.gitconfig|Operation not permitted/i);
+  await assert.rejects(stat(result.record.env.tmpdir), error => error?.code === "ENOENT");
+  assert.equal(await runCommand("git", ["-C", worktree, "status", "--short"]), "");
+});
+
+test("network-disabled macOS profiles allow workspace ancestors but deny unrelated user paths", {
+  skip: process.platform !== "darwin",
+}, async t => {
+  const workspace = await realpath(await mkdtemp(join(repoRoot, ".local-codex-profile-test-")));
+  t.after(() => rm(workspace, { recursive: true, force: true }));
+  await runCommand("git", ["-C", workspace, "init"]);
+  const commonGitDir = await realpath(join(workspace, ".git"));
+  const result = await runWrapper(t, [permissionConfig(workspace, false, commonGitDir)], [], workspace);
+  assert.equal(result.exitCode, 0, result.stderr);
+  const effective = result.record.args.find(value => value.startsWith("permissions.local-codex-tunnel="));
+  assert.doesNotMatch(effective, /"\/Users"="deny"/);
+  assert.doesNotMatch(effective, /"\/System\/Volumes\/Data\/Users"="deny"/);
+  assert.ok(effective.includes('"/Users/onin/.gitconfig"="deny"'));
+  assert.ok(effective.includes(`${JSON.stringify(workspace)}="write"`));
+  assert.equal(result.record.env.scratchWritable, true);
+  await assert.rejects(stat(result.record.env.tmpdir), error => error?.code === "ENOENT");
 });
 
 test("secure wrapper keeps network-disabled jobs hardened and denies host-authority state", async t => {
@@ -230,10 +272,15 @@ test("secure wrapper keeps network-disabled jobs hardened and denies host-author
   assert.equal(configs.filter(value => value.startsWith("permissions.local-codex-tunnel=")).length, 1);
   assert.notEqual(effectivePermission, permission, "wrapper must add its own control-state deny after validating adapter input");
   assert.match(effectivePermission, /network=\{enabled=false\}/);
-  assert.ok(effectivePermission.includes(`${JSON.stringify(result.controlDir)}="deny"`), "control state inside cwd must remain explicitly denied");
+  assert.ok(effectivePermission.includes(`${JSON.stringify(result.controlDir)}="deny"`), "control state must remain explicitly denied");
   assert.equal(configs.includes('shell_environment_policy.inherit="core"'), true);
   assert.equal(configs.includes("shell_environment_policy.ignore_default_excludes=false"), true);
   assert.ok(configs.some(value => value.includes('"*AUTH*"="exclude"')));
+  const environmentSet = configs.find(value => value.startsWith("shell_environment_policy.set="));
+  assert.ok(environmentSet.includes('"GIT_CONFIG_GLOBAL"="/dev/null"'));
+  assert.ok(environmentSet.includes('"GIT_CONFIG_SYSTEM"="/dev/null"'));
+  assert.ok(environmentSet.includes('"GIT_CONFIG_NOSYSTEM"="1"'));
+  assert.ok(environmentSet.includes('"GIT_TERMINAL_PROMPT"="0"'));
 
   assert.equal(result.record.env.pathPresent, true);
   assert.equal(result.record.env.homePresent, true);
@@ -246,6 +293,22 @@ test("secure wrapper keeps network-disabled jobs hardened and denies host-author
   assert.equal(result.record.env.approvalModePresent, false);
   assert.equal(result.record.env.runtimeApiKeyPresent, false);
   assert.equal(result.record.env.passwordPresent, false);
+  assert.equal(result.record.env.gitConfigNosystem, "1");
+  assert.equal(result.record.env.gitConfigGlobal, "/dev/null");
+  assert.equal(result.record.env.gitConfigSystem, "/dev/null");
+  assert.equal(result.record.env.gitTerminalPrompt, "0");
+  if (process.platform === "darwin") {
+    assert.notEqual(result.record.env.path.split(":")[0], "/usr/bin");
+    assert.ok(result.record.env.path.split(":")[0].endsWith("/usr/bin"));
+    assert.ok(result.record.env.developerDir?.endsWith("/Developer"));
+    assert.equal(result.record.env.gitCeilingDirectories, ":/Users");
+  }
+  assert.equal(result.record.env.scratchMode, 0o700);
+  assert.equal(result.record.env.scratchWritable, true);
+  assert.ok(result.record.env.tmpdir.startsWith(`${workspace}/.local-codex-tmp-`));
+  assert.equal(result.record.env.tmp, result.record.env.tmpdir);
+  assert.equal(result.record.env.temp, result.record.env.tmpdir);
+  await assert.rejects(stat(result.record.env.tmpdir), error => error?.code === "ENOENT");
 });
 
 test("default off mode grants network capability without approval files", async t => {
@@ -259,6 +322,14 @@ test("default off mode grants network capability without approval files", async 
   assert.equal(result.record.env.githubTokenPresent, true);
   assert.equal(result.record.env.sshAuthSockPresent, true);
   assert.equal(result.record.env.approvalModePresent, false);
+  assert.equal(result.record.env.gitConfigNosystem, "host-value");
+  assert.equal(result.record.env.gitConfigGlobal, "/host/global-config");
+  assert.equal(result.record.env.gitConfigSystem, "/host/system-config");
+  assert.equal(result.record.env.gitTerminalPrompt, "host-value");
+  assert.equal(result.record.env.path, process.env.PATH);
+  assert.equal(result.record.env.scratchMode, 0o700);
+  assert.equal(result.record.env.scratchWritable, true);
+  await assert.rejects(stat(result.record.env.tmpdir), error => error?.code === "ENOENT");
   assert.equal(result.audit.some(entry => entry.capability === "networkAccess"), false);
   let approvalFiles = [];
   try {
@@ -287,6 +358,9 @@ test("host approval mode holds network-enabled jobs before spawn", async t => {
   assert.equal(configs.includes('shell_environment_policy.inherit="all"'), true);
   assert.equal(configs.includes("shell_environment_policy.ignore_default_excludes=true"), true);
   assert.ok(configs.some(value => value === 'shell_environment_policy.filters={"LOCAL_CODEX_*"="exclude","TUNNEL_CLIENT_*"="exclude"}'));
+  const environmentSet = configs.find(value => value.startsWith("shell_environment_policy.set="));
+  assert.ok(environmentSet.includes('"TMPDIR"='));
+  assert.doesNotMatch(environmentSet, /GIT_CONFIG/);
 
   assert.equal(result.record.env.pathPresent, true);
   assert.equal(result.record.env.homePresent, true);
@@ -299,6 +373,14 @@ test("host approval mode holds network-enabled jobs before spawn", async t => {
   assert.equal(result.record.env.localTokenFilePresent, false);
   assert.equal(result.record.env.approvalModePresent, false);
   assert.equal(result.record.env.runtimeApiKeyPresent, false);
+  assert.equal(result.record.env.gitConfigNosystem, "host-value");
+  assert.equal(result.record.env.gitConfigGlobal, "/host/global-config");
+  assert.equal(result.record.env.gitConfigSystem, "/host/system-config");
+  assert.equal(result.record.env.gitTerminalPrompt, "host-value");
+  assert.equal(result.record.env.path, process.env.PATH);
+  assert.equal(result.record.env.scratchMode, 0o700);
+  assert.equal(result.record.env.scratchWritable, true);
+  await assert.rejects(stat(result.record.env.tmpdir), error => error?.code === "ENOENT");
   const capabilityAudit = result.audit.filter(entry => entry.component === "local-codex-guard" && entry.capability === "networkAccess");
   assert.deepEqual(capabilityAudit.map(entry => entry.event), ["capability_approval_requested", "capability_approval_resolved"]);
   assert.equal(capabilityAudit.at(-1).decision, "accept");
@@ -313,6 +395,7 @@ test("rejecting network capability prevents real Codex from starting", async t =
   const capabilityAudit = result.audit.filter(entry => entry.component === "local-codex-guard" && entry.capability === "networkAccess");
   assert.deepEqual(capabilityAudit.map(entry => entry.event), ["capability_approval_requested", "capability_approval_resolved"]);
   assert.equal(capabilityAudit.at(-1).decision, "decline");
+  assert.equal((await readdir(workspace)).some(name => name.startsWith(".local-codex-tmp-")), false);
 });
 
 test("secure wrapper rejects an invalid approval mode before Codex starts", async t => {
@@ -349,12 +432,15 @@ test("secure wrapper fails closed on missing, duplicate, malformed, or unsafe pe
 });
 
 async function runCommand(command, args) {
-  const child = spawn(command, args, { stdio: ["ignore", "pipe", "pipe"] });
+  const child = spawn(command, args, { stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, ...TEST_GIT_ENV } });
+  let stdout = "";
   let stderr = "";
+  child.stdout.on("data", chunk => { stdout += chunk; });
   child.stderr.on("data", chunk => { stderr += chunk; });
   const code = await new Promise((resolve, reject) => {
     child.once("error", reject);
     child.once("exit", resolve);
   });
   assert.equal(code, 0, stderr);
+  return stdout;
 }

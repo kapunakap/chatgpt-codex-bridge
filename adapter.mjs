@@ -33,7 +33,7 @@ const JOBS_DIR = process.env.LOCAL_CODEX_JOBS_DIR || resolve(dirname(STATE_FILE)
 const JOB_EVENTS_DIR = process.env.LOCAL_CODEX_JOB_EVENTS_DIR || resolve(dirname(STATE_FILE), "job-events");
 const WORKTREE_ROOT = process.env.LOCAL_CODEX_WORKTREE_ROOT || resolve(homedir(), "Library/Application Support/local-codex-worktrees");
 const WORKTREE_RETENTION = Number(process.env.LOCAL_CODEX_WORKTREE_RETENTION || "15");
-const VERSION = "3.5.0";
+const VERSION = "3.5.1";
 const DEFAULT_SETTINGS = { model: "gpt-5.6-luna", reasoningEffort: "max" };
 const MODEL_ALIASES = new Map([
   ["luna", "gpt-5.6-luna"], ["terra", "gpt-5.6-terra"], ["sol", "gpt-5.6-sol"],

@@ -1,6 +1,6 @@
 {
   "name": "chatgpt-local-codex-tunnel",
-  "version": "3.5.0",
+  "version": "3.5.1",
   "description": "Run local Codex from ChatGPT through OpenAI Secure MCP Tunnel.",
   "private": true,
   "type": "module",

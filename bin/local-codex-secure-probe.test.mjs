@@ -43,7 +43,9 @@ async function runProbe({ mode = "browser-status", profileOverride } = {}) {
   try { record = JSON.parse(await readFile(recordFile, "utf8")); } catch {}
   let controlEntries = [];
   try { controlEntries = await readdir(controlDir); } catch {}
-  return { exitCode, record, controlDir, controlEntries };
+  let workspaceEntries = [];
+  try { workspaceEntries = await readdir(cwd); } catch {}
+  return { exitCode, record, controlDir, controlEntries, workspaceEntries };
 }
 
 test("secure wrapper browser probe launches real App Server without Guard state", async () => {
@@ -65,6 +67,8 @@ test("secure wrapper browser probe launches real App Server without Guard state"
   assert.equal(result.record.env.runtimeApiKeyPresent, false);
   assert.equal(result.record.env.passwordPresent, false);
   assert.equal(result.controlEntries.includes("guard"), false, "probe mode must not create Guard sessions or approvals");
+  assert.deepEqual(result.workspaceEntries, [], "probe mode must not create private scratch state in the workspace");
+  assert.equal(configs.some(value => value.startsWith("shell_environment_policy.set=")), false);
 });
 
 test("secure wrapper rejects unknown probe modes and writable probe profiles", async () => {

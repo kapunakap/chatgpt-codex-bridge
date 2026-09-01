@@ -2,12 +2,12 @@
 
 import { randomUUID, timingSafeEqual } from "node:crypto";
 import {
-  appendFileSync, closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync,
-  readdirSync, realpathSync, renameSync, rmSync, writeFileSync,
+  appendFileSync, chmodSync, closeSync, existsSync, fsyncSync, mkdirSync, mkdtempSync,
+  openSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, writeFileSync,
 } from "node:fs";
 import { spawn, spawnSync } from "node:child_process";
 import { homedir } from "node:os";
-import { dirname, resolve } from "node:path";
+import { dirname, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import process from "node:process";
 
@@ -33,22 +33,19 @@ const GUARD_PROXY = fileURLToPath(new URL("./local-codex-guard-proxy.mjs", impor
 // even when the selected workspace is an ancestor such as the user's home.
 // Network-enabled jobs still deliberately widen ordinary host read/env access
 // to match the user's terminal, but never to this host-authority directory.
-function permissionConfig(cwd, networkAccess, trustedHostAccess = false, protectedControlDir = null, commonGitDir = null) {
+function permissionConfig(cwd, networkAccess, trustedHostAccess = false, protectedControlDir = null, commonGitDir = null, allowWorkspaceAncestors = false) {
   const denied = ["/Users", "/System/Volumes/Data/Users", "/Volumes", "/private/tmp", "/tmp", "/private/var/tmp", "/var/tmp", "/private/var/folders", "/var/folders"];
   const inside = path => cwd === "/" || path === cwd || path.startsWith(`${cwd}/`);
   let readRules;
   if (process.platform === "darwin") {
     readRules = trustedHostAccess
       ? ['":root"="read"']
-      : ['":root"="read"', ...denied.filter(path => {
-        const canonical = path.replace(/^\/System\/Volumes\/Data(?=\/)/, "").replace(/^\/tmp$/, "/private/tmp").replace(/^\/var(?=\/)/, "/private/var");
-        return !inside(path) && !inside(canonical);
-      }).map(path => `${JSON.stringify(path)}="deny"`)];
+      : macHardenedReadRules(denied, inside, allowWorkspaceAncestors ? [cwd, commonGitDir].filter(Boolean) : []);
   } else {
     readRules = [trustedHostAccess ? '":root"="read"' : '":minimal"="read"'];
   }
   if (protectedControlDir) readRules.push(`${JSON.stringify(protectedControlDir)}="deny"`);
-  const reads = readRules.join(", ");
+  const reads = [...new Set(readRules)].join(", ");
   const workspace = ['"."="write"', '".git"="write"', '".codex"="read"', '".env"="deny"', '".env.*"="deny"',
     '"**/.env"="deny"', '"**/.env.*"="deny"', '"*.env"="deny"', '"**/*.env"="deny"',
     '".npmrc"="deny"', '"**/.npmrc"="deny"', '".pypirc"="deny"', '"**/.pypirc"="deny"'].join(", ");
@@ -91,6 +88,13 @@ const TRUSTED_SHELL_ENV_CONFIGS = [
   "shell_environment_policy.ignore_default_excludes=true",
   'shell_environment_policy.filters={"LOCAL_CODEX_*"="exclude","TUNNEL_CLIENT_*"="exclude"}',
 ];
+
+const HARDENED_GIT_ENV = {
+  GIT_CONFIG_NOSYSTEM: "1",
+  GIT_CONFIG_GLOBAL: "/dev/null",
+  GIT_CONFIG_SYSTEM: "/dev/null",
+  GIT_TERMINAL_PROMPT: "0",
+};
 
 if (PROBE_MODE !== null && PROBE_MODE !== "browser-status") {
   throw new Error("Unknown Local Codex probe mode");
@@ -163,7 +167,35 @@ if (args.includes("--sandbox") || args.some(value => value.includes("sandbox_mod
 // workspace read-only, so App Server/plugin startup behavior cannot mutate it.
 args[permissionIndex] = PROBE_MODE
   ? probePermissionConfig(cwd, CONTROL_DIR)
-  : permissionConfig(cwd, networkAccess, networkAccess, CONTROL_DIR, commonGitDir);
+  : permissionConfig(cwd, networkAccess, networkAccess, CONTROL_DIR, commonGitDir, !networkAccess);
+
+// Normal jobs get private scratch space inside an already-authorized writable
+// root. Git workspaces use their per-worktree metadata directory so temporary
+// files never appear in `git status`; non-Git workspaces use their own root.
+// Probe mode remains read-only and creates no workspace state.
+const scratchDir = PROBE_MODE ? null : createScratchDirectory(cwd, commonGitDir);
+let scratchCleaned = false;
+const cleanupScratch = () => {
+  if (!scratchDir || scratchCleaned) return;
+  scratchCleaned = true;
+  try {
+    rmSync(scratchDir, { recursive: true, force: true });
+  } catch (error) {
+    process.stderr.write(`Unable to remove Local Codex scratch directory: ${error.message}\n`);
+    process.exitCode = 1;
+  }
+};
+process.once("exit", cleanupScratch);
+
+const commandEnvOverrides = scratchDir ? {
+  TMPDIR: scratchDir,
+  TMP: scratchDir,
+  TEMP: scratchDir,
+  ...(!networkAccess ? { ...HARDENED_GIT_ENV, ...developerGitEnvironment() } : {}),
+} : {};
+if (Object.keys(commandEnvOverrides).length > 0) {
+  args.push("-c", shellEnvironmentSetConfig(commandEnvOverrides));
+}
 if (networkAccess) {
   for (const config of TRUSTED_SHELL_ENV_CONFIGS) args.push("-c", config);
 } else {
@@ -194,6 +226,7 @@ if (networkAccess) {
     if (process.env[key] !== undefined) childEnv[key] = process.env[key];
   }
 }
+Object.assign(childEnv, commandEnvOverrides);
 
 let child;
 let terminating = false;
@@ -228,11 +261,13 @@ if (PROBE_MODE || INTERACTIVE_RESUME) {
   const commandArgs = REAL_CODEX_BIN.endsWith(".mjs") ? [REAL_CODEX_BIN, ...args] : args;
   child = spawn(command, commandArgs, { stdio: "inherit", env: childEnv });
   child.on("error", error => {
+    cleanupScratch();
     const label = INTERACTIVE_RESUME ? "interactive resume" : "probe";
     process.stderr.write(`Unable to start Local Codex ${label}: ${error.message}\n`);
     process.exitCode = 1;
   });
   child.on("exit", (code, signal) => {
+    cleanupScratch();
     process.exitCode = signal ? 1 : (code ?? 1);
   });
 } else {
@@ -267,10 +302,12 @@ if (PROBE_MODE || INTERACTIVE_RESUME) {
     });
 
     child.on("error", error => {
+      cleanupScratch();
       process.stderr.write(`Unable to start guarded Codex: ${error.message}\n`);
       process.exitCode = 1;
     });
     child.on("exit", (code, signal) => {
+      cleanupScratch();
       if (signal) {
         process.exitCode = 1;
         return;
@@ -297,12 +334,132 @@ function gitCommonDirectory(cwd) {
       ...process.env,
       GIT_CONFIG_NOSYSTEM: "1",
       GIT_CONFIG_GLOBAL: "/dev/null",
+      GIT_CONFIG_SYSTEM: "/dev/null",
       GIT_TERMINAL_PROMPT: "0",
     },
   });
   if (result.status !== 0 || typeof result.stdout !== "string" || !result.stdout.trim()) return null;
   try { return realpathSync(result.stdout.trim()); }
   catch { throw new Error("Invalid Git common directory for Local Codex workspace"); }
+}
+
+function gitDirectory(cwd) {
+  const result = spawnSync("git", ["-C", cwd, "rev-parse", "--path-format=absolute", "--git-dir"], {
+    encoding: "utf8",
+    env: { ...process.env, ...HARDENED_GIT_ENV },
+  });
+  if (result.status !== 0 || typeof result.stdout !== "string" || !result.stdout.trim()) return null;
+  try { return realpathSync(result.stdout.trim()); }
+  catch { throw new Error("Invalid Git directory for Local Codex workspace"); }
+}
+
+function developerGitEnvironment() {
+  if (process.platform !== "darwin") return {};
+  const result = spawnSync("/usr/bin/xcrun", ["--find", "git"], {
+    encoding: "utf8",
+    env: { ...process.env, ...HARDENED_GIT_ENV },
+  });
+  if (result.status !== 0 || typeof result.stdout !== "string" || !result.stdout.trim()) {
+    throw new Error("Unable to resolve the macOS developer Git executable");
+  }
+  let gitPath;
+  try { gitPath = realpathSync(result.stdout.trim()); }
+  catch { throw new Error("Invalid macOS developer Git executable"); }
+  if (gitPath === "/usr/bin/git") {
+    throw new Error("macOS developer Git resolved to the xcrun shim");
+  }
+  const developerBin = dirname(gitPath);
+  return {
+    PATH: `${developerBin}:${process.env.PATH || "/usr/bin:/bin:/usr/sbin:/sbin"}`,
+    DEVELOPER_DIR: resolve(developerBin, "../.."),
+    // The leading empty entry tells Git the following ceiling path does not
+    // need symlink resolution. This prevents repository discovery from
+    // probing the deliberately denied /Users ancestor.
+    GIT_CEILING_DIRECTORIES: ":/Users",
+  };
+}
+
+function macHardenedReadRules(denied, inside, authorizedRoots) {
+  const userTrees = ["/Users", "/System/Volumes/Data/Users"];
+  const rules = ['":root"="read"'];
+  for (const path of denied) {
+    if (authorizedRoots.length > 0 && userTrees.includes(path)) continue;
+    const canonical = path.replace(/^\/System\/Volumes\/Data(?=\/)/, "").replace(/^\/tmp$/, "/private/tmp").replace(/^\/var(?=\/)/, "/private/var");
+    if (!inside(path) && !inside(canonical)) rules.push(`${JSON.stringify(path)}="deny"`);
+  }
+  if (authorizedRoots.length === 0) return rules;
+  for (const tree of userTrees) {
+    const targets = authorizedRoots.map(root => {
+      const canonical = root.replace(/^\/System\/Volumes\/Data(?=\/)/, "");
+      return canonical === "/Users" || canonical.startsWith("/Users/")
+        ? `${tree}${canonical.slice("/Users".length)}`
+        : null;
+    }).filter(Boolean);
+    if (targets.length === 0) {
+      rules.push(`${JSON.stringify(tree)}="deny"`);
+      continue;
+    }
+    // The macOS sandbox needs readable directory ancestors for getcwd and
+    // Git discovery. Deny unrelated entries beneath those ancestors instead
+    // of denying the ancestors themselves.
+    rules.push(...denyUnrelatedUserPaths(tree, targets));
+  }
+  for (const root of authorizedRoots) rules.push(`${JSON.stringify(root)}="write"`);
+  return rules;
+}
+
+function denyUnrelatedUserPaths(tree, targets) {
+  const rules = [];
+  const minimalTargets = targets.filter(target => !targets.some(other => other !== target && target.startsWith(`${other}/`)));
+  const visit = (directory, activeTargets) => {
+    // Once an authorized root is reached, keep its complete subtree readable
+    // (Git worktree metadata lives below the common Git directory). Unrelated
+    // entries are denied only while walking the ancestors toward that root.
+    if (activeTargets.some(target => target === directory)) return;
+    const nextTargets = new Map();
+    for (const target of activeTargets) {
+      const remainder = relative(directory, target);
+      if (!remainder || remainder.startsWith("..")) continue;
+      const name = remainder.split("/")[0];
+      if (!nextTargets.has(name)) nextTargets.set(name, []);
+      nextTargets.get(name).push(target);
+    }
+    let entries;
+    try { entries = readdirSync(directory, { withFileTypes: true }); }
+    catch { throw new Error("Unable to build the hardened Local Codex user-path boundary"); }
+    for (const entry of entries) {
+      const child = resolve(directory, entry.name);
+      const childTargets = nextTargets.get(entry.name);
+      if (childTargets) visit(child, childTargets);
+      else rules.push(`${JSON.stringify(child)}="deny"`);
+    }
+  };
+  visit(tree, minimalTargets);
+  return rules;
+}
+
+function createScratchDirectory(cwd, commonGitDir) {
+  const gitDir = gitDirectory(cwd);
+  const parent = gitDir || cwd;
+  const authorizedRoots = [cwd, commonGitDir].filter(Boolean);
+  if (!authorizedRoots.some(root => parent === root || parent.startsWith(`${root}/`))) {
+    throw new Error("Local Codex scratch directory is outside the authorized workspace roots");
+  }
+  const prefix = resolve(parent, gitDir ? "local-codex-tmp-" : ".local-codex-tmp-");
+  const scratch = realpathSync(mkdtempSync(prefix));
+  if (!authorizedRoots.some(root => scratch.startsWith(`${root}/`))) {
+    rmSync(scratch, { recursive: true, force: true });
+    throw new Error("Local Codex scratch directory escaped the authorized workspace roots");
+  }
+  chmodSync(scratch, 0o700);
+  return scratch;
+}
+
+function shellEnvironmentSetConfig(values) {
+  const entries = Object.entries(values)
+    .map(([key, value]) => `${JSON.stringify(key)}=${JSON.stringify(value)}`)
+    .join(",");
+  return `shell_environment_policy.set={${entries}}`;
 }
 
 async function waitForNetworkCapabilityApproval() {
