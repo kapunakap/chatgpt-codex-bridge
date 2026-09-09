@@ -885,6 +885,14 @@ async function pruneManagedWorktrees() {
   }
 }
 
+function normalizeJobToDirect(job) {
+  job.worktreeId = null;
+  job.workspaceKind = "direct";
+  job.worktreeState = "direct";
+  job.cwd = job.sourceCwd;
+  job.gitCommonDir = null;
+}
+
 function cancelJob(job, reason, details = {}) {
   if (terminalStatuses.has(job.status) || job.stopReason) return;
   clearJobLease(job);
@@ -896,7 +904,11 @@ function cancelJob(job, reason, details = {}) {
     job.finishedAt = Date.now();
     const index = jobQueue.indexOf(job);
     if (index >= 0) jobQueue.splice(index, 1);
-    if (job.worktreeId) void worktreeManager.abandon(job.worktreeId);
+    if (job.worktreeId) {
+      const abandonedWorktreeId = job.worktreeId;
+      normalizeJobToDirect(job);
+      void worktreeManager.abandon(abandonedWorktreeId);
+    }
     try { persistJob(job); }
     finally {
       logCall(`job_${job.status}`, job, job.errorCode);
@@ -990,15 +1002,20 @@ async function loadJobs() {
     if (typeof job.sourceCwd !== "string" || !isAbsolute(job.sourceCwd)) throw new Error("Invalid job source folder");
     if (job.workspaceKind === undefined) job.workspaceKind = "direct";
     if (!["direct", "worktree"].includes(job.workspaceKind)) throw new Error("Invalid job workspace kind");
+    let normalizedStaleTerminalWorktree = false;
     if (job.worktreeId !== undefined && job.worktreeId !== null) {
       const record = worktreeManager.get(job.worktreeId);
-      if (!record || record.executionCwd !== job.cwd) throw new Error("Invalid job worktree state");
-      job.worktreeState = record.state;
-      job.gitCommonDir = record.commonGitDir;
+      if (!record) {
+        if (!terminalStatuses.has(job.status)) throw new Error("Invalid job worktree state");
+        normalizeJobToDirect(job);
+        normalizedStaleTerminalWorktree = true;
+      } else {
+        if (record.executionCwd !== job.cwd) throw new Error("Invalid job worktree state");
+        job.worktreeState = record.state;
+        job.gitCommonDir = record.commonGitDir;
+      }
     } else {
-      job.worktreeId = null;
-      job.worktreeState = "direct";
-      job.gitCommonDir = null;
+      normalizeJobToDirect(job);
     }
     if (job.networkAccess === undefined) job.networkAccess = false;
     if (typeof job.networkAccess !== "boolean") throw new Error("Invalid job network setting");
@@ -1027,6 +1044,7 @@ async function loadJobs() {
       job.finishedAt = Date.now();
       persistJob(job);
     }
+    if (normalizedStaleTerminalWorktree) persistJob(job);
     if (job.worktreeId) {
       const record = worktreeManager.get(job.worktreeId);
       if (terminalStatuses.has(job.status) && record && ["planned", "creating", "failed"].includes(record.state)) {

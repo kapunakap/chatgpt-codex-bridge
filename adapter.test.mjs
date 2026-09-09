@@ -386,6 +386,125 @@ test("queued jobs can be cancelled and are interrupted without replay after rest
   assert.equal((await f.records()).filter(r => r.method === "turn/start").length, 1);
 });
 
+test("terminal jobs normalize stale removed worktrees during restart", async t => {
+  const f = await fixture(t, { maxConcurrency: 1, maxQueue: 3 });
+  const repo = await realpath(await mkdtemp(join(tmpdir(), "codex-stale-terminal-worktree-")));
+  t.after(() => rm(repo, { recursive: true, force: true }));
+  await runGit(repo, "init");
+  await runGit(repo, "config", "user.name", "Test User");
+  await runGit(repo, "config", "user.email", "test@example.com");
+  await writeFile(join(repo, "tracked.txt"), "committed\n");
+  await runGit(repo, "add", ".");
+  await runGit(repo, "commit", "-m", "initial");
+
+  const blocker = await f.call("codex", { requestId: "stale-terminal-blocker", prompt: "hold" });
+  await f.started(blocker.jobId);
+  const queued = await f.call("codex", { requestId: "stale-terminal", cwd: repo, prompt: "hello" });
+  assert.equal(queued.status, "queued");
+  assert.equal(queued.workspaceKind, "worktree");
+  assert.ok(queued.worktreeId);
+
+  const cancelled = await f.call("codex-cancel", { jobId: queued.jobId });
+  assert.equal(cancelled.status, "cancelled");
+  assert.equal(cancelled.workspaceKind, "direct");
+  assert.equal(cancelled.worktreeId, undefined);
+  await f.call("codex-cancel", { jobId: blocker.jobId });
+  assert.equal((await f.finished(blocker.jobId)).status, "cancelled");
+
+  for (let i = 0; i < 100; i++) {
+    const state = JSON.parse(await readFile(join(f.root, "worktrees.json"), "utf8"));
+    if (!state.records.some(record => record.id === queued.worktreeId)) break;
+    await delay(10);
+  }
+  const state = JSON.parse(await readFile(join(f.root, "worktrees.json"), "utf8"));
+  assert.ok(!state.records.some(record => record.id === queued.worktreeId));
+
+  const jobPath = join(f.root, "jobs", queued.jobId + ".json");
+  const historical = JSON.parse(await readFile(jobPath, "utf8"));
+  historical.workspaceKind = "worktree";
+  historical.worktreeId = queued.worktreeId;
+  historical.worktreeState = "planned";
+  historical.cwd = queued.cwd;
+  historical.content = "SAVED_RESULT";
+  await writeFile(jobPath, JSON.stringify(historical) + "\n", { mode: 0o600 });
+  const eventPath = join(f.root, "job-events", queued.jobId + ".jsonl");
+  const eventHistory = JSON.stringify({ seq: 1, time: "2026-01-01T00:00:00.000Z", type: "session.started", data: { source: "test" } }) + "\n";
+  await writeFile(eventPath, eventHistory, { mode: 0o600 });
+
+  await f.stop();
+  await f.start();
+  const recovered = await f.call("codex-status", { jobId: queued.jobId });
+  assert.equal(recovered.status, "cancelled");
+  assert.equal(recovered.errorCode, historical.errorCode);
+  assert.equal(recovered.message, historical.message);
+  assert.equal(recovered.content, historical.content);
+  assert.equal(recovered.workspaceKind, "direct");
+  assert.equal(recovered.cwd, repo);
+  assert.equal(recovered.sourceCwd, repo);
+  assert.equal(recovered.worktreeId, undefined);
+
+  const persisted = JSON.parse(await readFile(jobPath, "utf8"));
+  assert.equal(persisted.status, historical.status);
+  assert.equal(persisted.errorCode, historical.errorCode);
+  assert.equal(persisted.message, historical.message);
+  assert.equal(persisted.content, historical.content);
+  assert.equal(persisted.workspaceKind, "direct");
+  assert.equal(persisted.cwd, repo);
+  assert.equal(persisted.worktreeId, undefined);
+  assert.equal(persisted.worktreeState, undefined);
+  assert.equal(persisted.gitCommonDir, undefined);
+  assert.equal(await readFile(eventPath, "utf8"), eventHistory);
+});
+
+test("non-terminal jobs still fail closed when their managed worktree is missing", async t => {
+  const f = await fixture(t, { maxConcurrency: 1, maxQueue: 3 });
+  const repo = await realpath(await mkdtemp(join(tmpdir(), "codex-stale-active-worktree-")));
+  t.after(() => rm(repo, { recursive: true, force: true }));
+  await runGit(repo, "init");
+  await runGit(repo, "config", "user.name", "Test User");
+  await runGit(repo, "config", "user.email", "test@example.com");
+  await writeFile(join(repo, "tracked.txt"), "committed\n");
+  await runGit(repo, "add", ".");
+  await runGit(repo, "commit", "-m", "initial");
+
+  const blocker = await f.call("codex", { requestId: "stale-active-blocker", prompt: "hold" });
+  await f.started(blocker.jobId);
+  const queued = await f.call("codex", { requestId: "stale-active", cwd: repo, prompt: "hello" });
+  assert.equal(queued.status, "queued");
+  assert.ok(queued.worktreeId);
+  await f.stop("SIGKILL");
+
+  const statePath = join(f.root, "worktrees.json");
+  const state = JSON.parse(await readFile(statePath, "utf8"));
+  state.records = state.records.filter(record => record.id !== queued.worktreeId);
+  await writeFile(statePath, JSON.stringify(state) + "\n", { mode: 0o600 });
+  await assert.rejects(f.start(), /job recovery failed; refusing work|adapter exited 1/);
+});
+
+test("terminal jobs with mismatched existing worktrees still fail closed", async t => {
+  const f = await fixture(t);
+  const repo = await realpath(await mkdtemp(join(tmpdir(), "codex-mismatched-terminal-worktree-")));
+  t.after(() => rm(repo, { recursive: true, force: true }));
+  await runGit(repo, "init");
+  await runGit(repo, "config", "user.name", "Test User");
+  await runGit(repo, "config", "user.email", "test@example.com");
+  await writeFile(join(repo, "tracked.txt"), "committed\n");
+  await runGit(repo, "add", ".");
+  await runGit(repo, "commit", "-m", "initial");
+
+  const created = await f.finished((await f.call("codex", {
+    requestId: "mismatched-terminal-worktree", cwd: repo, prompt: "hello",
+  })).jobId);
+  assert.equal(created.status, "completed");
+  await f.stop("SIGKILL");
+
+  const jobPath = join(f.root, "jobs", created.jobId + ".json");
+  const historical = JSON.parse(await readFile(jobPath, "utf8"));
+  historical.cwd = repo;
+  await writeFile(jobPath, JSON.stringify(historical) + "\n", { mode: 0o600 });
+  await assert.rejects(f.start(), /job recovery failed; refusing work|adapter exited 1/);
+});
+
 test("stale schemas return actionable errors, never start work, and log only schema metadata", async t => {
   const f = await fixture(t);
   const listed = await f.rpc({ jsonrpc: "2.0", id: "SCHEMA_REQUEST_SECRET", method: "tools/list" });
