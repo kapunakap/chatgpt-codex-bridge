@@ -159,3 +159,80 @@ function command(commandName, args) {
     child.once("exit", code => resolve({ code: code ?? 1, stdout, stderr }));
   });
 }
+
+
+test("disabled planning bypasses a busy worktree serializer", async t => {
+  const f = await repository(t);
+  const manager = await createWorktreeManager({ rootDir: f.rootDir, stateDir: f.stateDir, retention: 15 });
+  let release;
+  const blocker = manager.serial(() => new Promise(resolve => { release = resolve; }));
+  while (!release) await new Promise(resolve => setImmediate(resolve));
+  const result = await Promise.race([
+    manager.plan({ id: firstId, sourceCwd: f.repo, enabled: false }),
+    new Promise((_, reject) => setTimeout(() => reject(new Error("direct planning waited for serializer")), 250)),
+  ]);
+  assert.equal(result.state, "direct");
+  assert.equal(result.reason, "disabled");
+  release();
+  await blocker;
+});
+
+test("a >200 prune backlog yields to new worktree admission between bounded candidates", async t => {
+  const f = await repository(t);
+  const manager = await createWorktreeManager({ rootDir: f.rootDir, stateDir: f.stateDir, retention: 15 });
+  const idFor = value => `00000000-0000-0000-0000-${value.toString(16).padStart(12, "0")}`;
+  for (let i = 1; i <= 225; i++) {
+    manager.records.set(idFor(i), {
+      id: idFor(i), state: "ready", lastUsedAt: i, createdAt: i,
+      worktreeRoot: join(f.rootDir, `fake-${i}`), executionCwd: join(f.rootDir, `fake-${i}`),
+    });
+  }
+  let releaseFirst;
+  let firstStarted;
+  let secondStarted;
+  const firstStartedPromise = new Promise(resolve => { firstStarted = resolve; });
+  const secondStartedPromise = new Promise(resolve => { secondStarted = resolve; });
+  let snapshots = 0;
+  manager.snapshotAndRemove = async record => {
+    snapshots += 1;
+    if (snapshots === 1) {
+      firstStarted();
+      await new Promise(resolve => { releaseFirst = resolve; });
+    }
+    if (snapshots === 2) secondStarted();
+    record.state = "snapshotted";
+  };
+  const prune = manager.prune(new Set(), { limit: 4 });
+  await firstStartedPromise;
+  const admitted = manager.plan({ id: "ffffffff-ffff-ffff-ffff-ffffffffffff", sourceCwd: f.repo });
+  while (!releaseFirst) await new Promise(resolve => setImmediate(resolve));
+  releaseFirst();
+  const winner = await Promise.race([
+    admitted.then(() => "admitted"),
+    secondStartedPromise.then(() => "second-prune"),
+  ]);
+  assert.equal(winner, "admitted");
+  assert.equal((await admitted).state, "planned");
+  const pruned = await prune;
+  assert.equal(pruned.length, 4);
+  assert.equal(snapshots, 4);
+});
+
+test("stalled Git times out and releases the serializer", async t => {
+  const f = await repository(t);
+  const manager = await createWorktreeManager({ rootDir: f.rootDir, stateDir: f.stateDir, retention: 15 });
+  await manager.plan({ id: firstId, sourceCwd: f.repo });
+  manager.gitTimeoutMs = 100;
+  const stalled = join(f.temp, "stalled-git.mjs");
+  await writeFile(stalled, '#!/usr/bin/env node\nprocess.on("SIGTERM", () => {}); setInterval(() => {}, 1000);\n');
+  await chmod(stalled, 0o755);
+  manager.gitBin = stalled;
+  const before = Date.now();
+  await assert.rejects(manager.prepare(firstId), error => error?.code === "worktree_git_timeout");
+  assert.ok(Date.now() - before < 1500, "stalled Git must be bounded");
+  const touched = await Promise.race([
+    manager.touch(firstId),
+    new Promise((_, reject) => setTimeout(() => reject(new Error("serializer remained blocked")), 250)),
+  ]);
+  assert.equal(touched.id, firstId);
+});

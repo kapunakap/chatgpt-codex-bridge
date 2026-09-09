@@ -33,6 +33,8 @@ const JOBS_DIR = process.env.LOCAL_CODEX_JOBS_DIR || resolve(dirname(STATE_FILE)
 const JOB_EVENTS_DIR = process.env.LOCAL_CODEX_JOB_EVENTS_DIR || resolve(dirname(STATE_FILE), "job-events");
 const WORKTREE_ROOT = process.env.LOCAL_CODEX_WORKTREE_ROOT || resolve(homedir(), "Library/Application Support/local-codex-worktrees");
 const WORKTREE_RETENTION = Number(process.env.LOCAL_CODEX_WORKTREE_RETENTION || "15");
+const WORKTREE_GIT_TIMEOUT_MS = Number(process.env.LOCAL_CODEX_WORKTREE_GIT_TIMEOUT_MS || "30000");
+const WORKTREE_PRUNE_BATCH_SIZE = Number(process.env.LOCAL_CODEX_WORKTREE_PRUNE_BATCH_SIZE || "4");
 const VERSION = "3.5.2";
 const DEFAULT_SETTINGS = { model: "gpt-5.6-luna", reasoningEffort: "max" };
 const MODEL_ALIASES = new Map([
@@ -105,6 +107,12 @@ if (!isAbsolute(WORKTREE_ROOT)) throw new Error("LOCAL_CODEX_WORKTREE_ROOT must 
 if (!Number.isSafeInteger(WORKTREE_RETENTION) || WORKTREE_RETENTION < 1 || WORKTREE_RETENTION > 1000) {
   throw new Error("LOCAL_CODEX_WORKTREE_RETENTION must be an integer between 1 and 1000");
 }
+if (!Number.isSafeInteger(WORKTREE_GIT_TIMEOUT_MS) || WORKTREE_GIT_TIMEOUT_MS < 1 || WORKTREE_GIT_TIMEOUT_MS > 2147483647) {
+  throw new Error("LOCAL_CODEX_WORKTREE_GIT_TIMEOUT_MS must be a positive timer-safe integer");
+}
+if (!Number.isSafeInteger(WORKTREE_PRUNE_BATCH_SIZE) || WORKTREE_PRUNE_BATCH_SIZE < 1 || WORKTREE_PRUNE_BATCH_SIZE > 100) {
+  throw new Error("LOCAL_CODEX_WORKTREE_PRUNE_BATCH_SIZE must be an integer between 1 and 100");
+}
 
 if (!TOKEN_FILE) {
   throw new Error("LOCAL_CODEX_TOKEN_FILE is required");
@@ -133,6 +141,7 @@ const worktreeManager = await createWorktreeManager({
   rootDir: WORKTREE_ROOT,
   stateDir: dirname(STATE_FILE),
   retention: WORKTREE_RETENTION,
+  gitTimeoutMs: WORKTREE_GIT_TIMEOUT_MS,
 });
 const jobs = new Map();
 const requests = new Map();
@@ -161,6 +170,9 @@ let ready = false;
 let shuttingDown = false;
 let storageHealthy = true;
 let runtimeHealthy = true;
+let worktreePruneTask = null;
+let worktreePruneRequested = false;
+let worktreePruneController = null;
 const requestIdProperty = {
   type: "string", minLength: 1, maxLength: 200,
   description: "Generate a unique ID for new work. Reuse this exact ID and arguments on retries; never retry with a new ID.",
@@ -342,6 +354,7 @@ server.listen(PORT, HOST, async () => {
     await worktreeManager.reconcile();
     await loadJobs();
     ready = true;
+    scheduleManagedWorktreePrune();
     process.stderr.write(`local-codex-adapter ready on http://${HOST}:${PORT}/mcp; scope=per_job\n`);
   } catch {
     process.stderr.write("local-codex-adapter job recovery failed; refusing work\n");
@@ -399,6 +412,7 @@ async function restoreWorktreeForMonitor(message) {
   if (!terminalStatuses.has(job.status)) return rpcError(message.id, -32602, "job is not terminal");
   if (!job.worktreeId) return { jsonrpc: "2.0", id: message.id, result: { cwd: job.cwd, worktreeState: "direct" } };
   try {
+    pauseManagedWorktreePrune();
     const record = await worktreeManager.prepare(job.worktreeId);
     job.cwd = record.executionCwd;
     job.gitCommonDir = record.commonGitDir;
@@ -475,6 +489,9 @@ async function callTool(message, signal) {
       if (!runtimeHealthy) throw callError("unavailable", "Job process cleanup could not be verified; restart the adapter before starting new work");
       if (shuttingDown) throw callError("unavailable", "Adapter is shutting down; no work was started");
       if (signal?.aborted) throw callError("request_cancelled", "Request disconnected before acceptance");
+      // A fresh foreground request preempts any in-flight background GC. The manager's
+      // abort-aware Git operations release the serializer instead of making admission wait.
+      pauseManagedWorktreePrune();
       const jobId = randomUUID();
       let workspace;
       if (name === "codex") {
@@ -825,8 +842,11 @@ async function executeJob(job, args) {
     if (job.stopReason) throw callError(job.stopReason, "Job stopped before execution");
     if (job.worktreeId) {
       let workspace;
-      try { workspace = await worktreeManager.prepare(job.worktreeId); }
+      const prepareController = new AbortController();
+      job.prepareAbortController = prepareController;
+      try { workspace = await worktreeManager.prepare(job.worktreeId, { signal: prepareController.signal }); }
       catch (error) { throw callError(error.code || "worktree_create_failed", error.message); }
+      finally { delete job.prepareAbortController; }
       job.cwd = workspace.executionCwd;
       job.sourceCwd = workspace.sourceCwd;
       job.worktreeState = workspace.state;
@@ -860,22 +880,56 @@ async function executeJob(job, args) {
     activeFolders.delete(job.cwd);
     settleJob(job);
     scheduleJobs();
-    setImmediate(() => {
-      void pruneManagedWorktrees().catch(() => {
-        process.stderr.write("local-codex-adapter worktree pruning deferred\n");
-      });
-    });
+    scheduleManagedWorktreePrune();
   }
 }
 
-async function pruneManagedWorktrees() {
+function worktreeIsProtected(id) {
+  return [...activeJobs.values(), ...jobQueue].some(job => job.worktreeId === id);
+}
+
+function pauseManagedWorktreePrune() {
+  worktreePruneRequested = false;
+  worktreePruneController?.abort();
+}
+
+function scheduleManagedWorktreePrune() {
+  if (shuttingDown) return;
+  worktreePruneRequested = true;
+  // GC is background work: never start a new pass while user jobs are active or queued.
+  if (activeJobs.size || jobQueue.length || worktreePruneTask) return;
+  const controller = new AbortController();
+  worktreePruneController = controller;
+  worktreePruneTask = (async () => {
+    try {
+      do {
+        worktreePruneRequested = false;
+        for (;;) {
+          if (shuttingDown || controller.signal.aborted || activeJobs.size || jobQueue.length) return;
+          const count = await pruneManagedWorktrees(controller.signal);
+          if (count < WORKTREE_PRUNE_BATCH_SIZE) break;
+          await new Promise(resolvePromise => setImmediate(resolvePromise));
+        }
+      } while (worktreePruneRequested && !shuttingDown && !controller.signal.aborted);
+    } catch {
+      if (!controller.signal.aborted) process.stderr.write("local-codex-adapter worktree pruning deferred\n");
+    } finally {
+      if (worktreePruneController === controller) worktreePruneController = null;
+      worktreePruneTask = null;
+      if (worktreePruneRequested && !shuttingDown && !activeJobs.size && !jobQueue.length) setImmediate(scheduleManagedWorktreePrune);
+    }
+  })();
+}
+
+async function pruneManagedWorktrees(signal) {
   const protectedIds = new Set(
-    [...activeJobs.values(), ...jobQueue]
-      .map(job => job.worktreeId)
-      .filter(Boolean)
+    [...activeJobs.values(), ...jobQueue].map(job => job.worktreeId).filter(Boolean),
   );
-  const pruned = await worktreeManager.prune(protectedIds);
-  if (!pruned.length) return;
+  const pruned = await worktreeManager.prune(protectedIds, {
+    limit: WORKTREE_PRUNE_BATCH_SIZE,
+    signal,
+    isProtected: worktreeIsProtected,
+  });
   for (const record of pruned) {
     for (const job of jobs.values()) {
       if (job.worktreeId !== record.id) continue;
@@ -883,6 +937,7 @@ async function pruneManagedWorktrees() {
       try { persistJob(job); } catch { storageHealthy = false; }
     }
   }
+  return pruned.length;
 }
 
 function normalizeJobToDirect(job) {
@@ -921,8 +976,11 @@ function cancelJob(job, reason, details = {}) {
   job.status = "cancelling";
   job.errorCode = details.errorCode || job.errorCode;
   job.message = details.message || job.message;
-  // Cancellation must still stop the child if the disk is full.
-  try { persistJob(job); } finally { job.stop?.(reason); }
+  // Cancellation must still stop worktree preparation or the child if the disk is full.
+  try { persistJob(job); } finally {
+    job.prepareAbortController?.abort();
+    job.stop?.(reason);
+  }
   logCall("job_cancelling", job);
 }
 
@@ -1113,6 +1171,8 @@ function waitForJobEvents(job, afterEventSeq, waitMs, id, signal) {
 async function shutdown() {
   if (shuttingDown) return;
   shuttingDown = true;
+  worktreePruneRequested = false;
+  worktreePruneController?.abort();
   const closed = new Promise(resolve => server.close(resolve));
   for (const group of waiters.values()) for (const waiter of group) waiter.abort();
   for (const job of [...jobQueue]) {
@@ -1123,6 +1183,7 @@ async function shutdown() {
     try { cancelJob(job, "interrupted"); } catch { /* stop is called even on storage failure */ }
   }
   await Promise.all(active.map(job => job.done));
+  if (worktreePruneTask) await worktreePruneTask.catch(() => {});
   server.closeAllConnections();
   await closed;
   process.exit(storageHealthy && runtimeHealthy ? 0 : 1);

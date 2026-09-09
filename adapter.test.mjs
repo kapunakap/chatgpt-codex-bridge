@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { spawn } from "node:child_process";
-import { mkdir, mkdtemp, readFile, realpath, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, realpath, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { join } from "node:path";
@@ -42,6 +42,7 @@ async function fixture(t, options = {}) {
     LOCAL_CODEX_TOKEN_FILE: tokenFile, LOCAL_CODEX_STATE_FILE: join(root, "threads.json"),
     LOCAL_CODEX_LOG_FILE: join(root, "audit.log"), LOCAL_CODEX_JOBS_DIR: join(root, "jobs"),
     LOCAL_CODEX_WORKTREE_ROOT: join(root, "worktrees"), LOCAL_CODEX_WORKTREE_RETENTION: "15",
+    LOCAL_CODEX_WORKTREE_GIT_TIMEOUT_MS: String(options.worktreeGitTimeout ?? 30000),
     LOCAL_CODEX_BIN: options.missingBin ? join(root, "missing") : fake, LOCAL_CODEX_CALL_TIMEOUT_MS: String(options.timeout || 10000),
     LOCAL_CODEX_POLL_LEASE_MS: String(options.pollLease ?? 90000),
     LOCAL_CODEX_MAX_CONCURRENCY: String(options.maxConcurrency ?? 10), LOCAL_CODEX_MAX_QUEUE: String(options.maxQueue ?? 100),
@@ -936,3 +937,38 @@ input.on('line',line=>{
  }
 });
 `;
+
+
+test("poll expiry cancels worktree preparation before runCodex starts", async t => {
+  const f = await fixture(t, { pollLease: 120, worktreeGitTimeout: 1000 });
+  const repoPath = await realpath(await mkdtemp(join(tmpdir(), "codex-prepare-cancel-")));
+  t.after(() => rm(repoPath, { recursive: true, force: true }));
+  await runGit(repoPath, "init");
+  await runGit(repoPath, "config", "user.name", "Test User");
+  await runGit(repoPath, "config", "user.email", "test@example.com");
+  const slowFilter = join(repoPath, "slow-filter.mjs");
+  await writeFile(slowFilter, '#!/usr/bin/env node\nprocess.stdin.resume(); setInterval(() => {}, 1000);\n');
+  await chmod(slowFilter, 0o755);
+  await runGit(repoPath, "config", "filter.slow.clean", "cat");
+  await runGit(repoPath, "config", "filter.slow.smudge", slowFilter);
+  await runGit(repoPath, "config", "filter.slow.required", "true");
+  await writeFile(join(repoPath, ".gitattributes"), "slow.txt filter=slow\n");
+  await writeFile(join(repoPath, "slow.txt"), "tracked\n");
+  await runGit(repoPath, "add", ".gitattributes", "slow.txt");
+  await runGit(repoPath, "commit", "-m", "slow checkout");
+
+  const before = Date.now();
+  const accepted = await f.call("codex", {
+    requestId: "prepare-poll-expiry",
+    cwd: repoPath,
+    prompt: "must never reach model execution",
+  });
+  assert.equal(accepted.workspaceKind, "worktree");
+  assert.ok(accepted.jobId);
+  await delay(350);
+  const result = await f.finished(accepted.jobId);
+  assert.equal(result.status, "cancelled");
+  assert.equal(result.errorCode, "polling_expired");
+  assert.ok(Date.now() - before < 2500, "prepare cancellation must settle promptly");
+  assert.equal((await f.records()).filter(record => record.method === "turn/start").length, 0);
+});
