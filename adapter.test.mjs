@@ -174,10 +174,10 @@ test("discovery, authentication, schemas, and validation", async t => {
 
 test("durable immediate acceptance, duplicate retries, same-folder queueing, and final answer", async t => {
   const f = await fixture(t);
-  const args = { requestId: "same", prompt: "delay:500" };
+  const args = { requestId: "same", prompt: "delay:3000" };
   const before = Date.now();
   const results = await Promise.all(Array.from({ length: 8 }, () => f.call("codex", args)));
-  assert.ok(Date.now() - before < 450, "acceptance must not wait for generation");
+  assert.ok(Date.now() - before < 1500, "acceptance must not wait for generation");
   assert.equal(new Set(results.map(r => r.jobId)).size, 1);
   assert.equal(new Set(results.map(r => r.leaseExpiresAt)).size, 1);
   assert.equal(results[0].pollLeaseMs, 90000);

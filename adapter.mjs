@@ -483,6 +483,14 @@ async function callTool(message, signal) {
       if (args.sourceTitle !== undefined) fingerprintInput.push(suppliedSourceTitle);
       if (args.worktree !== undefined) fingerprintInput.push(args.worktree);
       const fingerprint = digest(JSON.stringify(fingerprintInput));
+      const inFlightAdmission = requestAdmissions.get(key);
+      if (inFlightAdmission) {
+        if (inFlightAdmission.fingerprint !== fingerprint) throw callError("request_conflict", "requestId already belongs to different arguments");
+        // Join the owner's durable admission snapshot without independently renewing
+        // its lease. All simultaneous retries must observe one acceptance boundary.
+        const admitted = await inFlightAdmission.promise;
+        return toolResult(message.id, snapshot(admitted));
+      }
       const prior = requests.get(key);
       if (prior) {
         if (prior.fingerprint !== fingerprint) throw callError("request_conflict", "requestId already belongs to different arguments");
