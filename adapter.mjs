@@ -145,6 +145,7 @@ const worktreeManager = await createWorktreeManager({
 });
 const jobs = new Map();
 const requests = new Map();
+const requestAdmissions = new Map();
 const waiters = new Map();
 const terminalStatuses = new Set(["completed", "failed", "cancelled", "timed_out", "interrupted"]);
 const activeJobs = new Map();
@@ -421,12 +422,15 @@ async function restoreWorktreeForMonitor(message) {
     return { jsonrpc: "2.0", id: message.id, result: { cwd: job.cwd, worktreeState: job.worktreeState } };
   } catch (error) {
     return rpcError(message.id, -32603, error.message || "worktree restore failed");
+  } finally {
+    scheduleManagedWorktreePrune();
   }
 }
 
 async function callTool(message, signal) {
   const name = message.params?.name;
   const args = message.params?.arguments || {};
+  let managedWorktreePrunePaused = false;
   try {
     if (name === "codex-browser-status") {
       validateArguments(args, ["cwd"]);
@@ -485,13 +489,15 @@ async function callTool(message, signal) {
         renewJobLease(prior);
         return toolResult(message.id, snapshot(prior));
       }
+      const job = await withRequestAdmission(key, fingerprint, async () => {
       if (!storageHealthy) throw callError("storage_error", "Job storage unavailable; refusing new work");
       if (!runtimeHealthy) throw callError("unavailable", "Job process cleanup could not be verified; restart the adapter before starting new work");
       if (shuttingDown) throw callError("unavailable", "Adapter is shutting down; no work was started");
       if (signal?.aborted) throw callError("request_cancelled", "Request disconnected before acceptance");
       // A fresh foreground request preempts any in-flight background GC. The manager's
-      // abort-aware Git operations release the serializer instead of making admission wait.
+      // abort-aware Git operations release the serializer after bounded process cleanup.
       pauseManagedWorktreePrune();
+      managedWorktreePrunePaused = true;
       const jobId = randomUUID();
       let workspace;
       if (name === "codex") {
@@ -517,7 +523,7 @@ async function callTool(message, signal) {
         if (workspace.id) await worktreeManager.abandon(workspace.id);
         if (concurrent.fingerprint !== fingerprint) throw callError("request_conflict", "requestId already belongs to different arguments");
         renewJobLease(concurrent);
-        return toolResult(message.id, snapshot(concurrent));
+        return concurrent;
       }
       const cwd = workspace.executionCwd;
       const startNow = canRunFolder(cwd);
@@ -559,6 +565,11 @@ async function callTool(message, signal) {
         jobQueue.push(job);
         logCall("job_queued", job);
       }
+      return job;
+      });
+      // The owner persisted and scheduled the initial lease before admission
+      // resolved. Identical waiters return that same durable snapshot; retries
+      // arriving after this group is gone use the prior-job path above.
       return toolResult(message.id, snapshot(job));
     }
     if (name === "codex-status" || name === "codex-cancel") {
@@ -599,6 +610,37 @@ async function callTool(message, signal) {
     return toolResult(message.id, { status: "error", errorCode, message: safeError(error),
       ...(errorCode === "schema_outdated" ? { adapterVersion: VERSION, schemaFingerprint: SCHEMA_FINGERPRINT } : {}),
     }, true);
+  } finally {
+    if (managedWorktreePrunePaused) scheduleManagedWorktreePrune();
+  }
+}
+
+async function withRequestAdmission(key, fingerprint, task) {
+  const existing = requestAdmissions.get(key);
+  if (existing) {
+    if (existing.fingerprint !== fingerprint) throw callError("request_conflict", "requestId already belongs to different arguments");
+    return existing.promise;
+  }
+  let resolveAdmission;
+  let rejectAdmission;
+  const promise = new Promise((resolve, reject) => {
+    resolveAdmission = resolve;
+    rejectAdmission = reject;
+  });
+  // The owner consumes task errors; this handler prevents an unobserved duplicate
+  // promise rejection when no concurrent retry is waiting.
+  promise.catch(() => {});
+  const admission = { fingerprint, promise };
+  requestAdmissions.set(key, admission);
+  try {
+    const value = await task();
+    resolveAdmission(value);
+    return value;
+  } catch (error) {
+    rejectAdmission(error);
+    throw error;
+  } finally {
+    if (requestAdmissions.get(key) === admission) requestAdmissions.delete(key);
   }
 }
 
@@ -862,7 +904,8 @@ async function executeJob(job, args) {
     job.content = result.content;
     job.status = "completed";
   } catch (error) {
-    if (error.callCode === "process_cleanup_failed") {
+    if (error.callCode === "process_cleanup_failed" || error.callCode === "worktree_git_cleanup_failed") {
+      runtimeHealthy = false;
       job.status = "failed";
       job.errorCode = error.callCode;
       job.message = safeError(error);
@@ -889,7 +932,7 @@ function worktreeIsProtected(id) {
 }
 
 function pauseManagedWorktreePrune() {
-  worktreePruneRequested = false;
+  worktreePruneRequested = true;
   worktreePruneController?.abort();
 }
 
@@ -904,15 +947,20 @@ function scheduleManagedWorktreePrune() {
     try {
       do {
         worktreePruneRequested = false;
+        const attemptedIds = new Set();
         for (;;) {
           if (shuttingDown || controller.signal.aborted || activeJobs.size || jobQueue.length) return;
-          const count = await pruneManagedWorktrees(controller.signal);
-          if (count < WORKTREE_PRUNE_BATCH_SIZE) break;
+          const result = await pruneManagedWorktrees(controller.signal, attemptedIds);
+          for (const id of result.attemptedIds) attemptedIds.add(id);
+          if (!result.hasMoreEligible) break;
           await new Promise(resolvePromise => setImmediate(resolvePromise));
         }
       } while (worktreePruneRequested && !shuttingDown && !controller.signal.aborted);
-    } catch {
-      if (!controller.signal.aborted) process.stderr.write("local-codex-adapter worktree pruning deferred\n");
+    } catch (error) {
+      if (error?.code === "worktree_git_cleanup_failed") {
+        runtimeHealthy = false;
+        process.stderr.write("local-codex-adapter worktree Git cleanup could not be verified\n");
+      } else if (!controller.signal.aborted) process.stderr.write("local-codex-adapter worktree pruning deferred\n");
     } finally {
       if (worktreePruneController === controller) worktreePruneController = null;
       worktreePruneTask = null;
@@ -921,7 +969,7 @@ function scheduleManagedWorktreePrune() {
   })();
 }
 
-async function pruneManagedWorktrees(signal) {
+async function pruneManagedWorktrees(signal, excludeIds = new Set()) {
   const protectedIds = new Set(
     [...activeJobs.values(), ...jobQueue].map(job => job.worktreeId).filter(Boolean),
   );
@@ -929,6 +977,7 @@ async function pruneManagedWorktrees(signal) {
     limit: WORKTREE_PRUNE_BATCH_SIZE,
     signal,
     isProtected: worktreeIsProtected,
+    excludeIds,
   });
   for (const record of pruned) {
     for (const job of jobs.values()) {
@@ -937,7 +986,7 @@ async function pruneManagedWorktrees(signal) {
       try { persistJob(job); } catch { storageHealthy = false; }
     }
   }
-  return pruned.length;
+  return pruned;
 }
 
 function normalizeJobToDirect(job) {
@@ -969,6 +1018,7 @@ function cancelJob(job, reason, details = {}) {
       logCall(`job_${job.status}`, job, job.errorCode);
       settleJob(job);
       scheduleJobs();
+      scheduleManagedWorktreePrune();
     }
     return;
   }
@@ -1184,6 +1234,7 @@ async function shutdown() {
   }
   await Promise.all(active.map(job => job.done));
   if (worktreePruneTask) await worktreePruneTask.catch(() => {});
+  await worktreeManager.waitForIdle();
   server.closeAllConnections();
   await closed;
   process.exit(storageHealthy && runtimeHealthy ? 0 : 1);

@@ -156,9 +156,10 @@ class WorktreeManager {
       } catch (error) {
         record.state = "failed";
         record.updatedAt = Date.now();
-        record.errorCode = signal?.aborted ? "worktree_cancelled" : (error.code || "worktree_create_failed");
+        const cancelled = signal?.aborted && error.code !== "worktree_git_cleanup_failed";
+        record.errorCode = cancelled ? "worktree_cancelled" : (error.code || "worktree_create_failed");
         await this.save();
-        throw coded(record.errorCode, signal?.aborted ? "Worktree preparation cancelled" : (error.message || "Unable to create worktree"));
+        throw coded(record.errorCode, cancelled ? "Worktree preparation cancelled" : (error.message || "Unable to create worktree"));
       }
     }, { signal });
   }
@@ -218,21 +219,22 @@ class WorktreeManager {
     }
   }
 
-  async prune(protectedIds = new Set(), { limit = 4, signal, isProtected } = {}) {
+  async prune(protectedIds = new Set(), { limit = 4, signal, isProtected, excludeIds = new Set() } = {}) {
     if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1000) throw new Error("Invalid prune batch limit");
     throwIfAborted(signal);
     const candidates = [...this.records.values()]
-      .filter(record => record.state === "ready" && !protectedIds.has(record.id))
+      .filter(record => record.state === "ready" && !protectedIds.has(record.id) && !excludeIds.has(record.id))
       .sort((a, b) => a.lastUsedAt - b.lastUsedAt)
       .map(record => record.id);
     const pruned = [];
-    let attempted = 0;
+    const attemptedIds = [];
     for (const id of candidates) {
       throwIfAborted(signal);
-      if (attempted >= limit) break;
+      if (attemptedIds.length >= limit) break;
       await this.waitForAdmissionIdle(signal);
       if (protectedIds.has(id) || isProtected?.(id)) continue;
-      attempted += 1;
+      if ([...this.records.values()].filter(record => record.state === "ready").length <= this.retention) break;
+      attemptedIds.push(id);
       try {
         const result = await this.serial(async () => {
           throwIfAborted(signal);
@@ -245,12 +247,21 @@ class WorktreeManager {
         }, { signal });
         if (result) pruned.push(result);
       } catch (error) {
+        if (error?.code === "worktree_git_cleanup_failed") throw error;
         if (signal?.aborted || error?.code === "worktree_cancelled") {
           throw coded("worktree_cancelled", "Worktree pruning cancelled");
         }
         // Snapshot failure is deliberately non-destructive. Keep the worktree.
       }
     }
+    const attempted = new Set([...excludeIds, ...attemptedIds]);
+    const readyCount = [...this.records.values()].filter(record => record.state === "ready").length;
+    const hasMoreEligible = readyCount > this.retention && [...this.records.values()].some(record =>
+      record.state === "ready" && !protectedIds.has(record.id) && !attempted.has(record.id) && !isProtected?.(record.id));
+    Object.defineProperties(pruned, {
+      attemptedIds: { value: attemptedIds, enumerable: false },
+      hasMoreEligible: { value: hasMoreEligible, enumerable: false },
+    });
     return pruned;
   }
 
@@ -273,10 +284,18 @@ class WorktreeManager {
 
   async inspectRepositoryCached(sourceCwd) {
     const cached = this.repositoryCache.get(sourceCwd);
+    if (cached?.promise) return clone(await cached.promise);
     if (cached && Date.now() - cached.time < 1000) return clone(cached.value);
-    const value = await this.inspectRepository(sourceCwd);
-    this.repositoryCache.set(sourceCwd, { time: Date.now(), value });
-    return clone(value);
+    const promise = this.inspectRepository(sourceCwd);
+    this.repositoryCache.set(sourceCwd, { promise });
+    try {
+      const value = await promise;
+      this.repositoryCache.set(sourceCwd, { time: Date.now(), value });
+      return clone(value);
+    } catch (error) {
+      if (this.repositoryCache.get(sourceCwd)?.promise === promise) this.repositoryCache.delete(sourceCwd);
+      throw error;
+    }
   }
 
   async snapshotAndRemove(record, { signal } = {}) {
@@ -387,6 +406,7 @@ class WorktreeManager {
     }
     throwIfAborted(signal);
     await chmod(record.worktreeRoot, 0o700);
+    await restoreGitModes(record.worktreeRoot, git);
     const overlay = join(dirname(record.snapshotBundle), "overlay");
     await restoreOverlay(overlay, record.worktreeRoot);
     record.executionCwd = record.relativeCwd ? join(record.worktreeRoot, record.relativeCwd) : record.worktreeRoot;
@@ -423,7 +443,15 @@ class WorktreeManager {
     };
     const result = this.operation.then(run, run);
     this.operation = result.then(() => undefined, () => undefined);
-    return abortable(result, signal);
+    return result;
+  }
+
+  async waitForIdle() {
+    for (;;) {
+      const operation = this.operation;
+      await operation;
+      if (operation === this.operation) return;
+    }
   }
 
   async git(args, options = {}) {
@@ -503,6 +531,20 @@ async function restoreOverlay(sourceRoot, destinationRoot) {
   }
 }
 
+async function restoreGitModes(root, git) {
+  const result = await git(["-C", root, "ls-files", "-s", "-z"]);
+  for (const entry of result.stdout.split("\0")) {
+    if (!entry) continue;
+    const tab = entry.indexOf("\t");
+    if (tab < 0) continue;
+    const mode = entry.slice(0, 6);
+    if (mode !== "100644" && mode !== "100755") continue;
+    const path = entry.slice(tab + 1);
+    if (!safeRelative(path)) continue;
+    try { await chmod(join(root, path), mode === "100755" ? 0o755 : 0o644); } catch {}
+  }
+}
+
 async function walkFiles(root, prefix = "") {
   const { readdir } = await import("node:fs/promises");
   const output = [];
@@ -551,6 +593,10 @@ function runProcess(command, args, { cwd, env, timeoutMs = 30000, signal } = {})
     let settled = false;
     let terminationError = null;
     let killTimer;
+    let killVerifyTimer;
+    let cleanupCheckPending = false;
+    const cleanupDeadline = () => Date.now() + 2000;
+    let cleanupExpiresAt;
     const timeout = setTimeout(
       () => terminate(coded("worktree_git_timeout", `Git worktree operation exceeded ${timeoutMs} milliseconds`)),
       timeoutMs,
@@ -568,6 +614,7 @@ function runProcess(command, args, { cwd, env, timeoutMs = 30000, signal } = {})
     const cleanup = () => {
       clearTimeout(timeout);
       clearTimeout(killTimer);
+      clearTimeout(killVerifyTimer);
       signal?.removeEventListener("abort", onAbort);
     };
     const finish = (error, result) => {
@@ -589,15 +636,40 @@ function runProcess(command, args, { cwd, env, timeoutMs = 30000, signal } = {})
         }
       }
     };
+    const groupExists = () => {
+      if (!child.pid || process.platform === "win32") return child.exitCode === null;
+      try {
+        process.kill(-child.pid, 0);
+        return true;
+      } catch (error) {
+        return error.code === "EPERM";
+      }
+    };
+    const verifyCleanup = () => {
+      if (settled) return;
+      if (!groupExists()) {
+        return finish(terminationError);
+      }
+      if (Date.now() >= cleanupExpiresAt) {
+        return finish(coded("worktree_git_cleanup_failed", "Git worktree process cleanup could not be verified"));
+      }
+      if (cleanupCheckPending) return;
+      cleanupCheckPending = true;
+      killVerifyTimer = setTimeout(() => {
+        cleanupCheckPending = false;
+        verifyCleanup();
+      }, 25);
+    };
     function terminate(error) {
       if (settled || terminationError) return;
       terminationError = error;
+      cleanupExpiresAt = cleanupDeadline();
       signalChild("SIGTERM");
       killTimer = setTimeout(() => {
         signalChild("SIGKILL");
-        finish(terminationError);
+        cleanupCheckPending = false;
+        verifyCleanup();
       }, 250);
-      killTimer.unref();
     }
     child.stdout.on("data", chunk => {
       try { stdout = append(stdout, chunk); }
@@ -607,9 +679,9 @@ function runProcess(command, args, { cwd, env, timeoutMs = 30000, signal } = {})
       try { stderr = append(stderr, chunk); }
       catch (error) { terminate(error); }
     });
-    child.once("error", error => finish(terminationError || error));
+    child.once("error", error => terminationError ? verifyCleanup() : finish(error));
     child.once("exit", code => {
-      if (terminationError) finish(terminationError);
+      if (terminationError) verifyCleanup();
       else finish(null, { code: code ?? 1, stdout, stderr });
     });
   });

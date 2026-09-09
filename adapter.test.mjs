@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { spawn } from "node:child_process";
+import { existsSync } from "node:fs";
 import { chmod, mkdir, mkdtemp, readFile, realpath, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
@@ -41,12 +42,14 @@ async function fixture(t, options = {}) {
     LOCAL_CODEX_ROOT: root, LOCAL_CODEX_PORT: String(port), LOCAL_CODEX_HOST: "127.0.0.1",
     LOCAL_CODEX_TOKEN_FILE: tokenFile, LOCAL_CODEX_STATE_FILE: join(root, "threads.json"),
     LOCAL_CODEX_LOG_FILE: join(root, "audit.log"), LOCAL_CODEX_JOBS_DIR: join(root, "jobs"),
-    LOCAL_CODEX_WORKTREE_ROOT: join(root, "worktrees"), LOCAL_CODEX_WORKTREE_RETENTION: "15",
+    LOCAL_CODEX_WORKTREE_ROOT: join(root, "worktrees"), LOCAL_CODEX_WORKTREE_RETENTION: String(options.worktreeRetention ?? 15),
     LOCAL_CODEX_WORKTREE_GIT_TIMEOUT_MS: String(options.worktreeGitTimeout ?? 30000),
+    LOCAL_CODEX_WORKTREE_PRUNE_BATCH_SIZE: String(options.worktreePruneBatch ?? 4),
     LOCAL_CODEX_BIN: options.missingBin ? join(root, "missing") : fake, LOCAL_CODEX_CALL_TIMEOUT_MS: String(options.timeout || 10000),
     LOCAL_CODEX_POLL_LEASE_MS: String(options.pollLease ?? 90000),
     LOCAL_CODEX_MAX_CONCURRENCY: String(options.maxConcurrency ?? 10), LOCAL_CODEX_MAX_QUEUE: String(options.maxQueue ?? 100),
     FAKE_ROOT: root, TEST_DENY_GROUP_PROBE: options.deniedGroupProbe ? "1" : "0",
+    ...(options.path ? { PATH: `${options.path}:${process.env.PATH}` } : {}),
   };
   async function start() {
     child = spawn(process.execPath, [...(options.deniedGroup ? ["--import", deniedGroup] : []), "adapter.mjs"], { cwd: repo, env, stdio: ["ignore", "ignore", "pipe"] });
@@ -176,6 +179,7 @@ test("durable immediate acceptance, duplicate retries, same-folder queueing, and
   const results = await Promise.all(Array.from({ length: 8 }, () => f.call("codex", args)));
   assert.ok(Date.now() - before < 450, "acceptance must not wait for generation");
   assert.equal(new Set(results.map(r => r.jobId)).size, 1);
+  assert.equal(new Set(results.map(r => r.leaseExpiresAt)).size, 1);
   assert.equal(results[0].pollLeaseMs, 90000);
   assert.ok(results[0].leaseExpiresAt > before);
   const { jobId } = results[0];
@@ -652,11 +656,13 @@ test("regular status polling keeps a job alive beyond one lease", async t => {
 });
 
 test("timeout, stubborn child cleanup, server failure, and missing executable", async t => {
-  const f = await fixture(t, { timeout: 250 });
-  const held = await f.call("codex", { requestId: "t", prompt: "stubborn" });
-  const timed = await f.finished(held.jobId);
+  const timeoutFixture = await fixture(t, { timeout: 250 });
+  const held = await timeoutFixture.call("codex", { requestId: "t", prompt: "stubborn" });
+  const timed = await timeoutFixture.finished(held.jobId);
   assert.equal(timed.status, "timed_out");
-  for (const r of (await f.records()).filter(r => r.event === "spawn")) assert.throws(() => process.kill(r.pid, 0), /ESRCH/);
+  for (const r of (await timeoutFixture.records()).filter(r => r.event === "spawn")) assert.throws(() => process.kill(r.pid, 0), /ESRCH/);
+
+  const f = await fixture(t);
   const crash = await f.finished((await f.call("codex", { requestId: "c", prompt: "crash" })).jobId);
   assert.equal(crash.status, "failed"); assert.equal(crash.errorCode, "server_exit");
   const ok = await f.finished((await f.call("codex", { requestId: "ok", prompt: "hello" })).jobId);
@@ -957,7 +963,6 @@ test("poll expiry cancels worktree preparation before runCodex starts", async t 
   await runGit(repoPath, "add", ".gitattributes", "slow.txt");
   await runGit(repoPath, "commit", "-m", "slow checkout");
 
-  const before = Date.now();
   const accepted = await f.call("codex", {
     requestId: "prepare-poll-expiry",
     cwd: repoPath,
@@ -969,6 +974,136 @@ test("poll expiry cancels worktree preparation before runCodex starts", async t 
   const result = await f.finished(accepted.jobId);
   assert.equal(result.status, "cancelled");
   assert.equal(result.errorCode, "polling_expired");
-  assert.ok(Date.now() - before < 2500, "prepare cancellation must settle promptly");
+  assert.equal(typeof accepted.leaseExpiresAt, "number");
+  assert.equal(typeof result.finishedAt, "number");
+  assert.ok(result.finishedAt - accepted.leaseExpiresAt < 2500, "expiry-to-terminal cancellation must settle promptly");
   assert.equal((await f.records()).filter(record => record.method === "turn/start").length, 0);
+  const state = JSON.parse(await readFile(join(f.root, "worktrees.json"), "utf8"));
+  const record = state.records.find(value => value.id === accepted.worktreeId);
+  assert.notEqual(record.state, "creating");
+  if (record.state === "failed") assert.equal(record.errorCode, "worktree_cancelled");
+});
+
+test("shutdown waits for in-flight worktree preparation cleanup", async t => {
+  const f = await fixture(t, { worktreeGitTimeout: 5000 });
+  const repoPath = await realpath(await mkdtemp(join(tmpdir(), "codex-shutdown-prepare-")));
+  t.after(() => rm(repoPath, { recursive: true, force: true }));
+  await runGit(repoPath, "init");
+  await runGit(repoPath, "config", "user.name", "Test User");
+  await runGit(repoPath, "config", "user.email", "test@example.com");
+  const started = join(repoPath, "shutdown-filter-started");
+  const slowFilter = join(repoPath, "shutdown-filter.mjs");
+  await writeFile(slowFilter, `#!/usr/bin/env node\nimport { writeFileSync } from "node:fs";\nwriteFileSync(${JSON.stringify(started)}, String(process.pid));\nprocess.stdin.resume();\nprocess.on("SIGTERM", () => {});\nsetInterval(() => {}, 1000);\n`);
+  await chmod(slowFilter, 0o755);
+  await runGit(repoPath, "config", "filter.slow.clean", "cat");
+  await runGit(repoPath, "config", "filter.slow.smudge", slowFilter);
+  await runGit(repoPath, "config", "filter.slow.required", "true");
+  await writeFile(join(repoPath, ".gitattributes"), "slow.txt filter=slow\n");
+  await writeFile(join(repoPath, "slow.txt"), "tracked\n");
+  await runGit(repoPath, "add", ".gitattributes", "slow.txt");
+  await runGit(repoPath, "commit", "-m", "slow shutdown checkout");
+
+  const accepted = await f.call("codex", {
+    requestId: "shutdown-during-prepare", cwd: repoPath, prompt: "must never reach model execution",
+  });
+  let filterPid;
+  for (let i = 0; i < 200; i++) {
+    try { filterPid = Number(await readFile(started, "utf8")); break; }
+    catch { await delay(10); }
+  }
+  assert.ok(Number.isSafeInteger(filterPid) && filterPid > 0, "slow Git filter never started");
+
+  await f.stop();
+  assert.throws(() => process.kill(filterPid, 0), /ESRCH/);
+  const state = JSON.parse(await readFile(join(f.root, "worktrees.json"), "utf8"));
+  const record = state.records.find(value => value.id === accepted.worktreeId);
+  assert.notEqual(record.state, "creating");
+  assert.equal(record.state, "failed");
+  assert.equal(record.errorCode, "worktree_cancelled");
+  const job = JSON.parse(await readFile(join(f.root, "jobs", `${accepted.jobId}.json`), "utf8"));
+  assert.equal(job.status, "interrupted");
+  assert.notEqual(job.status, "cancelling");
+});
+
+test("foreground rejection and monitor restore re-arm paused worktree pruning", async t => {
+  const testRoot = await realpath(await mkdtemp(join(tmpdir(), "codex-prune-rearm-")));
+  t.after(() => rm(testRoot, { recursive: true, force: true }));
+  const sourceRepo = join(testRoot, "source");
+  const rejectedRepo = join(testRoot, "rejected");
+  const gitPath = process.env.PATH.split(":").map(directory => join(directory, "git")).find(existsSync);
+  assert.ok(gitPath, "test requires a real Git executable");
+  for (const path of [sourceRepo, rejectedRepo]) {
+    await mkdir(path);
+    await runGit(path, "init");
+    await runGit(path, "config", "user.name", "Test User");
+    await runGit(path, "config", "user.email", "test@example.com");
+    await writeFile(join(path, "tracked.txt"), `${path}\n`);
+    await runGit(path, "add", "tracked.txt");
+    await runGit(path, "commit", "-m", "initial");
+  }
+
+  const pruneStarted = join(testRoot, "prune-started");
+  const wrapperDir = join(testRoot, "git-wrapper");
+  await mkdir(wrapperDir);
+  const gitWrapper = join(wrapperDir, "git");
+  await writeFile(gitWrapper, `#!/usr/bin/env node
+import { existsSync, writeFileSync } from "node:fs";
+import { spawn } from "node:child_process";
+const args = process.argv.slice(2);
+if (args.includes("bundle") && args.includes("create") && !existsSync(${JSON.stringify(pruneStarted)})) {
+  writeFileSync(${JSON.stringify(pruneStarted)}, "started");
+  process.on("SIGTERM", () => {});
+  setInterval(() => {}, 1000);
+} else if (args[0] === "-C" && args[1] === ${JSON.stringify(rejectedRepo)} && args[2] === "rev-parse" && args.includes("--git-common-dir")) {
+  process.stderr.write("fixture rejected Git inspection");
+  process.exit(7);
+} else {
+  const child = spawn(${JSON.stringify(gitPath)}, args, { stdio: "inherit", env: { ...process.env, PATH: ${JSON.stringify(process.env.PATH)} } });
+  child.once("error", error => { process.stderr.write(error.message); process.exit(1); });
+  child.once("exit", (code, signal) => signal ? process.kill(process.pid, signal) : process.exit(code ?? 1));
+}
+`);
+  await chmod(gitWrapper, 0o755);
+
+  const f = await fixture(t, {
+    path: wrapperDir,
+    worktreeRetention: 1,
+    worktreePruneBatch: 1,
+    worktreeGitTimeout: 5000,
+  });
+  const readWorktrees = async () => JSON.parse(await readFile(join(f.root, "worktrees.json"), "utf8")).records;
+  const waitFor = async (predicate, message) => {
+    const deadline = Date.now() + 8000;
+    while (Date.now() < deadline) {
+      if (await predicate()) return;
+      await delay(25);
+    }
+    assert.fail(`${message}: ${JSON.stringify(await readWorktrees())}`);
+  };
+
+  const first = await f.finished((await f.call("codex", {
+    requestId: "prune-rearm-first", cwd: sourceRepo, prompt: "hello",
+  })).jobId);
+  const second = await f.finished((await f.call("codex", {
+    requestId: "prune-rearm-second", cwd: sourceRepo, prompt: "hello",
+  })).jobId);
+  await waitFor(async () => readFile(pruneStarted).then(() => true, () => false), "background prune did not start");
+
+  const rejected = await f.call("codex", {
+    requestId: "prune-rearm-rejected", cwd: rejectedRepo, prompt: "hello",
+  });
+  assert.equal(rejected.status, "error");
+  assert.equal(rejected.errorCode, "worktree_git_failed");
+  await waitFor(async () => (await readWorktrees()).find(record => record.id === first.worktreeId)?.state === "snapshotted",
+    "pruning was not re-armed after foreground rejection");
+
+  const restored = await f.rpc({
+    jsonrpc: "2.0", id: "restore-pruned", method: "localCodex/worktreeRestore", params: { jobId: first.jobId },
+  });
+  assert.equal(restored.result.worktreeState, "ready");
+  await waitFor(async () => {
+    const records = await readWorktrees();
+    return records.find(record => record.id === first.worktreeId)?.state === "ready" &&
+      records.find(record => record.id === second.worktreeId)?.state === "snapshotted";
+  }, "pruning was not re-armed after monitor restore");
 });

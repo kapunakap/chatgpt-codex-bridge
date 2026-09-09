@@ -109,6 +109,8 @@ test("retention snapshots Git-visible work and declared setup, then restores aft
   await manager.bindThread(secondId, "thread-2");
   const pruned = await manager.prune(new Set());
   assert.deepEqual(pruned.map(record => record.id), [firstId]);
+  assert.deepEqual(pruned.attemptedIds, [firstId]);
+  assert.equal(pruned.hasMoreEligible, false);
   const snapshot = manager.get(firstId);
   assert.equal(snapshot.state, "snapshotted");
   assert.equal((await stat(snapshot.snapshotBundle)).mode & 0o777, 0o600);
@@ -215,7 +217,42 @@ test("a >200 prune backlog yields to new worktree admission between bounded cand
   assert.equal((await admitted).state, "planned");
   const pruned = await prune;
   assert.equal(pruned.length, 4);
+  assert.equal(pruned.attemptedIds.length, 4);
+  assert.equal(pruned.hasMoreEligible, true);
   assert.equal(snapshots, 4);
+});
+
+test("failed prune candidates are skipped for one drain while later batches continue", async t => {
+  const f = await repository(t);
+  const manager = await createWorktreeManager({ rootDir: f.rootDir, stateDir: f.stateDir, retention: 1 });
+  const idFor = value => `00000000-0000-0000-0000-${value.toString(16).padStart(12, "0")}`;
+  for (let i = 1; i <= 10; i++) {
+    manager.records.set(idFor(i), {
+      id: idFor(i), state: "ready", lastUsedAt: i, createdAt: i,
+      worktreeRoot: join(f.rootDir, `fake-${i}`), executionCwd: join(f.rootDir, `fake-${i}`),
+    });
+  }
+  const failedId = idFor(1);
+  const snapshotAttempts = [];
+  manager.snapshotAndRemove = async record => {
+    snapshotAttempts.push(record.id);
+    if (record.id === failedId) throw Object.assign(new Error("fixture snapshot failure"), { code: "fixture_failure" });
+    record.state = "snapshotted";
+  };
+
+  const attemptedIds = new Set();
+  let passes = 0;
+  let result;
+  do {
+    result = await manager.prune(new Set(), { limit: 4, excludeIds: attemptedIds });
+    for (const id of result.attemptedIds) attemptedIds.add(id);
+    passes += 1;
+  } while (result.hasMoreEligible);
+
+  assert.equal(passes, 3);
+  assert.equal(snapshotAttempts.filter(id => id === failedId).length, 1, "a permanent failure is not retried tightly");
+  assert.deepEqual(new Set(snapshotAttempts), new Set(Array.from({ length: 10 }, (_, index) => idFor(index + 1))));
+  assert.deepEqual([...manager.records.values()].filter(record => record.state === "ready").map(record => record.id), [failedId]);
 });
 
 test("stalled Git times out and releases the serializer", async t => {
@@ -235,4 +272,54 @@ test("stalled Git times out and releases the serializer", async t => {
     new Promise((_, reject) => setTimeout(() => reject(new Error("serializer remained blocked")), 250)),
   ]);
   assert.equal(touched.id, firstId);
+});
+
+test("aborted prepare settles state and Git before later serialized work", async t => {
+  const f = await repository(t);
+  const manager = await createWorktreeManager({ rootDir: f.rootDir, stateDir: f.stateDir, retention: 15 });
+  await manager.plan({ id: firstId, sourceCwd: f.repo });
+  const started = join(f.temp, "abort-started");
+  const exited = join(f.temp, "abort-exited");
+  const stalled = join(f.temp, "abortable-git.mjs");
+  await writeFile(stalled, `#!/usr/bin/env node
+import { writeFileSync } from "node:fs";
+writeFileSync(${JSON.stringify(started)}, "started");
+process.on("SIGTERM", () => {
+  setTimeout(() => {
+    writeFileSync(${JSON.stringify(exited)}, "exited");
+    process.exit(0);
+  }, 80);
+});
+setInterval(() => {}, 1000);
+`);
+  await chmod(stalled, 0o755);
+  manager.gitBin = stalled;
+  const controller = new AbortController();
+  let prepareSettled = false;
+  const prepare = manager.prepare(firstId, { signal: controller.signal }).then(
+    value => ({ value }),
+    error => ({ error }),
+  ).finally(() => { prepareSettled = true; });
+  for (let i = 0; i < 100; i++) {
+    try { await readFile(started); break; }
+    catch { await new Promise(resolve => setTimeout(resolve, 10)); }
+  }
+  assert.equal(await readFile(started, "utf8"), "started");
+  controller.abort();
+  let followUpSettled = false;
+  const followUp = manager.touch(firstId).finally(() => { followUpSettled = true; });
+  await new Promise(resolve => setTimeout(resolve, 50));
+  assert.equal(prepareSettled, false, "prepare must wait for Git termination and state persistence");
+  assert.equal(followUpSettled, false, "later serialized work must not race cancelled prepare cleanup");
+
+  const outcome = await prepare;
+  assert.equal(outcome.error?.code, "worktree_cancelled");
+  assert.equal(await readFile(exited, "utf8"), "exited");
+  const stable = manager.get(firstId);
+  assert.equal(stable.state, "failed");
+  assert.equal(stable.errorCode, "worktree_cancelled");
+  const touched = await followUp;
+  assert.equal(touched.state, "failed");
+  await manager.waitForIdle();
+  assert.equal(manager.get(firstId).state, "failed");
 });
