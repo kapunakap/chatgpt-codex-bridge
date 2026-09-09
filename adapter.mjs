@@ -494,7 +494,11 @@ async function callTool(message, signal) {
       const prior = requests.get(key);
       if (prior) {
         if (prior.fingerprint !== fingerprint) throw callError("request_conflict", "requestId already belongs to different arguments");
-        renewJobLease(prior);
+        // Coalesce a transport-level retry burst into the same acceptance snapshot.
+        // A later retry still renews normally; status polling is never coalesced here.
+        const leaseIssuedAt = prior.leaseExpiresAt - prior.pollLeaseMs;
+        const renewalCoalesceMs = Math.min(1000, Math.max(1, Math.floor(prior.pollLeaseMs / 10)));
+        if (Date.now() - leaseIssuedAt >= renewalCoalesceMs) renewJobLease(prior);
         return toolResult(message.id, snapshot(prior));
       }
       const job = await withRequestAdmission(key, fingerprint, async () => {

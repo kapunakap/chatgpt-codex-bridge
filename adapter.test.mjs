@@ -638,7 +638,7 @@ test("idempotent submission retries renew the job lease", async t => {
   const f = await fixture(t, { pollLease: 10000 });
   const args = { requestId: "lease-retry", prompt: "hold" };
   const created = await f.call("codex", args);
-  await delay(50);
+  await delay(1100);
   const retried = await f.call("codex", args);
   assert.ok(retried.leaseExpiresAt > created.leaseExpiresAt, JSON.stringify({ created, retried }));
   await f.call("codex-cancel", { jobId: created.jobId });
