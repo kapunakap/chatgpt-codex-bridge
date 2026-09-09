@@ -1,0 +1,13 @@
+#!/bin/zsh
+set -euo pipefail
+readonly CONFIG_FILE="${LOCAL_CODEX_CONFIG_FILE:-${HOME}/Library/Application Support/local-codex-tunnel/config.env}"
+if [[ ! -r "${CONFIG_FILE}" ]]; then
+  print -u2 "Local Codex configuration is missing: ${CONFIG_FILE}"
+  exit 1
+fi
+set -a
+source "${CONFIG_FILE}"
+set +a
+export LOCAL_CODEX_CONFIG_FILE="${CONFIG_FILE}"
+: "${LOCAL_CODEX_DIAGNOSTICS:?LOCAL_CODEX_DIAGNOSTICS is missing from ${CONFIG_FILE}}"
+exec node "${LOCAL_CODEX_DIAGNOSTICS}" "receipt" "$@"
