@@ -82,7 +82,7 @@ readline.createInterface({ input: process.stdin }).on("line", line => {
       reply(request.id, {
         thread: { id: threadId, cwd: params.cwd },
         model: params.model || "gpt-5.6-luna",
-        reasoningEffort: params.config?.model_reasoning_effort || "max",
+        reasoningEffort: params.config?.model_reasoning_effort || "xhigh",
       });
       break;
     }

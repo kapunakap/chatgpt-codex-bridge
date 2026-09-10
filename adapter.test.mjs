@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { spawn } from "node:child_process";
-import { mkdir, mkdtemp, readFile, realpath, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { chmod, mkdir, mkdtemp, readFile, realpath, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { join } from "node:path";
@@ -41,11 +42,16 @@ async function fixture(t, options = {}) {
     LOCAL_CODEX_ROOT: root, LOCAL_CODEX_PORT: String(port), LOCAL_CODEX_HOST: "127.0.0.1",
     LOCAL_CODEX_TOKEN_FILE: tokenFile, LOCAL_CODEX_STATE_FILE: join(root, "threads.json"),
     LOCAL_CODEX_LOG_FILE: join(root, "audit.log"), LOCAL_CODEX_JOBS_DIR: join(root, "jobs"),
-    LOCAL_CODEX_WORKTREE_ROOT: join(root, "worktrees"), LOCAL_CODEX_WORKTREE_RETENTION: "15",
+    LOCAL_CODEX_WORKTREE_ROOT: join(root, "worktrees"), LOCAL_CODEX_WORKTREE_RETENTION: String(options.worktreeRetention ?? 15),
+    LOCAL_CODEX_WORKTREE_GIT_TIMEOUT_MS: String(options.worktreeGitTimeout ?? 30000),
+    LOCAL_CODEX_WORKTREE_PRUNE_BATCH_SIZE: String(options.worktreePruneBatch ?? 4),
     LOCAL_CODEX_BIN: options.missingBin ? join(root, "missing") : fake, LOCAL_CODEX_CALL_TIMEOUT_MS: String(options.timeout || 10000),
     LOCAL_CODEX_POLL_LEASE_MS: String(options.pollLease ?? 90000),
+    LOCAL_CODEX_MODEL_CEILING: options.modelCeiling ?? "luna",
+    LOCAL_CODEX_REASONING_CEILING: options.reasoningCeiling ?? "xhigh",
     LOCAL_CODEX_MAX_CONCURRENCY: String(options.maxConcurrency ?? 10), LOCAL_CODEX_MAX_QUEUE: String(options.maxQueue ?? 100),
     FAKE_ROOT: root, TEST_DENY_GROUP_PROBE: options.deniedGroupProbe ? "1" : "0",
+    ...(options.path ? { PATH: `${options.path}:${process.env.PATH}` } : {}),
   };
   async function start() {
     child = spawn(process.execPath, [...(options.deniedGroup ? ["--import", deniedGroup] : []), "adapter.mjs"], { cwd: repo, env, stdio: ["ignore", "ignore", "pipe"] });
@@ -170,11 +176,12 @@ test("discovery, authentication, schemas, and validation", async t => {
 
 test("durable immediate acceptance, duplicate retries, same-folder queueing, and final answer", async t => {
   const f = await fixture(t);
-  const args = { requestId: "same", prompt: "delay:500" };
+  const args = { requestId: "same", prompt: "delay:3000" };
   const before = Date.now();
   const results = await Promise.all(Array.from({ length: 8 }, () => f.call("codex", args)));
-  assert.ok(Date.now() - before < 450, "acceptance must not wait for generation");
+  assert.ok(Date.now() - before < 1500, "acceptance must not wait for generation");
   assert.equal(new Set(results.map(r => r.jobId)).size, 1);
+  assert.equal(new Set(results.map(r => r.leaseExpiresAt)).size, 1);
   assert.equal(results[0].pollLeaseMs, 90000);
   assert.ok(results[0].leaseExpiresAt > before);
   const { jobId } = results[0];
@@ -191,7 +198,7 @@ test("durable immediate acceptance, duplicate retries, same-folder queueing, and
   assert.equal((await f.call("codex-status", { jobId, waitMs: 20001 })).errorCode, "invalid_wait");
   const result = await f.finished(jobId);
   assert.equal(result.content, "FINAL_OK"); assert.equal(result.status, "completed");
-  assert.equal(result.model, "gpt-5.6-luna"); assert.equal(result.reasoningEffort, "max");
+  assert.equal(result.model, "gpt-5.6-luna"); assert.equal(result.reasoningEffort, "xhigh");
   assert.equal(result.networkAccess, false);
   assert.equal(result.workspaceKind, "direct"); assert.equal(result.worktreeReason, "non_git");
   assert.equal(result.sourceCwd, f.root); assert.equal(result.cwd, f.root);
@@ -386,6 +393,125 @@ test("queued jobs can be cancelled and are interrupted without replay after rest
   assert.equal((await f.records()).filter(r => r.method === "turn/start").length, 1);
 });
 
+test("terminal jobs normalize stale removed worktrees during restart", async t => {
+  const f = await fixture(t, { maxConcurrency: 1, maxQueue: 3 });
+  const repo = await realpath(await mkdtemp(join(tmpdir(), "codex-stale-terminal-worktree-")));
+  t.after(() => rm(repo, { recursive: true, force: true }));
+  await runGit(repo, "init");
+  await runGit(repo, "config", "user.name", "Test User");
+  await runGit(repo, "config", "user.email", "test@example.com");
+  await writeFile(join(repo, "tracked.txt"), "committed\n");
+  await runGit(repo, "add", ".");
+  await runGit(repo, "commit", "-m", "initial");
+
+  const blocker = await f.call("codex", { requestId: "stale-terminal-blocker", prompt: "hold" });
+  await f.started(blocker.jobId);
+  const queued = await f.call("codex", { requestId: "stale-terminal", cwd: repo, prompt: "hello" });
+  assert.equal(queued.status, "queued");
+  assert.equal(queued.workspaceKind, "worktree");
+  assert.ok(queued.worktreeId);
+
+  const cancelled = await f.call("codex-cancel", { jobId: queued.jobId });
+  assert.equal(cancelled.status, "cancelled");
+  assert.equal(cancelled.workspaceKind, "direct");
+  assert.equal(cancelled.worktreeId, undefined);
+  await f.call("codex-cancel", { jobId: blocker.jobId });
+  assert.equal((await f.finished(blocker.jobId)).status, "cancelled");
+
+  for (let i = 0; i < 100; i++) {
+    const state = JSON.parse(await readFile(join(f.root, "worktrees.json"), "utf8"));
+    if (!state.records.some(record => record.id === queued.worktreeId)) break;
+    await delay(10);
+  }
+  const state = JSON.parse(await readFile(join(f.root, "worktrees.json"), "utf8"));
+  assert.ok(!state.records.some(record => record.id === queued.worktreeId));
+
+  const jobPath = join(f.root, "jobs", queued.jobId + ".json");
+  const historical = JSON.parse(await readFile(jobPath, "utf8"));
+  historical.workspaceKind = "worktree";
+  historical.worktreeId = queued.worktreeId;
+  historical.worktreeState = "planned";
+  historical.cwd = queued.cwd;
+  historical.content = "SAVED_RESULT";
+  await writeFile(jobPath, JSON.stringify(historical) + "\n", { mode: 0o600 });
+  const eventPath = join(f.root, "job-events", queued.jobId + ".jsonl");
+  const eventHistory = JSON.stringify({ seq: 1, time: "2026-01-01T00:00:00.000Z", type: "session.started", data: { source: "test" } }) + "\n";
+  await writeFile(eventPath, eventHistory, { mode: 0o600 });
+
+  await f.stop();
+  await f.start();
+  const recovered = await f.call("codex-status", { jobId: queued.jobId });
+  assert.equal(recovered.status, "cancelled");
+  assert.equal(recovered.errorCode, historical.errorCode);
+  assert.equal(recovered.message, historical.message);
+  assert.equal(recovered.content, historical.content);
+  assert.equal(recovered.workspaceKind, "direct");
+  assert.equal(recovered.cwd, repo);
+  assert.equal(recovered.sourceCwd, repo);
+  assert.equal(recovered.worktreeId, undefined);
+
+  const persisted = JSON.parse(await readFile(jobPath, "utf8"));
+  assert.equal(persisted.status, historical.status);
+  assert.equal(persisted.errorCode, historical.errorCode);
+  assert.equal(persisted.message, historical.message);
+  assert.equal(persisted.content, historical.content);
+  assert.equal(persisted.workspaceKind, "direct");
+  assert.equal(persisted.cwd, repo);
+  assert.equal(persisted.worktreeId, undefined);
+  assert.equal(persisted.worktreeState, undefined);
+  assert.equal(persisted.gitCommonDir, undefined);
+  assert.equal(await readFile(eventPath, "utf8"), eventHistory);
+});
+
+test("non-terminal jobs still fail closed when their managed worktree is missing", async t => {
+  const f = await fixture(t, { maxConcurrency: 1, maxQueue: 3 });
+  const repo = await realpath(await mkdtemp(join(tmpdir(), "codex-stale-active-worktree-")));
+  t.after(() => rm(repo, { recursive: true, force: true }));
+  await runGit(repo, "init");
+  await runGit(repo, "config", "user.name", "Test User");
+  await runGit(repo, "config", "user.email", "test@example.com");
+  await writeFile(join(repo, "tracked.txt"), "committed\n");
+  await runGit(repo, "add", ".");
+  await runGit(repo, "commit", "-m", "initial");
+
+  const blocker = await f.call("codex", { requestId: "stale-active-blocker", prompt: "hold" });
+  await f.started(blocker.jobId);
+  const queued = await f.call("codex", { requestId: "stale-active", cwd: repo, prompt: "hello" });
+  assert.equal(queued.status, "queued");
+  assert.ok(queued.worktreeId);
+  await f.stop("SIGKILL");
+
+  const statePath = join(f.root, "worktrees.json");
+  const state = JSON.parse(await readFile(statePath, "utf8"));
+  state.records = state.records.filter(record => record.id !== queued.worktreeId);
+  await writeFile(statePath, JSON.stringify(state) + "\n", { mode: 0o600 });
+  await assert.rejects(f.start(), /job recovery failed; refusing work|adapter exited 1/);
+});
+
+test("terminal jobs with mismatched existing worktrees still fail closed", async t => {
+  const f = await fixture(t);
+  const repo = await realpath(await mkdtemp(join(tmpdir(), "codex-mismatched-terminal-worktree-")));
+  t.after(() => rm(repo, { recursive: true, force: true }));
+  await runGit(repo, "init");
+  await runGit(repo, "config", "user.name", "Test User");
+  await runGit(repo, "config", "user.email", "test@example.com");
+  await writeFile(join(repo, "tracked.txt"), "committed\n");
+  await runGit(repo, "add", ".");
+  await runGit(repo, "commit", "-m", "initial");
+
+  const created = await f.finished((await f.call("codex", {
+    requestId: "mismatched-terminal-worktree", cwd: repo, prompt: "hello",
+  })).jobId);
+  assert.equal(created.status, "completed");
+  await f.stop("SIGKILL");
+
+  const jobPath = join(f.root, "jobs", created.jobId + ".json");
+  const historical = JSON.parse(await readFile(jobPath, "utf8"));
+  historical.cwd = repo;
+  await writeFile(jobPath, JSON.stringify(historical) + "\n", { mode: 0o600 });
+  await assert.rejects(f.start(), /job recovery failed; refusing work|adapter exited 1/);
+});
+
 test("stale schemas return actionable errors, never start work, and log only schema metadata", async t => {
   const f = await fixture(t);
   const listed = await f.rpc({ jsonrpc: "2.0", id: "SCHEMA_REQUEST_SECRET", method: "tools/list" });
@@ -418,7 +544,7 @@ test("stale schemas return actionable errors, never start work, and log only sch
 });
 
 test("defaults, overrides, resumed settings, unsupported settings, and safe logs", async t => {
-  const f = await fixture(t);
+  const f = await fixture(t, { modelCeiling: "sol", reasoningCeiling: "max" });
   const first = await f.finished((await f.call("codex", { requestId: "a", prompt: "hello", model: "terra", reasoningEffort: "high" })).jobId);
   assert.equal(first.model, "gpt-5.6-terra"); assert.equal(first.reasoningEffort, "high");
   await f.stop(); await f.start();
@@ -514,7 +640,7 @@ test("idempotent submission retries renew the job lease", async t => {
   const f = await fixture(t, { pollLease: 10000 });
   const args = { requestId: "lease-retry", prompt: "hold" };
   const created = await f.call("codex", args);
-  await delay(50);
+  await delay(1100);
   const retried = await f.call("codex", args);
   assert.ok(retried.leaseExpiresAt > created.leaseExpiresAt, JSON.stringify({ created, retried }));
   await f.call("codex-cancel", { jobId: created.jobId });
@@ -532,11 +658,13 @@ test("regular status polling keeps a job alive beyond one lease", async t => {
 });
 
 test("timeout, stubborn child cleanup, server failure, and missing executable", async t => {
-  const f = await fixture(t, { timeout: 250 });
-  const held = await f.call("codex", { requestId: "t", prompt: "stubborn" });
-  const timed = await f.finished(held.jobId);
+  const timeoutFixture = await fixture(t, { timeout: 250 });
+  const held = await timeoutFixture.call("codex", { requestId: "t", prompt: "stubborn" });
+  const timed = await timeoutFixture.finished(held.jobId);
   assert.equal(timed.status, "timed_out");
-  for (const r of (await f.records()).filter(r => r.event === "spawn")) assert.throws(() => process.kill(r.pid, 0), /ESRCH/);
+  for (const r of (await timeoutFixture.records()).filter(r => r.event === "spawn")) assert.throws(() => process.kill(r.pid, 0), /ESRCH/);
+
+  const f = await fixture(t);
   const crash = await f.finished((await f.call("codex", { requestId: "c", prompt: "crash" })).jobId);
   assert.equal(crash.status, "failed"); assert.equal(crash.errorCode, "server_exit");
   const ok = await f.finished((await f.call("codex", { requestId: "ok", prompt: "hello" })).jobId);
@@ -769,7 +897,7 @@ let settings, threadId, turnId, mode;
 const load = () => { try { return JSON.parse(readFileSync(join(root,'fake-threads.json'),'utf8')); } catch { return {}; } };
 const save = () => { const all=load(); all[threadId]=settings; writeFileSync(join(root,'fake-threads.json'),JSON.stringify(all)); };
 const catalog = [
- {model:'gpt-5.6-luna',supportedReasoningEfforts:[{reasoningEffort:'max'},{reasoningEffort:'low'}]},
+ {model:'gpt-5.6-luna',supportedReasoningEfforts:[{reasoningEffort:'max'},{reasoningEffort:'xhigh'},{reasoningEffort:'low'}]},
  {model:'gpt-5.6-terra',supportedReasoningEfforts:[{reasoningEffort:'high'}]},
 ];
 log({event:'spawn',pid:process.pid,cwd:process.cwd(),args:process.argv.slice(2)});
@@ -817,3 +945,167 @@ input.on('line',line=>{
  }
 });
 `;
+
+
+test("poll expiry cancels worktree preparation before runCodex starts", async t => {
+  const f = await fixture(t, { pollLease: 120, worktreeGitTimeout: 1000 });
+  const repoPath = await realpath(await mkdtemp(join(tmpdir(), "codex-prepare-cancel-")));
+  t.after(() => rm(repoPath, { recursive: true, force: true }));
+  await runGit(repoPath, "init");
+  await runGit(repoPath, "config", "user.name", "Test User");
+  await runGit(repoPath, "config", "user.email", "test@example.com");
+  const slowFilter = join(repoPath, "slow-filter.mjs");
+  await writeFile(slowFilter, '#!/usr/bin/env node\nprocess.stdin.resume(); setInterval(() => {}, 1000);\n');
+  await chmod(slowFilter, 0o755);
+  await runGit(repoPath, "config", "filter.slow.clean", "cat");
+  await runGit(repoPath, "config", "filter.slow.smudge", slowFilter);
+  await runGit(repoPath, "config", "filter.slow.required", "true");
+  await writeFile(join(repoPath, ".gitattributes"), "slow.txt filter=slow\n");
+  await writeFile(join(repoPath, "slow.txt"), "tracked\n");
+  await runGit(repoPath, "add", ".gitattributes", "slow.txt");
+  await runGit(repoPath, "commit", "-m", "slow checkout");
+
+  const accepted = await f.call("codex", {
+    requestId: "prepare-poll-expiry",
+    cwd: repoPath,
+    prompt: "must never reach model execution",
+  });
+  assert.equal(accepted.workspaceKind, "worktree");
+  assert.ok(accepted.jobId);
+  await delay(350);
+  const result = await f.finished(accepted.jobId);
+  assert.equal(result.status, "cancelled");
+  assert.equal(result.errorCode, "polling_expired");
+  assert.equal(typeof accepted.leaseExpiresAt, "number");
+  assert.equal(typeof result.finishedAt, "number");
+  assert.ok(result.finishedAt - accepted.leaseExpiresAt < 2500, "expiry-to-terminal cancellation must settle promptly");
+  assert.equal((await f.records()).filter(record => record.method === "turn/start").length, 0);
+  const state = JSON.parse(await readFile(join(f.root, "worktrees.json"), "utf8"));
+  const record = state.records.find(value => value.id === accepted.worktreeId);
+  assert.notEqual(record.state, "creating");
+  if (record.state === "failed") assert.equal(record.errorCode, "worktree_cancelled");
+});
+
+test("shutdown waits for in-flight worktree preparation cleanup", async t => {
+  const f = await fixture(t, { worktreeGitTimeout: 5000 });
+  const repoPath = await realpath(await mkdtemp(join(tmpdir(), "codex-shutdown-prepare-")));
+  t.after(() => rm(repoPath, { recursive: true, force: true }));
+  await runGit(repoPath, "init");
+  await runGit(repoPath, "config", "user.name", "Test User");
+  await runGit(repoPath, "config", "user.email", "test@example.com");
+  const started = join(repoPath, "shutdown-filter-started");
+  const slowFilter = join(repoPath, "shutdown-filter.mjs");
+  await writeFile(slowFilter, `#!/usr/bin/env node\nimport { writeFileSync } from "node:fs";\nwriteFileSync(${JSON.stringify(started)}, String(process.pid));\nprocess.stdin.resume();\nprocess.on("SIGTERM", () => {});\nsetInterval(() => {}, 1000);\n`);
+  await chmod(slowFilter, 0o755);
+  await runGit(repoPath, "config", "filter.slow.clean", "cat");
+  await runGit(repoPath, "config", "filter.slow.smudge", slowFilter);
+  await runGit(repoPath, "config", "filter.slow.required", "true");
+  await writeFile(join(repoPath, ".gitattributes"), "slow.txt filter=slow\n");
+  await writeFile(join(repoPath, "slow.txt"), "tracked\n");
+  await runGit(repoPath, "add", ".gitattributes", "slow.txt");
+  await runGit(repoPath, "commit", "-m", "slow shutdown checkout");
+
+  const accepted = await f.call("codex", {
+    requestId: "shutdown-during-prepare", cwd: repoPath, prompt: "must never reach model execution",
+  });
+  let filterPid;
+  for (let i = 0; i < 200; i++) {
+    try { filterPid = Number(await readFile(started, "utf8")); break; }
+    catch { await delay(10); }
+  }
+  assert.ok(Number.isSafeInteger(filterPid) && filterPid > 0, "slow Git filter never started");
+
+  await f.stop();
+  assert.throws(() => process.kill(filterPid, 0), /ESRCH/);
+  const state = JSON.parse(await readFile(join(f.root, "worktrees.json"), "utf8"));
+  const record = state.records.find(value => value.id === accepted.worktreeId);
+  assert.notEqual(record.state, "creating");
+  assert.equal(record.state, "failed");
+  assert.equal(record.errorCode, "worktree_cancelled");
+  const job = JSON.parse(await readFile(join(f.root, "jobs", `${accepted.jobId}.json`), "utf8"));
+  assert.equal(job.status, "interrupted");
+  assert.notEqual(job.status, "cancelling");
+});
+
+test("foreground rejection and monitor restore re-arm paused worktree pruning", async t => {
+  const testRoot = await realpath(await mkdtemp(join(tmpdir(), "codex-prune-rearm-")));
+  t.after(() => rm(testRoot, { recursive: true, force: true }));
+  const sourceRepo = join(testRoot, "source");
+  const rejectedRepo = join(testRoot, "rejected");
+  const gitPath = process.env.PATH.split(":").map(directory => join(directory, "git")).find(existsSync);
+  assert.ok(gitPath, "test requires a real Git executable");
+  for (const path of [sourceRepo, rejectedRepo]) {
+    await mkdir(path);
+    await runGit(path, "init");
+    await runGit(path, "config", "user.name", "Test User");
+    await runGit(path, "config", "user.email", "test@example.com");
+    await writeFile(join(path, "tracked.txt"), `${path}\n`);
+    await runGit(path, "add", "tracked.txt");
+    await runGit(path, "commit", "-m", "initial");
+  }
+
+  const pruneStarted = join(testRoot, "prune-started");
+  const wrapperDir = join(testRoot, "git-wrapper");
+  await mkdir(wrapperDir);
+  const gitWrapper = join(wrapperDir, "git");
+  await writeFile(gitWrapper, `#!/usr/bin/env node
+import { existsSync, writeFileSync } from "node:fs";
+import { spawn } from "node:child_process";
+const args = process.argv.slice(2);
+if (args.includes("bundle") && args.includes("create") && !existsSync(${JSON.stringify(pruneStarted)})) {
+  writeFileSync(${JSON.stringify(pruneStarted)}, "started");
+  process.on("SIGTERM", () => {});
+  setInterval(() => {}, 1000);
+} else if (args[0] === "-C" && args[1] === ${JSON.stringify(rejectedRepo)} && args[2] === "rev-parse" && args.includes("--git-common-dir")) {
+  process.stderr.write("fixture rejected Git inspection");
+  process.exit(7);
+} else {
+  const child = spawn(${JSON.stringify(gitPath)}, args, { stdio: "inherit", env: { ...process.env, PATH: ${JSON.stringify(process.env.PATH)} } });
+  child.once("error", error => { process.stderr.write(error.message); process.exit(1); });
+  child.once("exit", (code, signal) => signal ? process.kill(process.pid, signal) : process.exit(code ?? 1));
+}
+`);
+  await chmod(gitWrapper, 0o755);
+
+  const f = await fixture(t, {
+    path: wrapperDir,
+    worktreeRetention: 1,
+    worktreePruneBatch: 1,
+    worktreeGitTimeout: 5000,
+  });
+  const readWorktrees = async () => JSON.parse(await readFile(join(f.root, "worktrees.json"), "utf8")).records;
+  const waitFor = async (predicate, message) => {
+    const deadline = Date.now() + 8000;
+    while (Date.now() < deadline) {
+      if (await predicate()) return;
+      await delay(25);
+    }
+    assert.fail(`${message}: ${JSON.stringify(await readWorktrees())}`);
+  };
+
+  const first = await f.finished((await f.call("codex", {
+    requestId: "prune-rearm-first", cwd: sourceRepo, prompt: "hello",
+  })).jobId);
+  const second = await f.finished((await f.call("codex", {
+    requestId: "prune-rearm-second", cwd: sourceRepo, prompt: "hello",
+  })).jobId);
+  await waitFor(async () => readFile(pruneStarted).then(() => true, () => false), "background prune did not start");
+
+  const rejected = await f.call("codex", {
+    requestId: "prune-rearm-rejected", cwd: rejectedRepo, prompt: "hello",
+  });
+  assert.equal(rejected.status, "error");
+  assert.equal(rejected.errorCode, "worktree_git_failed");
+  await waitFor(async () => (await readWorktrees()).find(record => record.id === first.worktreeId)?.state === "snapshotted",
+    "pruning was not re-armed after foreground rejection");
+
+  const restored = await f.rpc({
+    jsonrpc: "2.0", id: "restore-pruned", method: "localCodex/worktreeRestore", params: { jobId: first.jobId },
+  });
+  assert.equal(restored.result.worktreeState, "ready");
+  await waitFor(async () => {
+    const records = await readWorktrees();
+    return records.find(record => record.id === first.worktreeId)?.state === "ready" &&
+      records.find(record => record.id === second.worktreeId)?.state === "snapshotted";
+  }, "pruning was not re-armed after monitor restore");
+});

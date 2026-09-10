@@ -31,11 +31,7 @@ const gitAcceptance = args.includes("--test-git-acceptance") ? {
   status: runGit(["status", "--short"]),
 } : null;
 const zshHeredoc = args.includes("--test-zsh-heredoc") ? (() => {
-  // The production path is zsh on macOS. The generic Linux unit job does not
-  // guarantee /bin/zsh, so retain the heredoc/environment assertion there
-  // with POSIX sh. Dedicated native macOS tests below still exercise zsh.
-  const shell = existsSync("/bin/zsh") ? "/bin/zsh" : "/bin/sh";
-  const result = spawnSync(shell, ["-c", "cat <<'EOF'\nHEREDOC_OK\nEOF"], {
+  const result = spawnSync("/bin/zsh", ["-c", "cat <<'EOF'\nHEREDOC_OK\nEOF"], {
     encoding: "utf8",
     env: process.env,
   });
