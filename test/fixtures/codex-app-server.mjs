@@ -11,7 +11,7 @@ const db = existsSync(stateFile) ? JSON.parse(readFileSync(stateFile, "utf8")) :
 let thread;
 const send = value => process.stdout.write(`${JSON.stringify(value)}\n`);
 const reply = (id, result) => send({ id, result });
-const models = ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"].map(model => ({
+const models = ["gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"].map(model => ({
   id: model, model,
   defaultReasoningEffort: "medium",
   supportedReasoningEfforts: ["low", "medium", "high", "xhigh", "max"].map(reasoningEffort => ({ reasoningEffort })),
