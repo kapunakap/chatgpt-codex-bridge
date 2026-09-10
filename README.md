@@ -233,6 +233,8 @@ v3.5.1 repairs local Git inside network-disabled macOS jobs. Normal jobs receive
 
 v3.5.2 makes the network-disabled macOS profile constant-size, intentionally broadens user-home reads to avoid recursive sibling enumeration, and sets zsh's `TMPPREFIX` to the authorized per-job scratch directory. The workspace write boundary, fixed credential denies, control-state deny, and temporary-tree denial remain in place.
 
+v3.5.3 fixes stale terminal worktree recovery; PR #19 fixes worktree-prune admission, GC preemption, bounded timeouts, and admission coalescing, eliminating ~120s admission stalls under large backlogs; PR #20 verifies bundles outside a repository cwd; PR #22 makes the zsh heredoc assertion macOS-only for CI portability; and PR #23 adds model/reasoning ceilings with Luna/xhigh defaults.
+
 The current `main` behavior additionally makes host approvals optional through `LOCAL_CODEX_APPROVAL_MODE=off|host`, defaulting to `off`. Network-enabled jobs remain terminal-like for host reads and developer authentication; network-disabled jobs remain hardened and the tunnel's own runtime/control variables stay filtered. It also adds optional exact `sourceTitle` metadata, Codex-name/prompt fallbacks in the monitor, and guarded `o` handoff to `codex resume` for terminal jobs. Refresh Local Codex's tools and use a fresh ChatGPT conversation before expecting `sourceTitle` in the tool schema.
 
 ### If ChatGPT reports missing `requestId` or `cwd`
