@@ -91,7 +91,7 @@ test("falls back to direct mode for disabled, non-Git, and unborn repositories",
   assert.equal(unbornResult.reason, "unborn_head");
 });
 
-test("retention snapshots Git-visible work and declared setup, then restores after source deletion", async t => {
+test("retention snapshots and restores from a non-repository process cwd after source deletion", async t => {
   const f = await repository(t);
   const manager = await createWorktreeManager({ rootDir: f.rootDir, stateDir: f.stateDir, retention: 1 });
   await manager.plan({ id: firstId, sourceCwd: f.repo });
@@ -107,6 +107,11 @@ test("retention snapshots Git-visible work and declared setup, then restores aft
   await manager.plan({ id: secondId, sourceCwd: f.repo });
   await manager.prepare(secondId);
   await manager.bindThread(secondId, "thread-2");
+  const originalCwd = process.cwd();
+  const runtimeCwd = join(f.temp, "runtime-cwd");
+  await mkdir(runtimeCwd);
+  process.chdir(runtimeCwd);
+  t.after(() => process.chdir(originalCwd));
   const pruned = await manager.prune(new Set());
   assert.deepEqual(pruned.map(record => record.id), [firstId]);
   assert.deepEqual(pruned.attemptedIds, [firstId]);

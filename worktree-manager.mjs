@@ -331,7 +331,7 @@ class WorktreeManager {
       await git(["-C", record.worktreeRoot, "update-ref", snapshotRef, snapshotCommit]);
       const bundle = join(temporary, "snapshot.bundle");
       await git(["-C", record.worktreeRoot, "bundle", "create", bundle, snapshotRef]);
-      await git(["bundle", "verify", bundle]);
+      await this.verifyBundle(bundle, { signal });
       await chmod(bundle, 0o600);
       const overlay = join(temporary, "overlay");
       await mkdir(overlay, { recursive: true, mode: 0o700 });
@@ -372,6 +372,17 @@ class WorktreeManager {
     }
   }
 
+  async verifyBundle(bundle, { signal } = {}) {
+    throwIfAborted(signal);
+    const verificationRepo = await mkdtemp(join(this.snapshotsDir, ".bundle-verify-"));
+    try {
+      await this.git(["-C", verificationRepo, "init", "--bare"], { signal });
+      await this.git(["-C", verificationRepo, "bundle", "verify", bundle], { signal });
+    } finally {
+      await rm(verificationRepo, { recursive: true, force: true });
+    }
+  }
+
   async restoreRecord(record, { signal } = {}) {
     throwIfAborted(signal);
     const git = (args, options = {}) => this.git(args, { ...options, signal });
@@ -382,7 +393,7 @@ class WorktreeManager {
       throw coded("worktree_snapshot_invalid", "Worktree snapshot checksum mismatch");
     }
     throwIfAborted(signal);
-    await git(["bundle", "verify", record.snapshotBundle]);
+    await this.verifyBundle(record.snapshotBundle, { signal });
     await mkdir(dirname(record.worktreeRoot), { recursive: true, mode: 0o700 });
     if (await pathExists(record.worktreeRoot)) {
       if (!this.ownsPath(record.worktreeRoot)) throw coded("worktree_path_invalid", "Refusing unmanaged restore path");
