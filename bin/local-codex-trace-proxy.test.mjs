@@ -55,7 +55,6 @@ async function fakeAdapter(port) {
         jobId: "job-1", status: "starting", cwd: "/tmp/local-codex-worktree-job-1",
         sourceCwd: "/tmp/source", threadId: null, turnId: null,
         model: null, reasoningEffort: null, networkAccess: false, browserAccess: false,
-        adapterVersion: "3.5.2", schemaFingerprint: "schema-test",
       });
     } else if (message.method === "tools/call" && message.params?.name === "codex-status") {
       statusCount += 1;
@@ -63,12 +62,11 @@ async function fakeAdapter(port) {
         jobId: "job-1", status: "running", cwd: "/tmp/local-codex-worktree-job-1",
         sourceCwd: "/tmp/source", threadId: "thread-1", turnId: "turn-1",
         model: "gpt-5.6-luna", reasoningEffort: "max", networkAccess: false, browserAccess: false,
-        adapterVersion: "3.5.2", schemaFingerprint: "schema-test",
       } : {
         jobId: "job-1", status: "completed", cwd: "/tmp/local-codex-worktree-job-1",
         sourceCwd: "/tmp/source", threadId: "thread-1", turnId: "turn-1",
         model: "gpt-5.6-luna", reasoningEffort: "max", networkAccess: false, browserAccess: false,
-        content: "LOCAL_CODEX_CANARY_OK", finishedAt: Date.now(), adapterVersion: "3.5.2", schemaFingerprint: "schema-test",
+        content: "LOCAL_CODEX_CANARY_OK", finishedAt: Date.now(),
       });
     } else body = result(message.id, { status: "error", errorCode: "invalid_request" });
     res.writeHead(200, { "Content-Type": "application/json", "Mcp-Session-Id": "local-codex" });
@@ -140,9 +138,16 @@ test("proxy correlates submit, polling, terminal receipt, and schema without pro
   assert.equal(receipt.status, "ok");
   assert.equal(receipt.pass, true);
   assert.equal(receipt.traceId, submit.traceId);
+  assert.equal(receipt.bridge.adapterVersion, "3.5.2");
+  assert.equal(receipt.bridge.schemaFingerprint, "schema-test");
+  assert.ok(receipt.observedStages.includes("mcp.request.received"));
+  assert.ok(receipt.observedStages.includes("mcp.request.validated"));
   assert.ok(receipt.observedStages.includes("status.poll.received"));
   assert.ok(receipt.observedStages.includes("job.result.persisted"));
   assert.ok(receipt.observedStages.includes("job.terminal.observed"));
+  const receiptText = JSON.stringify(receipt);
+  assert.equal(receiptText.includes("SECRET_PROMPT_NEVER_LOG"), false);
+  assert.equal(receiptText.includes("/tmp/source"), false);
 
   const log = await readFile(store.logFile, "utf8");
   assert.equal(log.includes("SECRET_PROMPT_NEVER_LOG"), false);

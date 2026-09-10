@@ -268,7 +268,7 @@ export class TraceStore {
   async receipt(jobId) {
     const record = await this.loadJobTrace(jobId);
     if (!record) return null;
-    const events = await this.readEvents({ traceId: record.traceId, jobId });
+    const events = await this.readEvents({ traceId: record.traceId });
     const byEvent = new Map();
     for (const event of events) if (!byEvent.has(event.event)) byEvent.set(event.event, event);
     const started = events[0]?.time ?? null;

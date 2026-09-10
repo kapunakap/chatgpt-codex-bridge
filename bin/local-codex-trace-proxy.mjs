@@ -391,6 +391,15 @@ export async function createTraceProxy(options = {}) {
       const snapshot = extractStructured(response);
 
       if (["codex", "codex-reply"].includes(tool) && snapshot?.jobId) {
+        let adapterVersion = snapshot.adapterVersion;
+        let schemaFingerprint = snapshot.schemaFingerprint;
+        if (!adapterVersion || !schemaFingerprint) {
+          try {
+            const ready = await adapterJson("/readyz");
+            if (!adapterVersion && typeof ready.body?.version === "string") adapterVersion = ready.body.version;
+            if (!schemaFingerprint && typeof ready.body?.schemaFingerprint === "string") schemaFingerprint = ready.body.schemaFingerprint;
+          } catch {}
+        }
         const fp = typeof snapshot.cwd === "string" ? folderFingerprint(snapshot.cwd) : undefined;
         const createdAt = Date.now();
         jobRecord = traceStore.saveJobTrace(snapshot.jobId, {
@@ -402,7 +411,7 @@ export async function createTraceProxy(options = {}) {
           source: "proxy", event: "job.accepted", traceId, requestTraceId, jobId: snapshot.jobId, tool,
           status: snapshot.status, folderFingerprint: fp, model: snapshot.model, reasoningEffort: snapshot.reasoningEffort,
           networkAccess: snapshot.networkAccess, browserAccess: snapshot.browserAccess,
-          stageDurationMs: Date.now() - requestStartedAt, adapterVersion: snapshot.adapterVersion, schemaFingerprint: snapshot.schemaFingerprint, bridgeVersion: BRIDGE_VERSION, sourceCommit,
+          stageDurationMs: Date.now() - requestStartedAt, adapterVersion, schemaFingerprint, bridgeVersion: BRIDGE_VERSION, sourceCommit,
         });
         if (snapshot.status === "queued") traceStore.append({ source: "proxy", event: "job.queued", traceId, jobId: snapshot.jobId, tool, status: snapshot.status, folderFingerprint: fp });
         if (["starting", "running"].includes(snapshot.status)) traceStore.append({ source: "proxy", event: "job.started", traceId, jobId: snapshot.jobId, tool, status: snapshot.status, folderFingerprint: fp });
