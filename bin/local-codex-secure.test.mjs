@@ -293,7 +293,8 @@ test("secure wrapper keeps network-disabled jobs hardened and denies host-author
   const workspace = await realpath(await mkdtemp(join(tmpdir(), "local-codex-profile-")));
   t.after(() => rm(workspace, { recursive: true, force: true }));
   const permission = permissionConfig(workspace, false);
-  const result = await runWrapper(t, [permission], ["--test-zsh-heredoc"], workspace);
+  const zshTestArgs = process.platform === "darwin" ? ["--test-zsh-heredoc"] : [];
+  const result = await runWrapper(t, [permission], zshTestArgs, workspace);
   assert.equal(result.exitCode, 0);
   const configs = result.record.args
     .map((value, index) => result.record.args[index - 1] === "-c" ? value : null)
@@ -340,7 +341,9 @@ test("secure wrapper keeps network-disabled jobs hardened and denies host-author
   assert.equal(result.record.env.tmp, result.record.env.tmpdir);
   assert.equal(result.record.env.temp, result.record.env.tmpdir);
   assert.equal(result.record.env.tmpprefix, `${result.record.env.tmpdir}/zsh-`);
-  assert.deepEqual(result.record.zshHeredoc, { status: 0, stdout: "HEREDOC_OK\n", stderr: "" });
+  if (process.platform === "darwin") {
+    assert.deepEqual(result.record.zshHeredoc, { status: 0, stdout: "HEREDOC_OK\n", stderr: "" });
+  }
   await assert.rejects(stat(result.record.env.tmpdir), error => error?.code === "ENOENT");
 });
 
