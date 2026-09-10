@@ -35,7 +35,7 @@ const WORKTREE_ROOT = process.env.LOCAL_CODEX_WORKTREE_ROOT || resolve(homedir()
 const WORKTREE_RETENTION = Number(process.env.LOCAL_CODEX_WORKTREE_RETENTION || "15");
 const WORKTREE_GIT_TIMEOUT_MS = Number(process.env.LOCAL_CODEX_WORKTREE_GIT_TIMEOUT_MS || "30000");
 const WORKTREE_PRUNE_BATCH_SIZE = Number(process.env.LOCAL_CODEX_WORKTREE_PRUNE_BATCH_SIZE || "4");
-const VERSION = "3.5.2";
+const VERSION = "3.5.3";
 const MODEL_ALIASES = new Map([
   ["luna", "gpt-5.6-luna"], ["terra", "gpt-5.6-terra"], ["sol", "gpt-5.6-sol"], ["astra", "gpt-6-astra"],
 ]);
