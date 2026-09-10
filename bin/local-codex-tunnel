@@ -16,12 +16,27 @@ source "${CONFIG_FILE}"
 : "${LOCAL_CODEX_TOKEN_FILE:?LOCAL_CODEX_TOKEN_FILE is missing from ${CONFIG_FILE}}"
 : "${LOCAL_CODEX_STATE_FILE:?LOCAL_CODEX_STATE_FILE is missing from ${CONFIG_FILE}}"
 : "${LOCAL_CODEX_ADAPTER:?LOCAL_CODEX_ADAPTER is missing from ${CONFIG_FILE}}"
+: "${LOCAL_CODEX_TRACE_PROXY:?LOCAL_CODEX_TRACE_PROXY is missing from ${CONFIG_FILE}}"
+: "${LOCAL_CODEX_SECURE_BIN:?LOCAL_CODEX_SECURE_BIN is missing from ${CONFIG_FILE}}"
 : "${TUNNEL_CLIENT_PROFILE:?TUNNEL_CLIENT_PROFILE is missing from ${CONFIG_FILE}}"
 
-readonly ADAPTER_URL="http://${LOCAL_CODEX_HOST:-127.0.0.1}:${LOCAL_CODEX_PORT:-8765}"
+readonly PUBLIC_HOST="${LOCAL_CODEX_HOST:-127.0.0.1}"
+readonly PUBLIC_PORT="${LOCAL_CODEX_PORT:-8765}"
+readonly ADAPTER_HOST="${LOCAL_CODEX_ADAPTER_HOST:-127.0.0.1}"
+readonly ADAPTER_PORT="${LOCAL_CODEX_ADAPTER_PORT:-8766}"
+readonly PUBLIC_URL="http://${PUBLIC_HOST}:${PUBLIC_PORT}"
+readonly ADAPTER_URL="http://${ADAPTER_HOST}:${ADAPTER_PORT}"
 
 if [[ ! -x "${LOCAL_CODEX_ADAPTER}" ]]; then
   print -u2 "Local Codex adapter is not installed: ${LOCAL_CODEX_ADAPTER}"
+  exit 1
+fi
+if [[ ! -x "${LOCAL_CODEX_TRACE_PROXY}" ]]; then
+  print -u2 "Local Codex trace proxy is not installed: ${LOCAL_CODEX_TRACE_PROXY}"
+  exit 1
+fi
+if [[ ! -x "${LOCAL_CODEX_SECURE_BIN}" ]]; then
+  print -u2 "Local Codex secure wrapper is not installed: ${LOCAL_CODEX_SECURE_BIN}"
   exit 1
 fi
 if [[ ! -r "${LOCAL_CODEX_TOKEN_FILE}" ]]; then
@@ -41,18 +56,31 @@ LOCAL_CODEX_WORKTREE_ROOT="${LOCAL_CODEX_WORKTREE_ROOT:-${USER_HOME}/Library/App
 LOCAL_CODEX_WORKTREE_RETENTION="${LOCAL_CODEX_WORKTREE_RETENTION:-15}" \
 LOCAL_CODEX_APPROVAL_MODE="${LOCAL_CODEX_APPROVAL_MODE:-off}" \
 LOCAL_CODEX_LOG_FILE="${LOCAL_CODEX_LOG_FILE:-${USER_HOME}/Library/Application Support/tunnel-client/logs/local-codex.log}" \
+LOCAL_CODEX_TRACE_LOG_FILE="${LOCAL_CODEX_TRACE_LOG_FILE:-${LOCAL_CODEX_STATE_FILE:h}/trace-events.jsonl}" \
+LOCAL_CODEX_TRACE_STATE_DIR="${LOCAL_CODEX_TRACE_STATE_DIR:-${LOCAL_CODEX_STATE_FILE:h}/traces}" \
+LOCAL_CODEX_TRACE_LOG_MAX_BYTES="${LOCAL_CODEX_TRACE_LOG_MAX_BYTES:-5242880}" \
+LOCAL_CODEX_TRACE_LOG_ROTATIONS="${LOCAL_CODEX_TRACE_LOG_ROTATIONS:-3}" \
+LOCAL_CODEX_BRIDGE_SOURCE_COMMIT="${LOCAL_CODEX_BRIDGE_SOURCE_COMMIT:-unknown}" \
 LOCAL_CODEX_CALL_TIMEOUT_MS="${LOCAL_CODEX_CALL_TIMEOUT_MS:-1800000}" \
 LOCAL_CODEX_POLL_LEASE_MS="${LOCAL_CODEX_POLL_LEASE_MS:-90000}" \
 LOCAL_CODEX_MODEL_CEILING="${LOCAL_CODEX_MODEL_CEILING:-luna}" \
 LOCAL_CODEX_REASONING_CEILING="${LOCAL_CODEX_REASONING_CEILING:-xhigh}" \
-LOCAL_CODEX_HOST="${LOCAL_CODEX_HOST:-127.0.0.1}" \
-LOCAL_CODEX_PORT="${LOCAL_CODEX_PORT:-8765}" \
-LOCAL_CODEX_BIN="${LOCAL_CODEX_BIN:-codex}" \
+LOCAL_CODEX_MAX_CONCURRENCY="${LOCAL_CODEX_MAX_CONCURRENCY:-10}" \
+LOCAL_CODEX_MAX_QUEUE="${LOCAL_CODEX_MAX_QUEUE:-100}" \
+LOCAL_CODEX_HOST="${ADAPTER_HOST}" \
+LOCAL_CODEX_PORT="${ADAPTER_PORT}" \
+LOCAL_CODEX_BIN="${LOCAL_CODEX_BIN:-${LOCAL_CODEX_SECURE_BIN}}" \
+LOCAL_CODEX_SECURE_BIN="${LOCAL_CODEX_SECURE_BIN}" \
 LOCAL_CODEX_REAL_BIN="${LOCAL_CODEX_REAL_BIN:-codex}" \
 "${LOCAL_CODEX_ADAPTER}" &
 adapter_pid=$!
 
+trace_proxy_pid=""
 cleanup() {
+  if [[ -n "${trace_proxy_pid}" ]]; then
+    kill "${trace_proxy_pid}" 2>/dev/null || true
+    wait "${trace_proxy_pid}" 2>/dev/null || true
+  fi
   kill "${adapter_pid}" 2>/dev/null || true
   wait "${adapter_pid}" 2>/dev/null || true
 }
@@ -71,6 +99,38 @@ done
 
 if ! /usr/bin/curl -fsS "${ADAPTER_URL}/readyz" >/dev/null; then
   print -u2 "Local Codex adapter did not become ready"
+  exit 1
+fi
+
+LOCAL_CODEX_TOKEN_FILE="${LOCAL_CODEX_TOKEN_FILE}" \
+LOCAL_CODEX_STATE_FILE="${LOCAL_CODEX_STATE_FILE}" \
+LOCAL_CODEX_TRACE_LOG_FILE="${LOCAL_CODEX_TRACE_LOG_FILE:-${LOCAL_CODEX_STATE_FILE:h}/trace-events.jsonl}" \
+LOCAL_CODEX_TRACE_STATE_DIR="${LOCAL_CODEX_TRACE_STATE_DIR:-${LOCAL_CODEX_STATE_FILE:h}/traces}" \
+LOCAL_CODEX_TRACE_LOG_MAX_BYTES="${LOCAL_CODEX_TRACE_LOG_MAX_BYTES:-5242880}" \
+LOCAL_CODEX_TRACE_LOG_ROTATIONS="${LOCAL_CODEX_TRACE_LOG_ROTATIONS:-3}" \
+LOCAL_CODEX_BRIDGE_SOURCE_COMMIT="${LOCAL_CODEX_BRIDGE_SOURCE_COMMIT:-unknown}" \
+LOCAL_CODEX_HOST="${PUBLIC_HOST}" \
+LOCAL_CODEX_PORT="${PUBLIC_PORT}" \
+LOCAL_CODEX_ADAPTER_HOST="${ADAPTER_HOST}" \
+LOCAL_CODEX_ADAPTER_PORT="${ADAPTER_PORT}" \
+LOCAL_CODEX_REAL_BIN="${LOCAL_CODEX_REAL_BIN:-codex}" \
+LOCAL_CODEX_TUNNEL_HEALTH_URL_FILE="${LOCAL_CODEX_TUNNEL_HEALTH_URL_FILE:-}" \
+"${LOCAL_CODEX_TRACE_PROXY}" &
+trace_proxy_pid=$!
+
+for _ in {1..50}; do
+  if /usr/bin/curl -fsS "${PUBLIC_URL}/readyz" >/dev/null 2>&1; then
+    break
+  fi
+  if ! kill -0 "${trace_proxy_pid}" 2>/dev/null; then
+    print -u2 "Local Codex trace proxy stopped during startup"
+    exit 1
+  fi
+  sleep 0.1
+done
+
+if ! /usr/bin/curl -fsS "${PUBLIC_URL}/readyz" >/dev/null; then
+  print -u2 "Local Codex trace proxy did not become ready"
   exit 1
 fi
 
