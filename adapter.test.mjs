@@ -47,6 +47,8 @@ async function fixture(t, options = {}) {
     LOCAL_CODEX_WORKTREE_PRUNE_BATCH_SIZE: String(options.worktreePruneBatch ?? 4),
     LOCAL_CODEX_BIN: options.missingBin ? join(root, "missing") : fake, LOCAL_CODEX_CALL_TIMEOUT_MS: String(options.timeout || 10000),
     LOCAL_CODEX_POLL_LEASE_MS: String(options.pollLease ?? 90000),
+    LOCAL_CODEX_MODEL_CEILING: options.modelCeiling ?? "luna",
+    LOCAL_CODEX_REASONING_CEILING: options.reasoningCeiling ?? "xhigh",
     LOCAL_CODEX_MAX_CONCURRENCY: String(options.maxConcurrency ?? 10), LOCAL_CODEX_MAX_QUEUE: String(options.maxQueue ?? 100),
     FAKE_ROOT: root, TEST_DENY_GROUP_PROBE: options.deniedGroupProbe ? "1" : "0",
     ...(options.path ? { PATH: `${options.path}:${process.env.PATH}` } : {}),
@@ -196,7 +198,7 @@ test("durable immediate acceptance, duplicate retries, same-folder queueing, and
   assert.equal((await f.call("codex-status", { jobId, waitMs: 20001 })).errorCode, "invalid_wait");
   const result = await f.finished(jobId);
   assert.equal(result.content, "FINAL_OK"); assert.equal(result.status, "completed");
-  assert.equal(result.model, "gpt-5.6-luna"); assert.equal(result.reasoningEffort, "max");
+  assert.equal(result.model, "gpt-5.6-luna"); assert.equal(result.reasoningEffort, "xhigh");
   assert.equal(result.networkAccess, false);
   assert.equal(result.workspaceKind, "direct"); assert.equal(result.worktreeReason, "non_git");
   assert.equal(result.sourceCwd, f.root); assert.equal(result.cwd, f.root);
@@ -542,7 +544,7 @@ test("stale schemas return actionable errors, never start work, and log only sch
 });
 
 test("defaults, overrides, resumed settings, unsupported settings, and safe logs", async t => {
-  const f = await fixture(t);
+  const f = await fixture(t, { modelCeiling: "sol", reasoningCeiling: "max" });
   const first = await f.finished((await f.call("codex", { requestId: "a", prompt: "hello", model: "terra", reasoningEffort: "high" })).jobId);
   assert.equal(first.model, "gpt-5.6-terra"); assert.equal(first.reasoningEffort, "high");
   await f.stop(); await f.start();
@@ -895,7 +897,7 @@ let settings, threadId, turnId, mode;
 const load = () => { try { return JSON.parse(readFileSync(join(root,'fake-threads.json'),'utf8')); } catch { return {}; } };
 const save = () => { const all=load(); all[threadId]=settings; writeFileSync(join(root,'fake-threads.json'),JSON.stringify(all)); };
 const catalog = [
- {model:'gpt-5.6-luna',supportedReasoningEfforts:[{reasoningEffort:'max'},{reasoningEffort:'low'}]},
+ {model:'gpt-5.6-luna',supportedReasoningEfforts:[{reasoningEffort:'max'},{reasoningEffort:'xhigh'},{reasoningEffort:'low'}]},
  {model:'gpt-5.6-terra',supportedReasoningEfforts:[{reasoningEffort:'high'}]},
 ];
 log({event:'spawn',pid:process.pid,cwd:process.cwd(),args:process.argv.slice(2)});
