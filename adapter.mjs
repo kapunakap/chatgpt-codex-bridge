@@ -1159,8 +1159,11 @@ async function loadJobs() {
     if (!["none", "official_codex"].includes(job.browserBackend)) throw new Error("Invalid job browser backend");
     if (job.sourceTitle !== undefined) job.sourceTitle = validatePersistedTitle(job.sourceTitle, "job source title");
     if (job.codexThreadName !== undefined) job.codexThreadName = validatePersistedTitle(job.codexThreadName, "job Codex thread name");
+    let normalizedStaleTerminalThread = false;
     if (job.threadId && threadFolders.has(job.threadId) && threadFolders.get(job.threadId) !== job.cwd) {
-      throw new Error("Job and thread folder mismatch");
+      if (!terminalStatuses.has(job.status)) throw new Error("Job and thread folder mismatch");
+      job.threadId = null;
+      normalizedStaleTerminalThread = true;
     }
     if (job.threadId && job.sourceTitle && !threadSourceTitles.has(job.threadId)) {
       threadSourceTitles.set(job.threadId, job.sourceTitle);
@@ -1178,7 +1181,7 @@ async function loadJobs() {
       job.finishedAt = Date.now();
       persistJob(job);
     }
-    if (normalizedStaleTerminalWorktree) persistJob(job);
+    if (normalizedStaleTerminalWorktree || normalizedStaleTerminalThread) persistJob(job);
     if (job.worktreeId) {
       const record = worktreeManager.get(job.worktreeId);
       if (terminalStatuses.has(job.status) && record && ["planned", "creating", "failed"].includes(record.state)) {
