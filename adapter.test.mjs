@@ -116,7 +116,7 @@ test("discovery, authentication, schemas, and validation", async t => {
   assert.equal(discover.error.code, -32601);
   const initialized = await f.rpc({ jsonrpc: "2.0", id: "i", method: "initialize", params: { protocolVersion: "2025-11-25" } });
   assert.equal(initialized.result.protocolVersion, "2025-11-25");
-  assert.equal(initialized.result.serverInfo.version, "3.5.3");
+  assert.equal(initialized.result.serverInfo.version, "3.6.0");
   const listed = await f.rpc({ jsonrpc: "2.0", id: "l", method: "tools/list" });
   assert.deepEqual(listed.result.tools.map(t => t.name), ["codex", "codex-reply", "codex-status", "codex-cancel", "codex-browser-status", "codex-folders"]);
   const browserStatus = listed.result.tools.find(t => t.name === "codex-browser-status");
@@ -461,6 +461,69 @@ test("terminal jobs normalize stale removed worktrees during restart", async t =
   assert.equal(persisted.worktreeState, undefined);
   assert.equal(persisted.gitCommonDir, undefined);
   assert.equal(await readFile(eventPath, "utf8"), eventHistory);
+});
+
+test("terminal jobs detach from mismatched thread folders during restart", async t => {
+  const f = await fixture(t);
+  const historicalCwd = await realpath(await mkdtemp(join(tmpdir(), "codex-terminal-thread-history-")));
+  const pinnedCwd = await realpath(await mkdtemp(join(tmpdir(), "codex-terminal-thread-pinned-")));
+  t.after(() => Promise.all([
+    rm(historicalCwd, { recursive: true, force: true }),
+    rm(pinnedCwd, { recursive: true, force: true }),
+  ]));
+
+  const completed = await f.finished((await f.call("codex", {
+    requestId: "terminal-thread-folder-mismatch", cwd: historicalCwd, worktree: false, prompt: "hello",
+  })).jobId);
+  assert.equal(completed.status, "completed");
+  assert.equal(completed.workspaceKind, "direct");
+
+  const jobPath = join(f.root, "jobs", `${completed.jobId}.json`);
+  const before = JSON.parse(await readFile(jobPath, "utf8"));
+  const statePath = join(f.root, "threads.json");
+  const state = JSON.parse(await readFile(statePath, "utf8"));
+  state.threadCwds[completed.threadId] = pinnedCwd;
+  await writeFile(statePath, JSON.stringify(state) + "\n", { mode: 0o600 });
+
+  await f.stop();
+  await f.start();
+  const recovered = await f.call("codex-status", { jobId: completed.jobId });
+  assert.equal(recovered.status, "completed");
+  assert.equal(recovered.content, "FINAL_OK");
+  assert.equal(recovered.cwd, historicalCwd);
+  assert.equal(recovered.sourceCwd, historicalCwd);
+  assert.equal(recovered.workspaceKind, before.workspaceKind);
+  assert.equal(recovered.threadId, null);
+
+  const persisted = JSON.parse(await readFile(jobPath, "utf8"));
+  assert.equal(persisted.status, before.status);
+  assert.equal(persisted.content, before.content);
+  assert.equal(persisted.cwd, historicalCwd);
+  assert.equal(persisted.sourceCwd, historicalCwd);
+  assert.equal(persisted.workspaceKind, before.workspaceKind);
+  assert.equal(persisted.threadId, null);
+});
+
+test("non-terminal jobs with mismatched thread folders still fail closed", async t => {
+  const f = await fixture(t);
+  const historicalCwd = await realpath(await mkdtemp(join(tmpdir(), "codex-active-thread-history-")));
+  const pinnedCwd = await realpath(await mkdtemp(join(tmpdir(), "codex-active-thread-pinned-")));
+  t.after(() => Promise.all([
+    rm(historicalCwd, { recursive: true, force: true }),
+    rm(pinnedCwd, { recursive: true, force: true }),
+  ]));
+
+  const active = await f.call("codex", {
+    requestId: "active-thread-folder-mismatch", cwd: historicalCwd, worktree: false, prompt: "hold",
+  });
+  const started = await f.started(active.jobId);
+  await f.stop("SIGKILL");
+
+  const statePath = join(f.root, "threads.json");
+  const state = JSON.parse(await readFile(statePath, "utf8"));
+  state.threadCwds[started.threadId] = pinnedCwd;
+  await writeFile(statePath, JSON.stringify(state) + "\n", { mode: 0o600 });
+  await assert.rejects(f.start(), /job recovery failed; refusing work|adapter exited 1/);
 });
 
 test("non-terminal jobs still fail closed when their managed worktree is missing", async t => {

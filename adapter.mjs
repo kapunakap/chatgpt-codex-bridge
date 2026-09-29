@@ -35,7 +35,7 @@ const WORKTREE_ROOT = process.env.LOCAL_CODEX_WORKTREE_ROOT || resolve(homedir()
 const WORKTREE_RETENTION = Number(process.env.LOCAL_CODEX_WORKTREE_RETENTION || "15");
 const WORKTREE_GIT_TIMEOUT_MS = Number(process.env.LOCAL_CODEX_WORKTREE_GIT_TIMEOUT_MS || "30000");
 const WORKTREE_PRUNE_BATCH_SIZE = Number(process.env.LOCAL_CODEX_WORKTREE_PRUNE_BATCH_SIZE || "4");
-const VERSION = "3.5.3";
+const VERSION = "3.6.0";
 const MODEL_ALIASES = new Map([
   ["luna", "gpt-5.6-luna"], ["terra", "gpt-5.6-terra"], ["sol", "gpt-5.6-sol"], ["astra", "gpt-6-astra"],
 ]);
@@ -1159,8 +1159,11 @@ async function loadJobs() {
     if (!["none", "official_codex"].includes(job.browserBackend)) throw new Error("Invalid job browser backend");
     if (job.sourceTitle !== undefined) job.sourceTitle = validatePersistedTitle(job.sourceTitle, "job source title");
     if (job.codexThreadName !== undefined) job.codexThreadName = validatePersistedTitle(job.codexThreadName, "job Codex thread name");
+    let normalizedStaleTerminalThread = false;
     if (job.threadId && threadFolders.has(job.threadId) && threadFolders.get(job.threadId) !== job.cwd) {
-      throw new Error("Job and thread folder mismatch");
+      if (!terminalStatuses.has(job.status)) throw new Error("Job and thread folder mismatch");
+      job.threadId = null;
+      normalizedStaleTerminalThread = true;
     }
     if (job.threadId && job.sourceTitle && !threadSourceTitles.has(job.threadId)) {
       threadSourceTitles.set(job.threadId, job.sourceTitle);
@@ -1178,7 +1181,7 @@ async function loadJobs() {
       job.finishedAt = Date.now();
       persistJob(job);
     }
-    if (normalizedStaleTerminalWorktree) persistJob(job);
+    if (normalizedStaleTerminalWorktree || normalizedStaleTerminalThread) persistJob(job);
     if (job.worktreeId) {
       const record = worktreeManager.get(job.worktreeId);
       if (terminalStatuses.has(job.status) && record && ["planned", "creating", "failed"].includes(record.state)) {
