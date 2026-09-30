@@ -88,10 +88,42 @@ test("approval mode defaults to off in launcher, installer, and example config",
   assert.match(example, /^LOCAL_CODEX_WORKTREE_ROOT=.*local-codex-worktrees$/m);
 });
 
-function run(args, executable = process.execPath) {
+test("installer Codex resolver prefers bundled executable, falls back, and preserves explicit overrides", async () => {
+  const root = fileURLToPath(new URL("..", import.meta.url));
+  const directory = await mkdtemp(join(tmpdir(), "local-codex-resolver-test-"));
+  const bundled = join(directory, "bundled codex");
+  const installer = await readFile(join(root, "scripts/install.sh"), "utf8");
+  const launcher = await readFile(join(root, "bin/local-codex-tunnel"), "utf8");
+  await writeFile(bundled, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+
+  assert.equal(await resolveCodex("codex", bundled), bundled);
+  assert.equal(await resolveCodex("codex", join(directory, "missing")), "codex");
+  assert.equal(await resolveCodex("/custom/codex", bundled), "/custom/codex");
+  assert.match(launcher, /LOCAL_CODEX_REAL_BIN="\$\{RESOLVED_CODEX_BIN\}"/);
+  assert.match(installer, /LOCAL_CODEX_REAL_BIN=%q\\n' "\$\{RESOLVED_CODEX_BIN\}"/);
+  assert.doesNotMatch(installer, /resolve_local_codex_real_bin|codex-bin\.zsh/);
+  assert.match(installer, /codex_real_bin=\$\{RESOLVED_CODEX_BIN\}/);
+  assert.match(installer, /! -x "\$\{RESOLVED_CODEX_BIN\}"/);
+});
+
+async function resolveCodex(configured, candidate) {
+  const root = fileURLToPath(new URL("..", import.meta.url));
+  const directory = await mkdtemp(join(tmpdir(), "local-codex-installer-resolver-"));
+  const key = join(directory, "unused-test-key");
+  await writeFile(key, "not-a-real-key", { mode: 0o600 });
+  const result = await run(["scripts/install.sh", "--tunnel-id", "tunnel_example", "--runtime-api-key-file", key, "--dry-run"], "/bin/zsh", {
+    cwd: root,
+    LOCAL_CODEX_BUNDLED_CODEX_CANDIDATE: candidate,
+    LOCAL_CODEX_REAL_BIN: configured,
+  });
+  return result.match(/^codex_real_bin=(.*)$/m)?.[1];
+}
+
+function run(args, executable = process.execPath, options = {}) {
   return new Promise((resolve, reject) => {
     const child = spawn(executable, args, {
-      cwd: fileURLToPath(new URL("..", import.meta.url)),
+      cwd: options.cwd || fileURLToPath(new URL("..", import.meta.url)),
+      env: { ...process.env, ...Object.fromEntries(Object.entries(options).filter(([key]) => key !== "cwd")) },
       stdio: ["ignore", "pipe", "pipe"],
     });
     let stderr = "";

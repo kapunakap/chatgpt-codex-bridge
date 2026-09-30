@@ -57,7 +57,7 @@ test("job/folder trace state and receipt survive separate reads", async () => {
   store.saveJobTrace("job-1", { traceId: "trc-1", jobId: "job-1", tool: "codex", requestHash: "sha256:123", folderFingerprint: fp, createdAt: 1000 });
   store.saveFolderTrace(fp, { traceId: "trc-1", jobId: "job-1", createdAt: Date.now() });
   assert.equal((await store.loadFolderTrace(fp)).traceId, "trc-1");
-  store.append({ time: "2026-09-09T10:00:00.000Z", source: "proxy", event: "job.accepted", traceId: "trc-1", jobId: "job-1", adapterVersion: "3.6.0" });
+  store.append({ time: "2026-09-09T10:00:00.000Z", source: "proxy", event: "job.accepted", traceId: "trc-1", jobId: "job-1", adapterVersion: "3.6.1" });
   store.append({ time: "2026-09-09T10:00:01.000Z", source: "runtime", event: "codex.app_server.ready", traceId: "trc-1", jobId: "job-1", stageDurationMs: 1000 });
   store.append({ time: "2026-09-09T10:00:02.000Z", source: "runtime", event: "codex.turn.completed", traceId: "trc-1", jobId: "job-1", terminalOutcome: "completed" });
   store.append({ time: "2026-09-09T10:00:02.050Z", source: "proxy", event: "job.terminal.observed", traceId: "trc-1", jobId: "job-1", terminalOutcome: "completed", pollGapMs: 50 });
@@ -66,7 +66,7 @@ test("job/folder trace state and receipt survive separate reads", async () => {
   assert.equal(receipt.pass, true);
   assert.equal(receipt.traceId, "trc-1");
   assert.equal(receipt.terminalOutcome, "completed");
-  assert.equal(receipt.bridge.adapterVersion, "3.6.0");
+  assert.equal(receipt.bridge.adapterVersion, "3.6.1");
   assert.deepEqual(receipt.observedStages, ["job.accepted", "codex.app_server.ready", "codex.turn.completed", "job.terminal.observed"]);
 });
 
