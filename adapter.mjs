@@ -35,33 +35,37 @@ const WORKTREE_ROOT = process.env.LOCAL_CODEX_WORKTREE_ROOT || resolve(homedir()
 const WORKTREE_RETENTION = Number(process.env.LOCAL_CODEX_WORKTREE_RETENTION || "15");
 const WORKTREE_GIT_TIMEOUT_MS = Number(process.env.LOCAL_CODEX_WORKTREE_GIT_TIMEOUT_MS || "30000");
 const WORKTREE_PRUNE_BATCH_SIZE = Number(process.env.LOCAL_CODEX_WORKTREE_PRUNE_BATCH_SIZE || "4");
-const VERSION = "3.6.0";
+const VERSION = "3.6.1";
 const MODEL_ALIASES = new Map([
-  ["luna", "gpt-5.6-luna"], ["terra", "gpt-5.6-terra"], ["sol", "gpt-5.6-sol"], ["astra", "gpt-6-astra"],
+  ["luna", "gpt-6-luna"], ["terra", "gpt-5.6-terra"], ["sol", "gpt-5.6-sol"], ["astra", "gpt-6-astra"],
 ]);
-const MODEL_TIERS = ["gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol", "gpt-6-astra"];
+const MODEL_TIERS = ["gpt-6-luna", "gpt-5.6-terra", "gpt-5.6-sol", "gpt-6-astra"];
+const MODEL_TIER_RANKS = new Map([
+  ...MODEL_TIERS.map((model, rank) => [model, rank]),
+  ["gpt-5.6-luna", 0], // Legacy Luna threads remain at the Luna policy tier when still supported upstream.
+]);
 const REASONING_TIERS = ["none", "low", "medium", "high", "xhigh", "max", "ultra"];
 const rawModelCeiling = process.env.LOCAL_CODEX_MODEL_CEILING || "luna";
 const MODEL_CEILING = MODEL_ALIASES.get(rawModelCeiling) || rawModelCeiling;
-const REASONING_CEILING = process.env.LOCAL_CODEX_REASONING_CEILING || "xhigh";
-if (!MODEL_TIERS.includes(MODEL_CEILING)) {
+const REASONING_CEILING = process.env.LOCAL_CODEX_REASONING_CEILING || "max";
+if (!MODEL_TIER_RANKS.has(MODEL_CEILING)) {
   throw new Error(`LOCAL_CODEX_MODEL_CEILING must be one of luna, terra, sol, astra or their full model IDs`);
 }
 if (!REASONING_TIERS.includes(REASONING_CEILING)) {
   throw new Error(`LOCAL_CODEX_REASONING_CEILING must be one of ${REASONING_TIERS.join(", ")}`);
 }
 const DEFAULT_SETTINGS = {
-  model: "gpt-5.6-luna",
-  reasoningEffort: REASONING_TIERS[Math.min(REASONING_TIERS.indexOf("xhigh"), REASONING_TIERS.indexOf(REASONING_CEILING))],
+  model: "gpt-6-luna",
+  reasoningEffort: REASONING_TIERS[Math.min(REASONING_TIERS.indexOf("max"), REASONING_TIERS.indexOf(REASONING_CEILING))],
 };
 const selectionProperties = {
   model: {
     type: "string", minLength: 1, maxLength: 200,
-    description: "Codex model ID or alias luna, terra, sol, astra. New threads default to gpt-5.6-luna; selections above the configured local model ceiling fail without fallback; replies keep the thread model when omitted if it remains within policy.",
+    description: "Codex model ID or alias luna, terra, sol, astra. New threads default to gpt-6-luna; selections above the configured local model ceiling fail without fallback; replies keep the thread model when omitted if it remains within policy.",
   },
   reasoningEffort: {
     type: "string", minLength: 1, maxLength: 32,
-    description: "Reasoning level supported by the selected model (e.g. low, medium, high, xhigh, max). New threads default to xhigh or a lower configured reasoning ceiling; selections above the local ceiling fail without fallback; replies keep the thread level when omitted if it remains within policy.",
+    description: "Reasoning level supported by the selected model (e.g. low, medium, high, xhigh, max). New threads default to max or a lower configured reasoning ceiling; selections above the local ceiling fail without fallback; replies keep the thread level when omitted if it remains within policy.",
   },
 };
 const MAX_BODY = 1024 * 1024;
@@ -222,7 +226,7 @@ const tools = [
   {
     name: "codex",
     title: "Local Codex",
-    description: "Start a background Codex job from cwd, any existing absolute folder you choose. Git repositories use a dedicated detached worktree from committed HEAD by default. Different canonical folders can run concurrently, and isolated worktrees let different threads from one repository run concurrently too. Set worktree false only when the user explicitly needs the selected checkout, where jobs are serialized through the queue. Replies reuse the thread workspace. Pass sourceTitle only when the host exposes the exact ChatGPT conversation title; otherwise omit it. Choose networkAccess from the user's task intent: set true when completing the request requires outbound command access such as git fetch, git pull, git clone, installing dependencies or packages, curl, HTTP/API access, or downloads, even if the user did not explicitly ask for network access; omit or use false for fully local command work. Choose browserAccess separately when the task needs the official Codex Browser/Chrome backend for navigation, page inspection, interaction, screenshots, or browser-based QA. browserAccess never enables shell-launched Playwright/Chromium, command networking, wider filesystem access, or danger-full-access. Use codex-folders to locate the narrowest relevant folder. Returns jobId immediately; start polling codex-status with waitMs=20000 and continue until terminal. Each valid status poll renews a 90-second default lease; if polling stops, queued or running work is cancelled. Never resubmit to check progress. Default Luna/xhigh; model and reasoning selections above the locally configured ceilings fail closed.",
+    description: "Start a background Codex job from cwd, any existing absolute folder you choose. Git repositories use a dedicated detached worktree from committed HEAD by default. Different canonical folders can run concurrently, and isolated worktrees let different threads from one repository run concurrently too. Set worktree false only when the user explicitly needs the selected checkout, where jobs are serialized through the queue. Replies reuse the thread workspace. Pass sourceTitle only when the host exposes the exact ChatGPT conversation title; otherwise omit it. Choose networkAccess from the user's task intent: set true when completing the request requires outbound command access such as git fetch, git pull, git clone, installing dependencies or packages, curl, HTTP/API access, or downloads, even if the user did not explicitly ask for network access; omit or use false for fully local command work. Choose browserAccess separately when the task needs the official Codex Browser/Chrome backend for navigation, page inspection, interaction, screenshots, or browser-based QA. browserAccess never enables shell-launched Playwright/Chromium, command networking, wider filesystem access, or danger-full-access. Use codex-folders to locate the narrowest relevant folder. Returns jobId immediately; start polling codex-status with waitMs=20000 and continue until terminal. Each valid status poll renews a 90-second default lease; if polling stops, queued or running work is cancelled. Never resubmit to check progress. Default Luna/max; model and reasoning selections above the locally configured ceilings fail closed.",
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -1961,8 +1965,8 @@ function selectSettings(args, prior, models) {
   if (!efforts.includes(reasoningEffort)) {
     throw callError("unsupported_effort", `Unsupported reasoning level for ${model}. Supported choices: ${efforts.join(", ")}. Specify reasoningEffort explicitly; no fallback is applied.`);
   }
-  const modelRank = MODEL_TIERS.indexOf(model);
-  if (modelRank < 0 || modelRank > MODEL_TIERS.indexOf(MODEL_CEILING)) {
+  const modelRank = MODEL_TIER_RANKS.get(model);
+  if (modelRank === undefined || modelRank > MODEL_TIER_RANKS.get(MODEL_CEILING)) {
     throw callError("model_ceiling_exceeded", `Requested model exceeds the configured Local Codex ceiling (${MODEL_CEILING}); no fallback is applied.`);
   }
   const reasoningRank = REASONING_TIERS.indexOf(reasoningEffort);

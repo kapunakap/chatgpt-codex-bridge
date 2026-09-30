@@ -107,6 +107,15 @@ readonly LOG_FILE="${TUNNEL_STATE_DIR}/logs/${PROFILE_NAME}.log"
 readonly TRACE_LOG_FILE="${STATE_DIR}/trace-events.jsonl"
 readonly TRACE_STATE_DIR="${STATE_DIR}/traces"
 readonly WORKTREE_ROOT="${USER_HOME}/Library/Application Support/local-codex-worktrees"
+readonly BUNDLED_CODEX_CANDIDATE="${LOCAL_CODEX_BUNDLED_CODEX_CANDIDATE:-/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex}"
+configured="${LOCAL_CODEX_REAL_BIN:-}"
+if [[ ( -z "${configured}" || "${configured}" == codex ) && -x "${BUNDLED_CODEX_CANDIDATE}" ]]; then
+  readonly RESOLVED_CODEX_BIN="${BUNDLED_CODEX_CANDIDATE}"
+elif [[ -n "${configured}" ]]; then
+  readonly RESOLVED_CODEX_BIN="${configured}"
+else
+  readonly RESOLVED_CODEX_BIN="codex"
+fi
 
 if [[ "${dry_run}" == "true" ]]; then
   print "DRY_RUN_OK"
@@ -129,6 +138,7 @@ if [[ "${dry_run}" == "true" ]]; then
   print "watch=${WATCH_PATH}"
   print "watch_renderer=${WATCH_RENDER_PATH}"
   print "codex_wrapper=${CODEX_WRAPPER_PATH}"
+  print "codex_real_bin=${RESOLVED_CODEX_BIN}"
   print "guard_proxy=${GUARD_PROXY_PATH}"
   print "browser_probe=${BROWSER_PROBE_PATH}"
   print "browser_proxy=${BROWSER_PROXY_PATH}"
@@ -136,12 +146,17 @@ if [[ "${dry_run}" == "true" ]]; then
   exit 0
 fi
 
-for required_command in node codex tunnel-client curl openssl git; do
+for required_command in node tunnel-client curl openssl git; do
   if ! command -v "${required_command}" >/dev/null 2>&1; then
     print -u2 "Required command is missing: ${required_command}"
     exit 1
   fi
 done
+
+if [[ ! -x "${RESOLVED_CODEX_BIN}" ]] && ! command -v "${RESOLVED_CODEX_BIN}" >/dev/null 2>&1; then
+  print -u2 "Required command is missing: ${RESOLVED_CODEX_BIN} (Codex CLI)"
+  exit 1
+fi
 
 node_major=$(node -p 'Number(process.versions.node.split(".")[0])')
 if (( node_major < 22 )); then
@@ -201,7 +216,7 @@ config_tmp=$(mktemp "${STATE_DIR}/config.env.XXXXXX")
   printf 'LOCAL_CODEX_CALL_TIMEOUT_MS=%q\n' "1800000"
   printf 'LOCAL_CODEX_POLL_LEASE_MS=%q\n' "90000"
   printf 'LOCAL_CODEX_MODEL_CEILING=%q\n' "luna"
-  printf 'LOCAL_CODEX_REASONING_CEILING=%q\n' "xhigh"
+  printf 'LOCAL_CODEX_REASONING_CEILING=%q\n' "max"
   printf 'LOCAL_CODEX_MAX_CONCURRENCY=%q\n' "10"
   printf 'LOCAL_CODEX_MAX_QUEUE=%q\n' "100"
   printf 'LOCAL_CODEX_HOST=%q\n' "127.0.0.1"
@@ -212,7 +227,7 @@ config_tmp=$(mktemp "${STATE_DIR}/config.env.XXXXXX")
   printf 'LOCAL_CODEX_TRACE_PROXY=%q\n' "${TRACE_PROXY_PATH}"
   printf 'LOCAL_CODEX_BIN=%q\n' "${INSTRUMENTED_CODEX_PATH}"
   printf 'LOCAL_CODEX_SECURE_BIN=%q\n' "${CODEX_WRAPPER_PATH}"
-  printf 'LOCAL_CODEX_REAL_BIN=%q\n' "codex"
+  printf 'LOCAL_CODEX_REAL_BIN=%q\n' "${RESOLVED_CODEX_BIN}"
   printf 'LOCAL_CODEX_DIAGNOSTICS=%q\n' "${DIAGNOSTICS_PATH}"
   printf 'LOCAL_CODEX_TUNNEL_HEALTH_URL_FILE=%q\n' "${HEALTH_URL_FILE}"
   printf 'TUNNEL_CLIENT_PROFILE=%q\n' "${PROFILE_NAME}"

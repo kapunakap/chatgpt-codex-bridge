@@ -16,7 +16,7 @@ import {
 } from "../observability.mjs";
 
 const MAX_BODY = 1024 * 1024;
-const BRIDGE_VERSION = "3.6.0";
+const BRIDGE_VERSION = "3.6.1";
 const RECEIPT_TOOL = {
   name: "codex-trace-receipt",
   title: "Local Codex Trace Receipt",

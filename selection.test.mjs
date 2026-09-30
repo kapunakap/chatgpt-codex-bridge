@@ -87,7 +87,7 @@ async function setup(t, mode = "", adapterEnv = {}) {
   };
 }
 
-test("Luna/xhigh is explicit; real responses confirm it; logs contain only metadata", async t => {
+test("Luna/max is explicit; real responses confirm it; logs contain only metadata", async t => {
   const h = await setup(t);
   const response = await h.call({});
   assert.equal(response.isError, undefined);
@@ -96,12 +96,12 @@ test("Luna/xhigh is explicit; real responses confirm it; logs contain only metad
   const trace = await h.trace();
   const start = trace.find(x => x.method === "thread/start").params;
   const turn = trace.find(x => x.method === "turn/start").params;
-  assert.equal(start.model, "gpt-5.6-luna");
-  assert.equal(start.config.model_reasoning_effort, "xhigh");
+  assert.equal(start.model, "gpt-6-luna");
+  assert.equal(start.config.model_reasoning_effort, "max");
   assert.equal(start.permissions, "local-codex-tunnel");
   assert.equal(start.approvalPolicy, "never");
-  assert.equal(turn.model, "gpt-5.6-luna");
-  assert.equal(turn.effort, "xhigh");
+  assert.equal(turn.model, "gpt-6-luna");
+  assert.equal(turn.effort, "max");
   assert.equal(turn.permissions, "local-codex-tunnel");
   assert.equal(trace.filter(x => x.method === "model/list").length, 2);
   const logs = await h.logs();
@@ -110,8 +110,8 @@ test("Luna/xhigh is explicit; real responses confirm it; logs contain only metad
   const requested = logs.find(x => x.event === "settings_requested");
   assert.equal(requested.settingsStatus, "requested");
   const confirmed = logs.find(x => x.event === "settings_confirmed");
-  assert.equal(confirmed.model, "gpt-5.6-luna");
-  assert.equal(confirmed.reasoningEffort, "xhigh");
+  assert.equal(confirmed.model, "gpt-6-luna");
+  assert.equal(confirmed.reasoningEffort, "max");
   assert.equal(confirmed.settingsStatus, "confirmed");
   const completed = logs.at(-1);
   assert.equal(completed.event, "job_completed");
@@ -123,13 +123,13 @@ test("Luna/xhigh is explicit; real responses confirm it; logs contain only metad
   assert.doesNotMatch(JSON.stringify(logs), /SECRET/);
 });
 
-test("default ceiling allows Luna through xhigh and rejects higher model or effort selections", async t => {
+test("default ceiling allows Luna through max and rejects higher model selections", async t => {
   const h = await setup(t);
-  for (const reasoningEffort of ["low", "medium", "high", "xhigh"]) {
+  for (const reasoningEffort of ["low", "medium", "high", "xhigh", "max"]) {
     const response = await h.call({ model: "luna", reasoningEffort });
     assert.equal(response.isError, undefined);
     const turn = (await h.trace()).filter(x => x.method === "turn/start").at(-1).params;
-    assert.equal(turn.model, "gpt-5.6-luna");
+    assert.equal(turn.model, "gpt-6-luna");
     assert.equal(turn.effort, reasoningEffort);
   }
   const allowedTurns = (await h.trace()).filter(x => x.method === "turn/start").length;
@@ -138,7 +138,6 @@ test("default ceiling allows Luna through xhigh and rejects higher model or effo
     { model: "sol", reasoningEffort: "low" },
     { model: "astra", reasoningEffort: "low" },
     { model: "gpt-6-astra", reasoningEffort: "low" },
-    { model: "luna", reasoningEffort: "max" },
   ]) {
     const response = await h.call(args);
     assert.equal(response.isError, true);
@@ -153,7 +152,7 @@ test("configured ceilings allow selections up to the configured model and effort
     LOCAL_CODEX_REASONING_CEILING: "max",
   });
   for (const [model, expected, reasoningEffort] of [
-    ["luna", "gpt-5.6-luna", "max"],
+    ["luna", "gpt-6-luna", "max"],
     ["terra", "gpt-5.6-terra", "high"],
     ["sol", "gpt-5.6-sol", "max"],
   ]) {
@@ -166,6 +165,25 @@ test("configured ceilings allow selections up to the configured model and effort
   const denied = await h.call({ model: "astra", reasoningEffort: "low" });
   assert.equal(denied.isError, true);
   assert.match(denied.content[0].text, /ceiling/i);
+});
+
+test("legacy gpt-5.6-luna threads and selections remain at the Luna policy tier", async t => {
+  const h = await setup(t);
+  const selected = await h.call({ model: "gpt-5.6-luna", reasoningEffort: "max" });
+  assert.equal(selected.isError, undefined);
+  let turn = (await h.trace()).filter(x => x.method === "turn/start").at(-1).params;
+  assert.equal(turn.model, "gpt-5.6-luna");
+  assert.equal(turn.effort, "max");
+
+  await h.stop();
+  await writeFile(h.stateFile, JSON.stringify({ threadIds: ["legacy-luna"] }));
+  await writeFile(h.mockState, JSON.stringify({ "legacy-luna": { id: "legacy-luna", model: "gpt-5.6-luna", reasoningEffort: "max" } }));
+  await h.start();
+  const inherited = await h.call({ threadId: "legacy-luna" }, "codex-reply");
+  assert.equal(inherited.isError, undefined);
+  turn = (await h.trace()).filter(x => x.method === "turn/start").at(-1).params;
+  assert.equal(turn.model, "gpt-5.6-luna");
+  assert.equal(turn.effort, "max");
 });
 
 test("reply overrides within a raised ceiling persist through app-server and adapter restarts", async t => {
@@ -221,7 +239,7 @@ test("legacy threads above the ceiling cannot bypass policy and can switch back 
   const recovered = await h.call({ threadId: "legacy-thread", model: "luna", reasoningEffort: "high" }, "codex-reply");
   assert.equal(recovered.isError, undefined);
   const turn = (await h.trace()).find(x => x.method === "turn/start").params;
-  assert.equal(turn.model, "gpt-5.6-luna");
+  assert.equal(turn.model, "gpt-6-luna");
   assert.equal(turn.effort, "high");
   const state = JSON.parse(await readFile(h.stateFile, "utf8"));
   assert.equal(state.threadNetworkAccess["legacy-thread"], false);
@@ -257,8 +275,8 @@ for (const mode of ["timeout", "exit", "turn-error"]) {
     assert.equal((await h.call({})).isError, true);
     const logs = await h.logs();
     assert.equal(logs.at(-1).event, mode === "timeout" ? "job_timed_out" : "job_failed");
-    assert.equal(logs.at(-1).model, "gpt-5.6-luna");
-    assert.equal(logs.at(-1).reasoningEffort, "xhigh");
+    assert.equal(logs.at(-1).model, "gpt-6-luna");
+    assert.equal(logs.at(-1).reasoningEffort, "max");
     assert.doesNotMatch(JSON.stringify(logs), /SECRET/);
   });
 }

@@ -48,7 +48,7 @@ async function fixture(t, options = {}) {
     LOCAL_CODEX_BIN: options.missingBin ? join(root, "missing") : fake, LOCAL_CODEX_CALL_TIMEOUT_MS: String(options.timeout || 10000),
     LOCAL_CODEX_POLL_LEASE_MS: String(options.pollLease ?? 90000),
     LOCAL_CODEX_MODEL_CEILING: options.modelCeiling ?? "luna",
-    LOCAL_CODEX_REASONING_CEILING: options.reasoningCeiling ?? "xhigh",
+    LOCAL_CODEX_REASONING_CEILING: options.reasoningCeiling ?? "max",
     LOCAL_CODEX_MAX_CONCURRENCY: String(options.maxConcurrency ?? 10), LOCAL_CODEX_MAX_QUEUE: String(options.maxQueue ?? 100),
     FAKE_ROOT: root, TEST_DENY_GROUP_PROBE: options.deniedGroupProbe ? "1" : "0",
     ...(options.path ? { PATH: `${options.path}:${process.env.PATH}` } : {}),
@@ -116,7 +116,7 @@ test("discovery, authentication, schemas, and validation", async t => {
   assert.equal(discover.error.code, -32601);
   const initialized = await f.rpc({ jsonrpc: "2.0", id: "i", method: "initialize", params: { protocolVersion: "2025-11-25" } });
   assert.equal(initialized.result.protocolVersion, "2025-11-25");
-  assert.equal(initialized.result.serverInfo.version, "3.6.0");
+  assert.equal(initialized.result.serverInfo.version, "3.6.1");
   const listed = await f.rpc({ jsonrpc: "2.0", id: "l", method: "tools/list" });
   assert.deepEqual(listed.result.tools.map(t => t.name), ["codex", "codex-reply", "codex-status", "codex-cancel", "codex-browser-status", "codex-folders"]);
   const browserStatus = listed.result.tools.find(t => t.name === "codex-browser-status");
@@ -198,7 +198,7 @@ test("durable immediate acceptance, duplicate retries, same-folder queueing, and
   assert.equal((await f.call("codex-status", { jobId, waitMs: 20001 })).errorCode, "invalid_wait");
   const result = await f.finished(jobId);
   assert.equal(result.content, "FINAL_OK"); assert.equal(result.status, "completed");
-  assert.equal(result.model, "gpt-5.6-luna"); assert.equal(result.reasoningEffort, "xhigh");
+  assert.equal(result.model, "gpt-6-luna"); assert.equal(result.reasoningEffort, "max");
   assert.equal(result.networkAccess, false);
   assert.equal(result.workspaceKind, "direct"); assert.equal(result.worktreeReason, "non_git");
   assert.equal(result.sourceCwd, f.root); assert.equal(result.cwd, f.root);
@@ -614,9 +614,9 @@ test("defaults, overrides, resumed settings, unsupported settings, and safe logs
   const reply = await f.finished((await f.call("codex-reply", { requestId: "b", threadId: first.threadId, prompt: "reply" })).jobId);
   assert.equal(reply.model, "gpt-5.6-terra"); assert.equal(reply.reasoningEffort, "high");
   const overridden = await f.finished((await f.call("codex-reply", { requestId: "c", threadId: first.threadId, prompt: "reply", model: "luna", reasoningEffort: "max" })).jobId);
-  assert.equal(overridden.model, "gpt-5.6-luna");
+  assert.equal(overridden.model, "gpt-6-luna");
   const inherited = await f.finished((await f.call("codex-reply", { requestId: "d", threadId: first.threadId, prompt: "reply" })).jobId);
-  assert.equal(inherited.model, "gpt-5.6-luna"); assert.equal(inherited.reasoningEffort, "max");
+  assert.equal(inherited.model, "gpt-6-luna"); assert.equal(inherited.reasoningEffort, "max");
   for (const args of [{ model: "missing" }, { model: "terra", reasoningEffort: "max" }]) {
     const result = await f.finished((await f.call("codex", { requestId: JSON.stringify(args), prompt: "hello", ...args })).jobId);
     assert.equal(result.status, "failed"); assert.match(result.errorCode, /^unsupported_/);
@@ -960,6 +960,7 @@ let settings, threadId, turnId, mode;
 const load = () => { try { return JSON.parse(readFileSync(join(root,'fake-threads.json'),'utf8')); } catch { return {}; } };
 const save = () => { const all=load(); all[threadId]=settings; writeFileSync(join(root,'fake-threads.json'),JSON.stringify(all)); };
 const catalog = [
+ {model:'gpt-6-luna',supportedReasoningEfforts:[{reasoningEffort:'max'},{reasoningEffort:'xhigh'},{reasoningEffort:'low'}]},
  {model:'gpt-5.6-luna',supportedReasoningEfforts:[{reasoningEffort:'max'},{reasoningEffort:'xhigh'},{reasoningEffort:'low'}]},
  {model:'gpt-5.6-terra',supportedReasoningEfforts:[{reasoningEffort:'high'}]},
 ];
@@ -971,7 +972,7 @@ input.on('line',line=>{
  const reply=result=>send({id:m.id,result});
  switch(m.method){
  case 'initialize': reply({}); break;
- case 'model/list': reply({data:[catalog[p.cursor?1:0]],nextCursor:p.cursor?null:'next'}); break;
+ case 'model/list': reply({data:p.cursor?catalog.slice(2):catalog.slice(0,2),nextCursor:p.cursor?null:'next'}); break;
  case 'thread/start':
   threadId=randomUUID(); settings={cwd:p.cwd,model:p.model,reasoningEffort:p.config.model_reasoning_effort}; save();
   reply({thread:{id:threadId,cwd:settings.cwd},...settings}); break;

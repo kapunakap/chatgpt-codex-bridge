@@ -6,8 +6,8 @@ import readline from "node:readline";
 const send = value => process.stdout.write(`${JSON.stringify(value)}\n`);
 const reply = (id, result) => send({ id, result });
 const model = {
-  id: "gpt-5.6-luna",
-  model: "gpt-5.6-luna",
+  id: "gpt-6-luna",
+  model: "gpt-6-luna",
   defaultReasoningEffort: "medium",
   supportedReasoningEfforts: ["low", "medium", "high", "xhigh", "max"].map(reasoningEffort => ({ reasoningEffort })),
 };
