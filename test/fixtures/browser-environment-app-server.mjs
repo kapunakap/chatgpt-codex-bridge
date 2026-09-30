@@ -7,8 +7,8 @@ import readline from "node:readline";
 const send = value => process.stdout.write(`${JSON.stringify(value)}\n`);
 const reply = (id, result) => send({ id, result });
 const model = {
-  id: "gpt-5.6-luna",
-  model: "gpt-5.6-luna",
+  id: "gpt-6-luna",
+  model: "gpt-6-luna",
   defaultReasoningEffort: "medium",
   supportedReasoningEfforts: ["low", "medium", "high", "xhigh", "max"].map(reasoningEffort => ({ reasoningEffort })),
 };
@@ -81,8 +81,8 @@ readline.createInterface({ input: process.stdin }).on("line", line => {
       threadId = params.threadId || threadId || randomUUID();
       reply(request.id, {
         thread: { id: threadId, cwd: params.cwd },
-        model: params.model || "gpt-5.6-luna",
-        reasoningEffort: params.config?.model_reasoning_effort || "xhigh",
+        model: params.model || "gpt-6-luna",
+        reasoningEffort: params.config?.model_reasoning_effort || "max",
       });
       break;
     }

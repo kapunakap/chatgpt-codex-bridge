@@ -78,11 +78,11 @@ test("approval mode defaults to off in launcher, installer, and example config",
   assert.match(installer, /LOCAL_CODEX_POLL_LEASE_MS=%q\\n' "90000"/);
   assert.match(example, /^LOCAL_CODEX_POLL_LEASE_MS=90000$/m);
   assert.match(launcher, /LOCAL_CODEX_MODEL_CEILING=.*:-luna/);
-  assert.match(launcher, /LOCAL_CODEX_REASONING_CEILING=.*:-xhigh/);
+  assert.match(launcher, /LOCAL_CODEX_REASONING_CEILING=.*:-max/);
   assert.match(installer, /LOCAL_CODEX_MODEL_CEILING=%q\\n' "luna"/);
-  assert.match(installer, /LOCAL_CODEX_REASONING_CEILING=%q\\n' "xhigh"/);
+  assert.match(installer, /LOCAL_CODEX_REASONING_CEILING=%q\\n' "max"/);
   assert.match(example, /^LOCAL_CODEX_MODEL_CEILING=luna$/m);
-  assert.match(example, /^LOCAL_CODEX_REASONING_CEILING=xhigh$/m);
+  assert.match(example, /^LOCAL_CODEX_REASONING_CEILING=max$/m);
   assert.match(installer, /LOCAL_CODEX_WORKTREE_RETENTION=%q/);
   assert.match(example, /^LOCAL_CODEX_WORKTREE_RETENTION=15$/m);
   assert.match(example, /^LOCAL_CODEX_WORKTREE_ROOT=.*local-codex-worktrees$/m);

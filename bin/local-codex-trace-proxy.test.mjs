@@ -61,11 +61,11 @@ async function fakeAdapter(port) {
       body = result(message.id, statusCount === 1 ? {
         jobId: "job-1", status: "running", cwd: "/tmp/local-codex-worktree-job-1",
         sourceCwd: "/tmp/source", threadId: "thread-1", turnId: "turn-1",
-        model: "gpt-5.6-luna", reasoningEffort: "max", networkAccess: false, browserAccess: false,
+        model: "gpt-6-luna", reasoningEffort: "max", networkAccess: false, browserAccess: false,
       } : {
         jobId: "job-1", status: "completed", cwd: "/tmp/local-codex-worktree-job-1",
         sourceCwd: "/tmp/source", threadId: "thread-1", turnId: "turn-1",
-        model: "gpt-5.6-luna", reasoningEffort: "max", networkAccess: false, browserAccess: false,
+        model: "gpt-6-luna", reasoningEffort: "max", networkAccess: false, browserAccess: false,
         content: "LOCAL_CODEX_CANARY_OK", finishedAt: Date.now(),
       });
     } else body = result(message.id, { status: "error", errorCode: "invalid_request" });

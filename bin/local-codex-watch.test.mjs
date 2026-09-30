@@ -34,7 +34,7 @@ async function fixture({ approval = false, commandOutput = false } = {}) {
   await mkdir(join(temp, "gta-labin"), { recursive: true });
   await writeFile(join(temp, "token"), "Bearer test\n");
   await writeFile(jobFile, JSON.stringify({
-    jobId, status: "running", cwd: join(temp, "gta-labin"), threadId: "thread-1", model: "gpt-5.6-luna",
+    jobId, status: "running", cwd: join(temp, "gta-labin"), threadId: "thread-1", model: "gpt-6-luna",
     reasoningEffort: "high", networkAccess: true, startedAt: Date.now() - 12000, updatedAt: Date.now(),
   }));
   await writeFile(sessionFile, JSON.stringify({
@@ -113,7 +113,7 @@ writeFileSync(process.env.TEST_RESUME_RECORD, JSON.stringify({
   const completedAt = Date.now();
   await writeFile(f.jobFile, JSON.stringify({
     jobId: f.jobId, status: "completed", cwd: join(f.temp, "gta-labin"), threadId: "thread-1",
-    model: "gpt-5.6-luna", reasoningEffort: "high", networkAccess: true,
+    model: "gpt-6-luna", reasoningEffort: "high", networkAccess: true,
     startedAt: completedAt - 12000, updatedAt: completedAt, finishedAt: completedAt,
   }));
   await delay(350);
@@ -140,7 +140,7 @@ test("browser jobs warn before native CLI handoff and launch on the second o", a
   const completedAt = Date.now();
   await writeFile(f.jobFile, JSON.stringify({
     jobId: f.jobId, status: "completed", cwd: join(f.temp, "gta-labin"), threadId: "thread-1",
-    model: "gpt-5.6-luna", reasoningEffort: "high", networkAccess: false, browserAccess: true,
+    model: "gpt-6-luna", reasoningEffort: "high", networkAccess: false, browserAccess: true,
     startedAt: completedAt - 12000, updatedAt: completedAt, finishedAt: completedAt,
   }));
   const recordFile = join(f.temp, "browser-resume.json");
@@ -172,7 +172,7 @@ test("watch restores the monitor after secure resume launch failure", async t =>
   const completedAt = Date.now();
   await writeFile(f.jobFile, JSON.stringify({
     jobId: f.jobId, status: "completed", cwd: join(f.temp, "gta-labin"), threadId: "thread-1",
-    model: "gpt-5.6-luna", reasoningEffort: "high", networkAccess: false,
+    model: "gpt-6-luna", reasoningEffort: "high", networkAccess: false,
     startedAt: completedAt - 12000, updatedAt: completedAt, finishedAt: completedAt,
   }));
   const { child, read } = startWatch(f, [], { LOCAL_CODEX_BIN: join(f.temp, "missing-secure-wrapper") });
@@ -197,7 +197,7 @@ test("watch restores a snapshotted worktree before opening the native CLI", asyn
     jobId: f.jobId, status: "completed", cwd: join(f.temp, "missing-worktree"),
     sourceCwd: join(f.temp, "gta-labin"), workspaceKind: "worktree",
     worktreeId: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", worktreeState: "snapshotted",
-    threadId: "thread-1", model: "gpt-5.6-luna", reasoningEffort: "high", networkAccess: false,
+    threadId: "thread-1", model: "gpt-6-luna", reasoningEffort: "high", networkAccess: false,
     startedAt: completedAt - 12000, updatedAt: completedAt, finishedAt: completedAt,
   }));
   let restoreCalls = 0;
@@ -328,7 +328,7 @@ for (const [status, label] of [
       status: "running",
       cwd: join(f.temp, "other-project"),
       threadId: "thread-2",
-      model: "gpt-5.6-luna",
+      model: "gpt-6-luna",
       reasoningEffort: "medium",
       networkAccess: false,
       startedAt: Date.now() - 5000,
@@ -347,7 +347,7 @@ for (const [status, label] of [
       status,
       cwd: join(f.temp, "gta-labin"),
       threadId: "thread-1",
-      model: "gpt-5.6-luna",
+      model: "gpt-6-luna",
       reasoningEffort: "high",
       networkAccess: true,
       startedAt: changedAt - 12000,
@@ -439,7 +439,7 @@ test("watch keeps a selected queued job visible when it starts running", async t
     status: "running",
     cwd: join(f.temp, "gta-labin"),
     threadId: "thread-1",
-    model: "gpt-5.6-luna",
+    model: "gpt-6-luna",
     reasoningEffort: "high",
     networkAccess: false,
     startedAt: queuedAt,
