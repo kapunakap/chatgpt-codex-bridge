@@ -97,10 +97,12 @@ test("Luna/max is explicit; real responses confirm it; logs contain only metadat
   const start = trace.find(x => x.method === "thread/start").params;
   const turn = trace.find(x => x.method === "turn/start").params;
   assert.equal(start.model, "gpt-6-luna");
+  assert.equal(start.serviceTier, "priority");
   assert.equal(start.config.model_reasoning_effort, "max");
   assert.equal(start.permissions, "local-codex-tunnel");
   assert.equal(start.approvalPolicy, "never");
   assert.equal(turn.model, "gpt-6-luna");
+  assert.equal(turn.serviceTier, "priority");
   assert.equal(turn.effort, "max");
   assert.equal(turn.permissions, "local-codex-tunnel");
   assert.equal(trace.filter(x => x.method === "model/list").length, 2);
@@ -200,6 +202,7 @@ test("reply overrides within a raised ceiling persist through app-server and ada
   let turn = (await h.trace()).filter(x => x.method === "turn/start").at(-1).params;
   assert.equal(turn.model, "gpt-5.6-terra");
   assert.equal(turn.effort, "high");
+  assert.equal(turn.serviceTier, "priority");
   await h.call({ threadId, reasoningEffort: "low" }, "codex-reply");
   await h.call({ threadId, model: "sol" }, "codex-reply");
   turn = (await h.trace()).filter(x => x.method === "turn/start").at(-1).params;

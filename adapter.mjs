@@ -226,7 +226,7 @@ const tools = [
   {
     name: "codex",
     title: "Local Codex",
-    description: "Start a background Codex job from cwd, any existing absolute folder you choose. Git repositories use a dedicated detached worktree from committed HEAD by default. Different canonical folders can run concurrently, and isolated worktrees let different threads from one repository run concurrently too. Set worktree false only when the user explicitly needs the selected checkout, where jobs are serialized through the queue. Replies reuse the thread workspace. Pass sourceTitle only when the host exposes the exact ChatGPT conversation title; otherwise omit it. Choose networkAccess from the user's task intent: set true when completing the request requires outbound command access such as git fetch, git pull, git clone, installing dependencies or packages, curl, HTTP/API access, or downloads, even if the user did not explicitly ask for network access; omit or use false for fully local command work. Choose browserAccess separately when the task needs the official Codex Browser/Chrome backend for navigation, page inspection, interaction, screenshots, or browser-based QA. browserAccess never enables shell-launched Playwright/Chromium, command networking, wider filesystem access, or danger-full-access. Use codex-folders to locate the narrowest relevant folder. Returns jobId immediately; start polling codex-status with waitMs=20000 and continue until terminal. Each valid status poll renews a 90-second default lease; if polling stops, queued or running work is cancelled. Never resubmit to check progress. Default Luna/max; model and reasoning selections above the locally configured ceilings fail closed.",
+    description: "Start a background Codex job from cwd, any existing absolute folder you choose. Git repositories use a dedicated detached worktree from committed HEAD by default. Different canonical folders can run concurrently, and isolated worktrees let different threads from one repository run concurrently too. Set worktree false only when the user explicitly needs the selected checkout, where jobs are serialized through the queue. Replies reuse the thread workspace. Pass sourceTitle only when the host exposes the exact ChatGPT conversation title; otherwise omit it. Choose networkAccess from the user's task intent: set true when completing the request requires outbound command access such as git fetch, git pull, git clone, installing dependencies or packages, curl, HTTP/API access, or downloads, even if the user did not explicitly ask for network access; omit or use false for fully local command work. Choose browserAccess separately when the task needs the official Codex Browser/Chrome backend for navigation, page inspection, interaction, screenshots, or browser-based QA. browserAccess never enables shell-launched Playwright/Chromium, command networking, wider filesystem access, or danger-full-access. Use codex-folders to locate the narrowest relevant folder. Returns jobId immediately; start polling codex-status with waitMs=20000 and continue until terminal. Each valid status poll renews a 90-second default lease; if polling stops, queued or running work is cancelled. Never resubmit to check progress. Defaults are Luna/max reasoning and Fast Mode (service tier priority). Fast Mode is separate from reasoning effort; model and reasoning selections above the locally configured ceilings fail closed.",
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -253,7 +253,7 @@ const tools = [
   {
     name: "codex-reply",
     title: "Local Codex Reply",
-    description: "Start a background reply on an adapter-owned thread in its saved folder. Pass sourceTitle only when the host exposes the exact ChatGPT conversation title; omit it to inherit any exact title already saved for the thread. Omit networkAccess to inherit: enabled stays enabled and disabled stays disabled. Set true when this reply newly requires outbound command access, even if the user only implies it; set false when command networking must be disabled again. Omit browserAccess to inherit the saved official Browser capability; set true when the reply needs the official Codex Browser/Chrome backend and false to disable it. browserAccess is independent of networkAccess and never enables shell Chromium or a wider sandbox. Folder changes are not allowed; use codex for a new folder. Replies use the same per-folder queue. Returns jobId; start polling codex-status with waitMs=20000 and continue until terminal. Each valid status poll renews a 90-second default lease; if polling stops, queued or running work is cancelled. Omitted model/reasoningEffort retain thread settings; overrides persist. Reuse requestId on retries.",
+    description: "Start a background reply on an adapter-owned thread in its saved folder. Replies use Fast Mode (service tier priority) on every turn, including resumed threads; this is separate from reasoning effort. Pass sourceTitle only when the host exposes the exact ChatGPT conversation title; omit it to inherit any exact title already saved for the thread. Omit networkAccess to inherit: enabled stays enabled and disabled stays disabled. Set true when this reply newly requires outbound command access, even if the user only implies it; set false when command networking must be disabled again. Omit browserAccess to inherit the saved official Browser capability; set true when the reply needs the official Codex Browser/Chrome backend and false to disable it. browserAccess is independent of networkAccess and never enables shell Chromium or a wider sandbox. Folder changes are not allowed; use codex for a new folder. Replies use the same per-folder queue. Returns jobId; start polling codex-status with waitMs=20000 and continue until terminal. Each valid status poll renews a 90-second default lease; if polling stops, queued or running work is cancelled. Omitted model/reasoningEffort retain thread settings; overrides persist. Reuse requestId on retries.",
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -1829,6 +1829,7 @@ function threadParams(cwd, networkAccess, browserAccess, threadId, settings) {
   if (threadId) params.threadId = threadId;
   if (settings) {
     params.model = settings.model;
+    params.serviceTier = "priority";
     params.config = { model_reasoning_effort: settings.reasoningEffort };
   }
   return params;
@@ -1843,6 +1844,7 @@ function turnParams(cwd, threadId, prompt, settings, browserAccess) {
     permissions: "local-codex-tunnel",
     model: settings.model,
     effort: settings.reasoningEffort,
+    serviceTier: "priority",
   };
   if (browserAccess) {
     params.additionalContext = {
