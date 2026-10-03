@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { spawn } from "node:child_process";
-import { existsSync, readFileSync, readdirSync, renameSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import process from "node:process";
 import {
@@ -27,6 +27,8 @@ const approvalsDir = join(guardDir, "approvals");
 const jobEventsDir = process.env.LOCAL_CODEX_JOB_EVENTS_DIR || join(dirname(stateFile), "job-events");
 const renderOnce = process.argv.includes("--once");
 const terminalStatuses = new Set(["completed", "failed", "cancelled", "timed_out", "interrupted"]);
+const activeStatuses = new Set(["starting", "running", "cancelling"]);
+const pollStatuses = new Set(["queued", ...activeStatuses]);
 let selectedJobId = null;
 let view = 0;
 let dirty = true;
@@ -44,6 +46,13 @@ let openConfirmationJobId = null;
 let notice = "";
 let noticeTimer = null;
 let latest = { jobs: [], sessions: [], approvals: [] };
+const stateCaches = {
+  jobs: new Map(),
+  sessions: new Map(),
+  approvals: new Map(),
+};
+const eventCache = new Map();
+let selectedEventsVersion = "";
 
 process.stdin.setEncoding("utf8");
 process.stdin.resume();
@@ -58,11 +67,16 @@ process.stdin.on("data", data => {
   void handleKey(data);
 });
 
-setInterval(() => {
-  if (handoffActive) return;
-  refresh();
-  dirty = true;
-}, 250).unref();
+await probeReady();
+refresh();
+refreshSelectedEventsVersion();
+render();
+if (renderOnce) {
+  restoreTerminal();
+  process.exit(0);
+}
+
+scheduleStatePoll();
 setInterval(() => {
   if (handoffActive) return;
   void probeReady();
@@ -71,42 +85,50 @@ setInterval(() => {
   if (dirty && !handoffActive) render();
 }, 80).unref();
 
-await probeReady();
-refresh();
-render();
-if (renderOnce) {
-  restoreTerminal();
-  process.exit(0);
-}
-
 function refresh() {
-  const jobs = readJsonDir(
+  const jobsResult = readJsonDir(
     jobsDir,
     file => file.endsWith(".json") &&
       !file.endsWith(".pending.json") &&
-      !file.endsWith(".decision.json")
-  )
+      !file.endsWith(".decision.json"),
+    stateCaches.jobs
+  );
+  const sessionsResult = readJsonDir(
+    sessionsDir,
+    file => file.endsWith(".json"),
+    stateCaches.sessions
+  );
+  const approvalsResult = readJsonDir(
+    approvalsDir,
+    file => file.endsWith(".pending.json"),
+    stateCaches.approvals
+  );
+  if (!jobsResult.changed && !sessionsResult.changed && !approvalsResult.changed) {
+    return false;
+  }
+
+  const jobs = jobsResult.values
     .filter(job => typeof job.jobId === "string")
     .sort((a, b) => rankJob(a) - rankJob(b) || (b.updatedAt || 0) - (a.updatedAt || 0));
-  const sessions = readJsonDir(sessionsDir, file => file.endsWith(".json"));
+  const sessions = sessionsResult.values;
   const jobById = new Map(jobs.map(job => [job.jobId, job]));
   const sessionById = new Map(sessions.map(session => [session.sessionId, session]));
-  const approvals = readJsonDir(approvalsDir, file => file.endsWith(".pending.json"))
-    .filter(approval => {
-      if (approval.jobId) {
-        const job = jobById.get(approval.jobId);
-        return Boolean(job && !terminalStatuses.has(job.status));
-      }
-      if (approval.sessionId) {
-        const session = sessionById.get(approval.sessionId);
-        return Boolean(session && session.status !== "ended");
-      }
-      return false;
-    });
+  const approvals = approvalsResult.values.filter(approval => {
+    if (approval.jobId) {
+      const job = jobById.get(approval.jobId);
+      return Boolean(job && !terminalStatuses.has(job.status));
+    }
+    if (approval.sessionId) {
+      const session = sessionById.get(approval.sessionId);
+      return Boolean(session && session.status !== "ended");
+    }
+    return false;
+  });
   latest = { jobs, sessions, approvals };
   if (!selectedJobId || !jobById.has(selectedJobId)) {
     selectedJobId = jobs[0]?.jobId || null;
   }
+  return true;
 }
 
 async function probeReady() {
@@ -121,35 +143,111 @@ async function probeReady() {
   dirty = true;
 }
 
-function readJsonDir(directory, keep) {
-  if (!existsSync(directory)) return [];
+function readJsonDir(directory, keep, cache) {
+  if (!existsSync(directory)) {
+    const changed = cache.size > 0;
+    cache.clear();
+    return { values: [], changed };
+  }
+
   const output = [];
+  const seen = new Set();
+  let changed = false;
   for (const file of readdirSync(directory)) {
     if (!keep(file)) continue;
+    seen.add(file);
+    const path = join(directory, file);
+    const fingerprint = fileFingerprint(path);
+    const previous = cache.get(file);
+    if (fingerprint && previous?.fingerprint === fingerprint) {
+      output.push(previous.value);
+      continue;
+    }
     try {
-      output.push(JSON.parse(readFileSync(join(directory, file), "utf8")));
+      const value = JSON.parse(readFileSync(path, "utf8"));
+      cache.set(file, { fingerprint, value });
+      output.push(value);
+      changed = true;
     } catch {
-      // A file may be between its temporary and final names.
+      // Preserve the last valid value while an in-place writer is between states.
+      if (previous) output.push(previous.value);
     }
   }
-  return output;
+  for (const file of [...cache.keys()]) {
+    if (seen.has(file)) continue;
+    cache.delete(file);
+    changed = true;
+  }
+  return { values: output, changed };
 }
 
 function readJsonl(file) {
-  if (!existsSync(file)) return [];
+  const fingerprint = fileFingerprint(file);
+  if (!fingerprint) {
+    eventCache.delete(file);
+    return [];
+  }
+  const cached = eventCache.get(file);
+  if (cached?.fingerprint === fingerprint) return cached.events;
   try {
-    return readFileSync(file, "utf8")
+    const events = readFileSync(file, "utf8")
       .split("\n")
       .filter(Boolean)
       .slice(-400)
       .map(line => JSON.parse(line));
+    eventCache.set(file, { fingerprint, events });
+    return events;
   } catch {
-    return [];
+    return cached?.events || [];
   }
 }
 
+function fileFingerprint(file) {
+  try {
+    const stats = statSync(file);
+    return [stats.size, stats.mtimeMs, stats.ctimeMs].join(":");
+  } catch {
+    return null;
+  }
+}
+
+function selectedEventsFingerprint() {
+  const job = selectedJob();
+  if (!job) return "";
+  const session = sessionFor(job);
+  const paths = [join(jobEventsDir, job.jobId + ".jsonl")];
+  if (session) paths.push(join(eventsDir, session.sessionId + ".jsonl"));
+  return paths.map(path => path + ":" + String(fileFingerprint(path))).join("|");
+}
+
+function refreshSelectedEventsVersion() {
+  const version = selectedEventsFingerprint();
+  if (version === selectedEventsVersion) return false;
+  selectedEventsVersion = version;
+  return true;
+}
+
+function statePollDelay() {
+  return latest.approvals.length || latest.jobs.some(job => pollStatuses.has(job.status))
+    ? 250
+    : 1000;
+}
+
+function scheduleStatePoll() {
+  const timer = setTimeout(() => {
+    if (!handoffActive) {
+      const stateChanged = refresh();
+      const eventsChanged = refreshSelectedEventsVersion();
+      const animateActiveJob = latest.jobs.some(job => activeStatuses.has(job.status));
+      if (stateChanged || eventsChanged || animateActiveJob) dirty = true;
+    }
+    scheduleStatePoll();
+  }, statePollDelay());
+  timer.unref();
+}
+
 function rankJob(job) {
-  if (["starting", "running", "cancelling"].includes(job.status)) return 0;
+  if (activeStatuses.has(job.status)) return 0;
   if (job.status === "queued") return 1;
   return 2;
 }
