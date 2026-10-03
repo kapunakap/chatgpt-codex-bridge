@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createServer } from "node:http";
-import { chmod, mkdir, mkdtemp, readFile, realpath, writeFile } from "node:fs/promises";
+import { appendFile, chmod, mkdir, mkdtemp, readFile, realpath, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -454,4 +454,78 @@ test("watch keeps a selected queued job visible when it starts running", async t
     child.once("error", reject);
     child.once("exit", resolve);
   });
+});
+
+
+test("watch avoids redraw churn while terminal state is unchanged", async t => {
+  const f = await fixture();
+  const completedAt = Date.now();
+  await writeFile(f.jobFile, JSON.stringify({
+    jobId: f.jobId,
+    status: "completed",
+    cwd: join(f.temp, "gta-labin"),
+    threadId: "thread-1",
+    model: "gpt-6-luna",
+    reasoningEffort: "high",
+    networkAccess: false,
+    startedAt: completedAt - 12000,
+    updatedAt: completedAt,
+    finishedAt: completedAt,
+  }));
+  await writeFile(f.sessionFile, JSON.stringify({
+    sessionId: "session-1",
+    cwd: join(f.temp, "gta-labin"),
+    threadId: "thread-1",
+    status: "ended",
+    startedAt: completedAt - 12000,
+    updatedAt: completedAt,
+    networkAccess: false,
+  }));
+
+  const { child, read } = startWatch(f);
+  t.after(() => {
+    if (child.exitCode === null) child.kill("SIGTERM");
+  });
+  await delay(350);
+  const unchangedAt = read().length;
+  await delay(850);
+  assert.equal(read().length, unchangedAt);
+
+  child.stdin.write("q");
+  const code = await new Promise((resolve, reject) => {
+    child.once("error", reject);
+    child.once("exit", resolve);
+  });
+  assert.equal(code, 0);
+});
+
+test("watch notices appended job events without job metadata changes", async t => {
+  const f = await fixture();
+  const { child, read } = startWatch(f);
+  t.after(() => {
+    if (child.exitCode === null) child.kill("SIGTERM");
+  });
+  await delay(350);
+
+  const marker = "EVENT_WITHOUT_JOB_REWRITE";
+  const changedAt = read().length;
+  await appendFile(
+    join(f.jobEventsDir, f.jobId + ".jsonl"),
+    JSON.stringify({
+      seq: 50,
+      time: new Date().toISOString(),
+      sessionId: "session-1",
+      type: "assistant.delta",
+      data: { text: marker },
+    }) + "\n"
+  );
+  await delay(450);
+  assert.match(read().slice(changedAt), new RegExp(marker));
+
+  child.stdin.write("q");
+  const code = await new Promise((resolve, reject) => {
+    child.once("error", reject);
+    child.once("exit", resolve);
+  });
+  assert.equal(code, 0);
 });
