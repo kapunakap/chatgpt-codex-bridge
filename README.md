@@ -235,7 +235,7 @@ v3.5.2 makes the network-disabled macOS profile constant-size, intentionally bro
 
 v3.5.3 fixes stale terminal worktree recovery; PR #19 fixes worktree-prune admission, GC preemption, bounded timeouts, and admission coalescing, eliminating ~120s admission stalls under large backlogs; PR #20 verifies bundles outside a repository cwd; PR #22 makes the zsh heredoc assertion macOS-only for CI portability; PR #23 adds model/reasoning ceilings; and issue #27 updates the defaults to gpt-6-luna/max.
 
-v3.6.1 prefers the Codex CLI bundled with ChatGPT.app when `LOCAL_CODEX_REAL_BIN` is unset or `codex` and that executable is present.
+v3.6.2 reduces `local-codex-watch` idle CPU by caching unchanged job/session/approval state and event logs, avoiding redraw churn when nothing changes, and using a slower idle state poll while preserving 250 ms responsiveness for active work.\n\nv3.6.1 prefers the Codex CLI bundled with ChatGPT.app when `LOCAL_CODEX_REAL_BIN` is unset or `codex` and that executable is present.
 
 v3.6.0 adds end-to-end correlated observability across ChatGPT → Secure MCP Tunnel → Local Codex, including the trace proxy, lifecycle instrumentation, readiness dependency states, local-codex-doctor, local-codex-canary, and sanitized trace receipts. It also fixes startup recovery so stale terminal job/thread folder mappings are detached and persisted without weakening fail-closed checks for active jobs or managed worktrees.
 
