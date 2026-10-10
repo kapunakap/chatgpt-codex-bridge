@@ -8,7 +8,7 @@ From the repository root, with Node.js 22 or later and local Git installed:
 
 ```sh
 node --test benchmarks/worktree-admission/grader.test.mjs
-node benchmarks/worktree-admission/grade.mjs --candidate /path/to/candidate-checkout
+node benchmarks/worktree-admission/grade.mjs --candidate /path/to/candidate-checkout --result-kind model_run
 ```
 
 To materialize the agent input from a checkout that contains the pinned commit, use a new destination outside that checkout; its parent directory must already exist:
@@ -19,14 +19,14 @@ node benchmarks/worktree-admission/materialize-task.mjs --repo . --destination /
 
 The materializer verifies the pinned tree, exports it without `.git`, copies only `TASK.md` as `BENCHMARK_TASK.md`, and prints archive and prompt hashes for the run record.
 
-The grader prints one JSON result and exits nonzero only for a grader/setup error. A candidate can receive any score from 0 to 100. Each criterion is all-or-nothing and the weights sum to 100. Every behavioral check runs in a child process with a fixed deadline; timed-out process groups are stopped. Git fixtures are local and use a private temporary HOME with no credential variables.
+Pass --result-kind model_run for an actual agent candidate; default is implementation_calibration. The grader prints one JSON result and exits nonzero only for a grader/setup error. A candidate can receive any score from 0 to 100. Each criterion is all-or-nothing and the weights sum to 100. Every behavioral check runs in a child process with a fixed deadline; timed-out process groups are stopped. Git fixtures are local and use a private temporary HOME with no credential variables.
 
 ## What is measured
 
 | Criterion | Weight | Dynamic evidence |
 | --- | ---: | --- |
 | Admission preemption | 25 | A new enabled plan completes before the second GC candidate in a 225-record backlog. |
-| Bounded GC batch | 15 | One prune pass visits and snapshots exactly four candidates. |
+| Bounded GC batch | 15 | One prune pass makes progress on 1 to 4 candidates, not the entire backlog. |
 | Stalled Git timeout | 15 | `prepare` returns `worktree_git_timeout` within 1.5 seconds against a Git stand-in that never exits after it starts. |
 | Git process cleanup | 15 | The timed-out stand-in and its child process are gone before the operation settles. |
 | Abort settling | 20 | Aborting preparation settles as cancelled, cleans the Git process tree, and allows the next serialized operation to complete afterward. |

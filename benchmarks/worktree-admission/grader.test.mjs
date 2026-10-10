@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { CRITERIA, criteriaResult, runBoundedCommand, validateResultShape } from "./grading.mjs";
+import { CRITERIA, criteriaResult, isBoundedPrune, runBoundedCommand, validateResultShape } from "./grading.mjs";
 
 test("criterion weights total 100 and scoring is deterministic", () => {
   assert.equal(CRITERIA.reduce((sum, item) => sum + item.weight, 0), 100);
@@ -45,4 +45,11 @@ test("bounded command runner kills a timed-out local process group", async () =>
     await new Promise(resolve => setTimeout(resolve, 10));
   }
   assert.equal(stillAlive, false, "timed-out child process must be reaped");
+});
+
+test("bounded prune accepts equivalent safe batch sizes and rejects no progress or unbounded work", () => {
+  for (let n = 1; n <= 4; n++) assert.equal(isBoundedPrune({ backlog_records: 225, snapshot_calls: n, pruned_count: n }), true);
+  for (const n of [0, 5, 210]) assert.equal(isBoundedPrune({ backlog_records: 225, snapshot_calls: n, pruned_count: n }), false);
+  assert.equal(isBoundedPrune({ backlog_records: 225, snapshot_calls: 3, pruned_count: 2 }), false);
+  assert.equal(isBoundedPrune(null), false);
 });

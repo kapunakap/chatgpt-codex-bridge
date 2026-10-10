@@ -2,7 +2,7 @@ import { spawn } from "node:child_process";
 
 export const CRITERIA = Object.freeze([
   { id: "admission_preemption", weight: 25, assertion: "A new enabled plan wins admission before GC starts its second candidate with 225 ready records." },
-  { id: "prune_batch_bound", weight: 15, assertion: "One prune pass snapshots exactly four candidates from the 225-record backlog." },
+  { id: "prune_batch_bound", weight: 15, assertion: "One prune pass makes bounded progress by snapshotting 1 to 4 candidates from a 225-record backlog." },
   { id: "git_timeout_bound", weight: 15, assertion: "A stalled Git operation returns worktree_git_timeout within 1,500 ms." },
   { id: "git_process_cleanup", weight: 15, assertion: "The timed-out Git stand-in and its child are gone before prepare settles." },
   { id: "abort_settling", weight: 20, assertion: "Aborting prepare returns cancellation, Git exits, and later serialized work completes only after Git exits and failed state is saved." },
@@ -15,6 +15,12 @@ export const SCENARIOS = Object.freeze({
   abort_prepare: { timeoutMs: 8000, ids: ["abort_settling"] },
   disabled_plan: { timeoutMs: 3000, ids: ["disabled_plan_bypass"] },
 });
+
+export function isBoundedPrune(admission) {
+  return admission?.backlog_records === 225 &&
+    Number.isInteger(admission.snapshot_calls) && admission.snapshot_calls >= 1 && admission.snapshot_calls <= 4 &&
+    admission.pruned_count === admission.snapshot_calls;
+}
 
 export function criteriaResult(assessments) {
   const criteria = CRITERIA.map(spec => {

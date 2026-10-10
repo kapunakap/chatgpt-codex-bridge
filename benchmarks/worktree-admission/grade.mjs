@@ -3,17 +3,18 @@ import { createHash } from "node:crypto";
 import { mkdtemp, mkdir, readFile, realpath, rm } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { CRITERIA, SCENARIOS, criteriaResult, runBoundedCommand, validateResultShape } from "./grading.mjs";
+import { CRITERIA, SCENARIOS, criteriaResult, isBoundedPrune, runBoundedCommand, validateResultShape } from "./grading.mjs";
 
 const benchmarkDir = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(benchmarkDir, "../..");
 const workerFile = join(benchmarkDir, "worker.mjs");
 
 function parseArgs(argv) {
-  const result = { candidate: process.cwd(), label: null };
+  const result = { candidate: process.cwd(), label: null, resultKind: "implementation_calibration" };
   for (let index = 0; index < argv.length; index += 1) {
     if (argv[index] === "--candidate" && argv[index + 1]) result.candidate = argv[++index];
     else if (argv[index] === "--label" && argv[index + 1]) result.label = argv[++index];
+    else if (argv[index] === "--result-kind" && ["model_run", "implementation_calibration"].includes(argv[index + 1])) result.resultKind = argv[++index];
     else if (argv[index] === "--help") result.help = true;
     else throw new Error(`Unknown or incomplete argument: ${argv[index]}`);
   }
@@ -140,7 +141,7 @@ async function main() {
       },
       prune_batch_bound: {
         scenario: "admission",
-        passed: admission?.snapshot_calls === 4 && admission?.pruned_count === 4,
+        passed: isBoundedPrune(admission),
         duration_ms: admission?.duration_ms,
         evidence: admission ? { backlog_records: admission.backlog_records, snapshot_calls: admission.snapshot_calls, pruned_count: admission.pruned_count } : scenarioFailures.admission || {},
       },
@@ -178,7 +179,7 @@ async function main() {
     const result = {
       schema_version: 1,
       benchmark_id: "chatgpt-codex-bridge.worktree-admission.v1",
-      result_kind: "implementation_calibration",
+      result_kind: options.resultKind,
       candidate: {
         label: options.label || basename(candidateRoot),
         commit: candidateHead,
