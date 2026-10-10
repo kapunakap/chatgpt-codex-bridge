@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "benchmark_id": "chatgpt-codex-bridge.worktree-admission.v1",
+  "repository": "kapunakap/chatgpt-codex-bridge",
+  "task_source": {
+    "commit": "0fdfa620d5d99ee5f40d3bc688d714f834fb2802",
+    "tree": "be26240abf23a476fb940ccf5b0a307b8c3535e0",
+    "meaning": "Frozen pre-fix source; parent of the first historical PR #19 fix commit."
+  },
+  "normalization": {
+    "export": "git archive --format=tar <task_source.commit> | tar -x -C <empty-agent-source-directory>",
+    "include": "Tracked files from the pinned source tree only, plus a separate copy of TASK.md as the prompt.",
+    "exclude": [".git", "post-fix commits", "benchmark grader", "reference checkout", "local environment files", "credentials"],
+    "file_rules": "Preserve committed file bytes and executable bits; do not install dependencies or run setup scripts before the agent starts.",
+    "archive_digest": {
+      "algorithm": "SHA-256",
+      "capture": "materialize-task.mjs prints the exported archive digest; record that observed value for each run."
+    }
+  },
+  "evaluation": {
+    "grader": "benchmarks/worktree-admission/grade.mjs",
+    "tests": "benchmarks/worktree-admission/grader.test.mjs",
+    "reference_commit": "c32868dfa120cde597a7cc097081c065988fc7ee",
+    "reference_visibility": "Evaluator only; never include it, its checkout, or grader files in the agent input.",
+    "network": "The grader makes no network calls. Run agent sessions with network egress disabled. GitHub Actions checks out the two public calibration commits.",
+    "credentials": "The grading worker receives a small environment allowlist and a private temporary HOME; no API keys, repository secrets, or paid services are used.",
+    "leakage_limit": "After publication, the reference commit and grader are public and discoverable. Source-archive isolation removes local Git history but cannot prevent contamination from external knowledge or a network-enabled agent. Record exposure; do not claim secrecy."
+  },
+  "model_results": "None are included. Use run-template.json for real, observed model runs only."
+}
