@@ -1,0 +1,256 @@
+{
+  "schema_version": 1,
+  "benchmark_id": "chatgpt-codex-bridge.worktree-admission.v1",
+  "result_kind": "model_run",
+  "candidate": {
+    "label": "gpt-6-luna-max-interrupted",
+    "commit": "12eb3366c69be79c426b1dbc63b9aac2479d1475",
+    "worktree_manager_sha256": "12138a2d38160caedab55f9117bc4b6c240c13587f7305952ceda549fc41fd76"
+  },
+  "score": 35,
+  "max_score": 100,
+  "criteria": [
+    {
+      "id": "admission_preemption",
+      "weight": 25,
+      "earned": 25,
+      "passed": true,
+      "assertion": "A new enabled plan wins admission before GC starts its second candidate with 225 ready records.",
+      "timeout_ms": 8000,
+      "duration_ms": 913,
+      "evidence": {
+        "ok": true,
+        "scenario": "admission",
+        "backlog_records": 225,
+        "winner": "admission",
+        "admission_state": "planned",
+        "snapshot_calls": 1,
+        "prune_error": null,
+        "duration_ms": 913
+      }
+    },
+    {
+      "id": "prune_batch_bound",
+      "weight": 15,
+      "earned": 0,
+      "passed": false,
+      "assertion": "One prune pass makes bounded progress by snapshotting 1 to 4 candidates from a 225-record backlog.",
+      "timeout_ms": 8000,
+      "duration_ms": 913,
+      "evidence": {
+        "backlog_records": 225,
+        "snapshot_calls": 1
+      }
+    },
+    {
+      "id": "git_timeout_bound",
+      "weight": 15,
+      "earned": 0,
+      "passed": false,
+      "assertion": "A stalled Git operation returns worktree_git_timeout within 1,500 ms.",
+      "timeout_ms": 5000,
+      "duration_ms": 1,
+      "evidence": {
+        "ok": true,
+        "scenario": "stalled_git",
+        "started": false,
+        "settled": true,
+        "error_code": null,
+        "elapsed_ms": 1,
+        "follow_up_settled": true,
+        "follow_up_state": "planned",
+        "process_tree_gone_before_runner_cleanup": true,
+        "pids_observed": 0,
+        "record_state": "planned",
+        "record_error_code": null,
+        "duration_ms": 2182
+      }
+    },
+    {
+      "id": "git_process_cleanup",
+      "weight": 15,
+      "earned": 0,
+      "passed": false,
+      "assertion": "The timed-out Git stand-in and its child are gone before prepare settles.",
+      "timeout_ms": 5000,
+      "duration_ms": 1,
+      "evidence": {
+        "process_tree_gone_before_runner_cleanup": true,
+        "pids_observed": 0,
+        "record_state": "planned"
+      }
+    },
+    {
+      "id": "abort_settling",
+      "weight": 20,
+      "earned": 0,
+      "passed": false,
+      "assertion": "Aborting prepare returns cancellation, Git exits, and later serialized work completes only after Git exits and failed state is saved.",
+      "timeout_ms": 8000,
+      "duration_ms": 1209,
+      "evidence": {
+        "ok": true,
+        "scenario": "abort_prepare",
+        "started": false,
+        "prepare_settled": true,
+        "error_code": null,
+        "follow_up_blocked_before_git_exit": false,
+        "follow_up_settled": true,
+        "git_exit_observed": false,
+        "git_exit_preceded_follow_up": true,
+        "follow_up_elapsed_ms": 1209,
+        "record_state": "planned",
+        "record_error_code": null,
+        "duration_ms": 2246
+      }
+    },
+    {
+      "id": "disabled_plan_bypass",
+      "weight": 10,
+      "earned": 10,
+      "passed": true,
+      "assertion": "Disabled planning returns a direct workspace before the deliberately blocked serializer is released.",
+      "timeout_ms": 3000,
+      "duration_ms": 998,
+      "evidence": {
+        "ok": true,
+        "scenario": "disabled_plan",
+        "resolved_before_release": true,
+        "state": "direct",
+        "reason": "disabled",
+        "duration_ms": 998
+      }
+    }
+  ],
+  "commands": [
+    {
+      "argv": [
+        "node",
+        "benchmarks/worktree-admission/grade.mjs",
+        "--candidate",
+        "<candidate-checkout>"
+      ],
+      "cwd": "<benchmark-repository-root>",
+      "timeout_ms": 30000
+    },
+    {
+      "argv": [
+        "git",
+        "-C",
+        "<candidate-checkout>",
+        "rev-parse",
+        "--show-toplevel"
+      ],
+      "cwd": "<benchmark-repository-root>",
+      "timeout_ms": 1000
+    },
+    {
+      "argv": [
+        "git",
+        "-C",
+        "<candidate-checkout>",
+        "rev-parse",
+        "HEAD"
+      ],
+      "cwd": "<benchmark-repository-root>",
+      "timeout_ms": 1000
+    },
+    {
+      "argv": [
+        "node",
+        "benchmarks/worktree-admission/worker.mjs",
+        "admission",
+        "<candidate-checkout>",
+        "<private-scratch>"
+      ],
+      "cwd": "<benchmark-repository-root>",
+      "timeout_ms": 8000
+    },
+    {
+      "argv": [
+        "node",
+        "benchmarks/worktree-admission/worker.mjs",
+        "stalled_git",
+        "<candidate-checkout>",
+        "<private-scratch>"
+      ],
+      "cwd": "<benchmark-repository-root>",
+      "timeout_ms": 5000
+    },
+    {
+      "argv": [
+        "node",
+        "benchmarks/worktree-admission/worker.mjs",
+        "abort_prepare",
+        "<candidate-checkout>",
+        "<private-scratch>"
+      ],
+      "cwd": "<benchmark-repository-root>",
+      "timeout_ms": 8000
+    },
+    {
+      "argv": [
+        "node",
+        "benchmarks/worktree-admission/worker.mjs",
+        "disabled_plan",
+        "<candidate-checkout>",
+        "<private-scratch>"
+      ],
+      "cwd": "<benchmark-repository-root>",
+      "timeout_ms": 3000
+    },
+    {
+      "argv": [
+        "git",
+        "init",
+        "-q"
+      ],
+      "cwd": "<fixture-repository>",
+      "timeout_ms": 2500
+    },
+    {
+      "argv": [
+        "git",
+        "config",
+        "user.name",
+        "Benchmark Fixture"
+      ],
+      "cwd": "<fixture-repository>",
+      "timeout_ms": 2500
+    },
+    {
+      "argv": [
+        "git",
+        "config",
+        "user.email",
+        "benchmark-fixture@localhost"
+      ],
+      "cwd": "<fixture-repository>",
+      "timeout_ms": 2500
+    },
+    {
+      "argv": [
+        "git",
+        "add",
+        "fixture.txt"
+      ],
+      "cwd": "<fixture-repository>",
+      "timeout_ms": 2500
+    },
+    {
+      "argv": [
+        "git",
+        "commit",
+        "-qm",
+        "fixture"
+      ],
+      "cwd": "<fixture-repository>",
+      "timeout_ms": 2500
+    }
+  ],
+  "runtime": {
+    "node": "v26.10.0",
+    "platform": "darwin-arm64",
+    "total_duration_ms": 7120
+  }
+}

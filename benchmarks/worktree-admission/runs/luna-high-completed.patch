@@ -1,0 +1,410 @@
+diff --git a/adapter.mjs b/adapter.mjs
+index b227ea9..768a15f 100755
+--- a/adapter.mjs
++++ b/adapter.mjs
+@@ -520,6 +520,7 @@ async function callTool(message, signal) {
+         sourceTitle, codexThreadName,
+         startedAt: Date.now(), updatedAt: Date.now(), eventSeq: 0,
+         pollLeaseMs: POLL_LEASE_MS, leaseExpiresAt: Date.now() + POLL_LEASE_MS,
++        worktreePreparation: new AbortController(),
+       };
+       // Acceptance is durable before work is started or queued. Visible prompts
+       // and activity may also be persisted in the private Guard/job-event stream;
+@@ -825,7 +826,7 @@ async function executeJob(job, args) {
+     if (job.stopReason) throw callError(job.stopReason, "Job stopped before execution");
+     if (job.worktreeId) {
+       let workspace;
+-      try { workspace = await worktreeManager.prepare(job.worktreeId); }
++      try { workspace = await worktreeManager.prepare(job.worktreeId, { signal: job.worktreePreparation?.signal }); }
+       catch (error) { throw callError(error.code || "worktree_create_failed", error.message); }
+       job.cwd = workspace.executionCwd;
+       job.sourceCwd = workspace.sourceCwd;
+@@ -918,6 +919,7 @@ function cancelJob(job, reason, details = {}) {
+     return;
+   }
+   job.stopReason = reason;
++  job.worktreePreparation?.abort();
+   job.status = "cancelling";
+   job.errorCode = details.errorCode || job.errorCode;
+   job.message = details.message || job.message;
+diff --git a/worktree-manager.mjs b/worktree-manager.mjs
+index d979a72..ca1f433 100644
+--- a/worktree-manager.mjs
++++ b/worktree-manager.mjs
+@@ -15,17 +15,21 @@ export async function createWorktreeManager(options) {
+ }
+ 
+ class WorktreeManager {
+-  constructor({ rootDir, stateDir, retention = 15, gitBin = "git" }) {
++  constructor({ rootDir, stateDir, retention = 15, gitBin = "git", gitTimeoutMs = 30_000 }) {
+     if (!isAbsolute(rootDir) || !isAbsolute(stateDir)) throw new Error("Worktree paths must be absolute");
+     if (!Number.isSafeInteger(retention) || retention < 1 || retention > 1000) {
+       throw new Error("Worktree retention must be an integer between 1 and 1000");
+     }
++    if (!Number.isSafeInteger(gitTimeoutMs) || gitTimeoutMs < 1 || gitTimeoutMs > 300_000) {
++      throw new Error("Git timeout must be an integer between 1 and 300000 milliseconds");
++    }
+     this.rootDir = resolve(rootDir);
+     this.stateDir = resolve(stateDir);
+     this.stateFile = join(this.stateDir, "worktrees.json");
+     this.snapshotsDir = join(this.stateDir, "worktree-snapshots");
+     this.retention = retention;
+     this.gitBin = gitBin;
++    this.gitTimeoutMs = gitTimeoutMs;
+     this.records = new Map();
+     this.repositoryCache = new Map();
+     this.operation = Promise.resolve();
+@@ -50,13 +54,14 @@ class WorktreeManager {
+   }
+ 
+   async plan({ id, sourceCwd, enabled = true }) {
++    if (!RECORD_ID.test(id)) throw new Error("Invalid worktree id");
++    if (this.records.has(id)) return clone(this.records.get(id));
++    sourceCwd = await realpath(sourceCwd);
++    if (!enabled) return directWorkspace(sourceCwd, "disabled");
++    const repository = await this.inspectRepositoryCached(sourceCwd);
++    if (!repository.git) return directWorkspace(sourceCwd, repository.reason);
+     return this.serial(async () => {
+-      if (!RECORD_ID.test(id)) throw new Error("Invalid worktree id");
+       if (this.records.has(id)) return clone(this.records.get(id));
+-      sourceCwd = await realpath(sourceCwd);
+-      if (!enabled) return directWorkspace(sourceCwd, "disabled");
+-      const repository = await this.inspectRepositoryCached(sourceCwd);
+-      if (!repository.git) return directWorkspace(sourceCwd, repository.reason);
+       const bucket = `${safeName(basename(repository.repoRoot))}-${digest(repository.commonGitDir).slice(0, 10)}`;
+       const worktreeRoot = join(this.rootDir, bucket, id);
+       const executionCwd = repository.relativeCwd ? join(worktreeRoot, repository.relativeCwd) : worktreeRoot;
+@@ -98,15 +103,23 @@ class WorktreeManager {
+     return null;
+   }
+ 
+-  async prepare(id) {
++  async prepare(id, { signal } = {}) {
+     return this.serial(async () => {
++      if (signal?.aborted) throw coded("worktree_cancelled", "Worktree preparation was cancelled");
+       const record = this.require(id);
+       if (record.state === "ready" && await isDirectory(record.executionCwd)) {
+         record.lastUsedAt = record.updatedAt = Date.now();
+         await this.save();
+         return clone(record);
+       }
+-      if (record.state === "snapshotted") return this.restoreRecord(record);
++      if (record.state === "snapshotted") {
++        try { return await this.restoreRecord(record, signal); }
++        catch (error) {
++          if (error.code !== "worktree_cancelled" && !signal?.aborted) throw error;
++          await this.cleanupCancelledWorktree(record).catch(() => {});
++          throw coded("worktree_cancelled", "Worktree preparation was cancelled");
++        }
++      }
+       if (!await isDirectory(record.repoRoot)) throw coded("worktree_source_missing", "Source repository is unavailable");
+       await mkdir(dirname(record.worktreeRoot), { recursive: true, mode: 0o700 });
+       if (await pathExists(record.worktreeRoot)) {
+@@ -117,15 +130,25 @@ class WorktreeManager {
+       record.updatedAt = Date.now();
+       await this.save();
+       try {
+-        await this.git(["-C", record.repoRoot, "-c", "core.hooksPath=/dev/null", "worktree", "add", "--detach", record.worktreeRoot, record.baseSha]);
++        await this.git(["-C", record.repoRoot, "-c", "core.hooksPath=/dev/null", "worktree", "add", "--detach", record.worktreeRoot, record.baseSha], { signal });
++        if (signal?.aborted) throw coded("worktree_cancelled", "Worktree preparation was cancelled");
+         await chmod(record.worktreeRoot, 0o700);
+-        await copyWorktreeIncludes(record.repoRoot, record.worktreeRoot, this.git.bind(this), false);
++        await copyWorktreeIncludes(record.repoRoot, record.worktreeRoot, this.git.bind(this), false, signal);
++        if (signal?.aborted) throw coded("worktree_cancelled", "Worktree preparation was cancelled");
+         if (!await isDirectory(record.executionCwd)) throw coded("worktree_subdirectory_missing", "Selected repository subdirectory is absent from committed HEAD");
+         record.state = "ready";
+         record.updatedAt = record.lastUsedAt = Date.now();
+         await this.save();
+         return clone(record);
+       } catch (error) {
++        if (error.code === "worktree_cancelled" || signal?.aborted) {
++          await this.cleanupCancelledWorktree(record).catch(() => {});
++          record.state = "failed";
++          record.updatedAt = Date.now();
++          record.errorCode = "worktree_cancelled";
++          await this.save();
++          throw coded("worktree_cancelled", "Worktree preparation was cancelled");
++        }
+         record.state = "failed";
+         record.updatedAt = Date.now();
+         record.errorCode = error.code || "worktree_create_failed";
+@@ -168,7 +191,7 @@ class WorktreeManager {
+       let changed = false;
+       for (const record of this.records.values()) {
+         const exists = await isDirectory(record.executionCwd);
+-        if (["planned", "creating", "failed"].includes(record.state) && exists) {
++        if ((["planned", "creating"].includes(record.state) || (record.state === "failed" && record.errorCode !== "worktree_cancelled")) && exists) {
+           record.state = "ready";
+           record.updatedAt = Date.now();
+           changed = true;
+@@ -183,25 +206,28 @@ class WorktreeManager {
+   }
+ 
+   async prune(protectedIds = new Set()) {
+-    return this.serial(async () => {
++    const candidate = await this.serial(async () => {
+       const ready = [...this.records.values()].filter(record => record.state === "ready");
+       let excess = ready.length - this.retention;
+-      if (excess <= 0) return [];
++      if (excess <= 0) return null;
+       const candidates = ready
+         .filter(record => !protectedIds.has(record.id))
+         .sort((a, b) => a.lastUsedAt - b.lastUsedAt);
+-      const pruned = [];
+-      for (const record of candidates) {
+-        if (excess <= 0) break;
+-        try {
+-          await this.snapshotAndRemove(record);
+-          pruned.push(clone(record));
+-          excess -= 1;
+-        } catch {
+-          // Snapshot failure is deliberately non-destructive. Keep the worktree.
+-        }
++      return candidates[0] ? clone(candidates[0]) : null;
++    });
++    if (!candidate) return [];
++    return this.serial(async () => {
++      const record = this.records.get(candidate.id);
++      if (!record || record.state !== "ready" || protectedIds.has(record.id)) return [];
++      const readyCount = [...this.records.values()].filter(item => item.state === "ready").length;
++      if (readyCount <= this.retention) return [];
++      try {
++        await this.snapshotAndRemove(record);
++        return [clone(record)];
++      } catch {
++        // Snapshot failure is deliberately non-destructive. Keep the worktree.
++        return [];
+       }
+-      return pruned;
+     });
+   }
+ 
+@@ -299,14 +325,22 @@ class WorktreeManager {
+     }
+   }
+ 
+-  async restoreRecord(record) {
++  async cleanupCancelledWorktree(record) {
++    if (this.ownsPath(record.worktreeRoot)) await rm(record.worktreeRoot, { recursive: true, force: true });
++    if (await isDirectory(record.repoRoot)) {
++      await this.git(["-C", record.repoRoot, "worktree", "prune"]).catch(() => {});
++    }
++  }
++
++  async restoreRecord(record, signal) {
++    if (signal?.aborted) throw coded("worktree_cancelled", "Worktree preparation was cancelled");
+     if (!record.snapshotBundle || !record.snapshotCommit || !record.snapshotBundleSha256) {
+       throw coded("worktree_snapshot_missing", "Worktree snapshot is unavailable");
+     }
+     if (await hashFile(record.snapshotBundle) !== record.snapshotBundleSha256) {
+       throw coded("worktree_snapshot_invalid", "Worktree snapshot checksum mismatch");
+     }
+-    await this.git(["bundle", "verify", record.snapshotBundle]);
++    await this.git(["bundle", "verify", record.snapshotBundle], { signal });
+     await mkdir(dirname(record.worktreeRoot), { recursive: true, mode: 0o700 });
+     if (await pathExists(record.worktreeRoot)) {
+       if (!this.ownsPath(record.worktreeRoot)) throw coded("worktree_path_invalid", "Refusing unmanaged restore path");
+@@ -314,23 +348,24 @@ class WorktreeManager {
+     }
+     let linked = false;
+     if (await isDirectory(record.repoRoot)) {
+-      const ref = await this.git(["-C", record.repoRoot, "rev-parse", "--verify", record.snapshotCommit], { allowFailure: true });
++      const ref = await this.git(["-C", record.repoRoot, "rev-parse", "--verify", record.snapshotCommit], { allowFailure: true, signal });
+       if (ref.code === 0) {
+-        await this.git(["-C", record.repoRoot, "-c", "core.hooksPath=/dev/null", "worktree", "add", "--detach", record.worktreeRoot, record.snapshotCommit]);
++        await this.git(["-C", record.repoRoot, "-c", "core.hooksPath=/dev/null", "worktree", "add", "--detach", record.worktreeRoot, record.snapshotCommit], { signal });
+         linked = true;
+       }
+     }
+     if (!linked) {
+       await mkdir(record.worktreeRoot, { recursive: true, mode: 0o700 });
+-      await this.git(["-C", record.worktreeRoot, "-c", "core.hooksPath=/dev/null", "init"]);
+-      await this.git(["-C", record.worktreeRoot, "fetch", record.snapshotBundle, record.snapshotRef]);
+-      await this.git(["-C", record.worktreeRoot, "-c", "core.hooksPath=/dev/null", "checkout", "--detach", record.snapshotCommit]);
++      await this.git(["-C", record.worktreeRoot, "-c", "core.hooksPath=/dev/null", "init"], { signal });
++      await this.git(["-C", record.worktreeRoot, "fetch", record.snapshotBundle, record.snapshotRef], { signal });
++      await this.git(["-C", record.worktreeRoot, "-c", "core.hooksPath=/dev/null", "checkout", "--detach", record.snapshotCommit], { signal });
+       record.repoRoot = record.worktreeRoot;
+       record.commonGitDir = join(record.worktreeRoot, ".git");
+     }
+     await chmod(record.worktreeRoot, 0o700);
+     const overlay = join(dirname(record.snapshotBundle), "overlay");
+     await restoreOverlay(overlay, record.worktreeRoot);
++    if (signal?.aborted) throw coded("worktree_cancelled", "Worktree preparation was cancelled");
+     record.executionCwd = record.relativeCwd ? join(record.worktreeRoot, record.relativeCwd) : record.worktreeRoot;
+     if (!await isDirectory(record.executionCwd)) throw coded("worktree_subdirectory_missing", "Restored worktree is missing the selected subdirectory");
+     record.state = "ready";
+@@ -374,6 +409,8 @@ class WorktreeManager {
+         GIT_LFS_SKIP_SMUDGE: "1",
+         ...(options.env || {}),
+       },
++      timeoutMs: this.gitTimeoutMs,
++      signal: options.signal,
+     });
+     if (result.code !== 0 && !options.allowFailure) {
+       throw coded("worktree_git_failed", result.stderr.trim() || "Git worktree operation failed");
+@@ -398,11 +435,11 @@ function directWorkspace(sourceCwd, reason) {
+   };
+ }
+ 
+-async function copyWorktreeIncludes(sourceRoot, destinationRoot, git, overwrite) {
++async function copyWorktreeIncludes(sourceRoot, destinationRoot, git, overwrite, signal) {
+   const includeFile = join(sourceRoot, ".worktreeinclude");
+   const paths = new Set();
+   if (await pathExists(includeFile)) {
+-    const listed = await git(["-C", sourceRoot, "ls-files", "--others", "--ignored", "--exclude-from=.worktreeinclude", "-z"], { allowFailure: true });
++    const listed = await git(["-C", sourceRoot, "ls-files", "--others", "--ignored", "--exclude-from=.worktreeinclude", "-z"], { allowFailure: true, signal });
+     if (listed.code === 0) for (const path of listed.stdout.split("\0")) if (path) paths.add(path);
+   }
+   if (await pathExists(join(sourceRoot, "AGENTS.override.md"))) paths.add("AGENTS.override.md");
+@@ -472,20 +509,48 @@ async function writePrivateJson(path, value) {
+   await rename(temporary, path);
+ }
+ 
+-function runProcess(command, args, { cwd, env } = {}) {
++function runProcess(command, args, { cwd, env, timeoutMs = 30_000, signal } = {}) {
+   return new Promise((resolvePromise, rejectPromise) => {
++    if (signal?.aborted) {
++      rejectPromise(coded("worktree_cancelled", "Worktree preparation was cancelled"));
++      return;
++    }
+     const child = spawn(command, args, { cwd, env, stdio: ["ignore", "pipe", "pipe"] });
+     let stdout = "";
+     let stderr = "";
++    let settled = false;
++    let timeout;
++    let killTimer;
++    let terminationError;
++    const finish = (error, result) => {
++      if (settled) return;
++      settled = true;
++      clearTimeout(timeout);
++      clearTimeout(killTimer);
++      signal?.removeEventListener("abort", abort);
++      error ? rejectPromise(error) : resolvePromise(result);
++    };
++    const terminate = error => {
++      if (child.exitCode !== null || child.signalCode !== null) return;
++      terminationError ||= error;
++      child.kill("SIGTERM");
++      killTimer = setTimeout(() => child.kill("SIGKILL"), 250);
++      killTimer.unref?.();
++    };
++    const stop = code => terminate(coded(code, code === "worktree_cancelled" ? "Worktree preparation was cancelled" : "Git command timed out"));
++    const abort = () => stop("worktree_cancelled");
++    signal?.addEventListener("abort", abort, { once: true });
++    timeout = setTimeout(() => stop("worktree_git_timeout"), timeoutMs);
++    timeout.unref?.();
+     const append = (current, chunk) => {
+       const next = current + chunk.toString();
+       if (Buffer.byteLength(next) > 8 * 1024 * 1024) throw coded("worktree_output_too_large", "Git output exceeded the safety limit");
+       return next;
+     };
+-    child.stdout.on("data", chunk => { try { stdout = append(stdout, chunk); } catch (error) { child.kill(); rejectPromise(error); } });
+-    child.stderr.on("data", chunk => { try { stderr = append(stderr, chunk); } catch (error) { child.kill(); rejectPromise(error); } });
+-    child.once("error", rejectPromise);
+-    child.once("exit", code => resolvePromise({ code: code ?? 1, stdout, stderr }));
++    child.stdout.on("data", chunk => { try { stdout = append(stdout, chunk); } catch (error) { terminate(error); } });
++    child.stderr.on("data", chunk => { try { stderr = append(stderr, chunk); } catch (error) { terminate(error); } });
++    child.once("error", error => finish(error));
++    child.once("exit", code => finish(terminationError, { code: code ?? 1, stdout, stderr }));
+   });
+ }
+ 
+diff --git a/worktree-manager.test.mjs b/worktree-manager.test.mjs
+index a376721..c23bdf9 100644
+--- a/worktree-manager.test.mjs
++++ b/worktree-manager.test.mjs
+@@ -91,6 +91,22 @@ test("falls back to direct mode for disabled, non-Git, and unborn repositories",
+   assert.equal(unbornResult.reason, "unborn_head");
+ });
+ 
++test("direct planning does not wait behind serialized cleanup work", async t => {
++  const f = await repository(t);
++  const manager = await createWorktreeManager({ rootDir: f.rootDir, stateDir: f.stateDir, retention: 15 });
++  manager.operation = new Promise(() => {});
++  const plain = join(f.temp, "plain");
++  await mkdir(plain);
++  const [disabled, nonGit] = await Promise.all([
++    manager.plan({ id: firstId, sourceCwd: f.repo, enabled: false }),
++    manager.plan({ id: secondId, sourceCwd: plain }),
++  ]);
++  assert.equal(disabled.state, "direct");
++  assert.equal(disabled.reason, "disabled");
++  assert.equal(nonGit.state, "direct");
++  assert.equal(nonGit.reason, "non_git");
++});
++
+ test("retention snapshots Git-visible work and declared setup, then restores after source deletion", async t => {
+   const f = await repository(t);
+   const manager = await createWorktreeManager({ rootDir: f.rootDir, stateDir: f.stateDir, retention: 1 });
+@@ -148,6 +164,69 @@ test("active worktrees are protected and snapshot failure never deletes the work
+   assert.equal((await lstat(third.worktreeRoot)).isDirectory(), true);
+ });
+ 
++test("prune processes one oldest candidate per pass and leaves protected worktrees active", async t => {
++  const f = await repository(t);
++  const manager = await createWorktreeManager({ rootDir: f.rootDir, stateDir: f.stateDir, retention: 1 });
++  const ids = [firstId, secondId, "33333333-3333-3333-3333-333333333333"];
++  for (const id of ids) {
++    await manager.plan({ id, sourceCwd: f.repo });
++    await manager.prepare(id);
++    await manager.bindThread(id, `thread-${id}`);
++  }
++  const snapshotted = [];
++  manager.snapshotAndRemove = async record => {
++    snapshotted.push(record.id);
++    record.state = "snapshotted";
++    record.updatedAt = Date.now();
++  };
++  const firstPass = await manager.prune(new Set([secondId]));
++  assert.deepEqual(firstPass.map(record => record.id), [firstId]);
++  assert.deepEqual(snapshotted, [firstId]);
++  assert.equal(manager.get(secondId).state, "ready");
++  assert.equal(manager.get(ids[2]).state, "ready");
++
++  const secondPass = await manager.prune(new Set([secondId]));
++  assert.deepEqual(secondPass.map(record => record.id), [ids[2]]);
++  assert.deepEqual(snapshotted, [firstId, ids[2]]);
++  assert.equal(manager.get(secondId).state, "ready");
++});
++
++test("cancelled preparation kills Git, removes its partial worktree, and releases the manager queue", async t => {
++  const f = await repository(t);
++  const hangingGit = join(f.temp, "hanging-git.mjs");
++  await writeFile(hangingGit, `#!/usr/bin/env node
++import { execFileSync } from "node:child_process";
++if (process.argv.includes("add")) { setInterval(() => {}, 1000); }
++execFileSync("git", process.argv.slice(2), { stdio: "inherit" });
++`);
++  await chmod(hangingGit, 0o700);
++  const manager = await createWorktreeManager({ rootDir: f.rootDir, stateDir: f.stateDir, gitBin: hangingGit, gitTimeoutMs: 5000 });
++  await manager.plan({ id: firstId, sourceCwd: f.repo });
++  const controller = new AbortController();
++  const preparation = manager.prepare(firstId, { signal: controller.signal });
++  await delay(50);
++  controller.abort();
++  await assert.rejects(preparation, { code: "worktree_cancelled" });
++  assert.equal(manager.get(firstId).state, "failed");
++  await assert.rejects(lstat(manager.get(firstId).worktreeRoot), { code: "ENOENT" });
++
++  const planned = await manager.plan({ id: secondId, sourceCwd: f.repo });
++  assert.equal(planned.state, "planned");
++});
++
++test("Git commands time out with a stable error code", async t => {
++  const f = await repository(t);
++  const hangingGit = join(f.temp, "hanging-git.mjs");
++  await writeFile(hangingGit, `#!/usr/bin/env node
++setInterval(() => {}, 1000);
++`);
++  await chmod(hangingGit, 0o700);
++  const manager = await createWorktreeManager({ rootDir: f.rootDir, stateDir: f.stateDir, gitBin: hangingGit, gitTimeoutMs: 80 });
++  await assert.rejects(manager.plan({ id: firstId, sourceCwd: f.repo }), { code: "worktree_git_timeout" });
++});
++
++function delay(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
++
+ function command(commandName, args) {
+   return new Promise((resolve, reject) => {
+     const child = spawn(commandName, args, { stdio: ["ignore", "pipe", "pipe"] });
