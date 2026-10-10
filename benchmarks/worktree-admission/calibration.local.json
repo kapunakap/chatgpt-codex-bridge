@@ -1,0 +1,69 @@
+{
+  "schema_version": 1,
+  "benchmark_id": "chatgpt-codex-bridge.worktree-admission.v1",
+  "calibration_kind": "implementation_calibration_not_model_result",
+  "observed_on": "2026-10-10",
+  "runtime": {
+    "node": "v26.10.0",
+    "platform": "darwin-arm64",
+    "git": "2.54.0"
+  },
+  "materialized_agent_input_check": {
+    "command_from_repository_root": "node benchmarks/worktree-admission/materialize-task.mjs --repo benchmarks/worktree-admission/.calibration/materializer-repo --destination benchmarks/worktree-admission/.calibration/materialized-source",
+    "verified_source_tree": "be26240abf23a476fb940ccf5b0a307b8c3535e0",
+    "archive_sha256": "9a25a2cfa37d540db05d0f4e2a69f73383f4ca69d4814288b09b0640a7f7fdc0",
+    "task_prompt_sha256": "f90da1a7251db483bbc9f0bd349f852fc2569b13272113e2be278d3900e541c5",
+    "no_git_history": true,
+    "no_reference_or_grader_files": true,
+    "task_copy_matches": true
+  },
+  "commands_from_repository_root": [
+    "node --test benchmarks/worktree-admission/grader.test.mjs",
+    "node benchmarks/worktree-admission/grade.mjs --candidate benchmarks/worktree-admission/.calibration/pre-fix --label frozen-pre-fix > benchmarks/worktree-admission/.calibration/baseline.json",
+    "node benchmarks/worktree-admission/grade.mjs --candidate benchmarks/worktree-admission/.calibration/reference --label historical-reference > benchmarks/worktree-admission/.calibration/reference.json",
+    "node benchmarks/worktree-admission/calibration-check.mjs benchmarks/worktree-admission/.calibration/baseline.json benchmarks/worktree-admission/.calibration/reference.json"
+  ],
+  "source_checkouts": {
+    "frozen_pre_fix": {
+      "commit": "0fdfa620d5d99ee5f40d3bc688d714f834fb2802",
+      "tree": "be26240abf23a476fb940ccf5b0a307b8c3535e0",
+      "git_archive_sha256": "9a25a2cfa37d540db05d0f4e2a69f73383f4ca69d4814288b09b0640a7f7fdc0",
+      "worktree_manager_sha256": "88ae068a53afdfd1882cd519ef5c096ab966ed21c080cb17af15944dd4cd79ed"
+    },
+    "historical_reference": {
+      "commit": "c32868dfa120cde597a7cc097081c065988fc7ee",
+      "tree": "4972815a1c363820905113a0a34a9b573ad0c60e",
+      "git_archive_sha256": "d68e5b2d3f2d297356b6f80eaaa8bab94e3f8c3209216c4df31a4fc8a4b3ea1e",
+      "worktree_manager_sha256": "0129596de38c5d322346f50689c275f870533113c5b2eadf0a600d7c2507088c"
+    }
+  },
+  "results": {
+    "frozen_pre_fix": {
+      "score": 0,
+      "max_score": 100,
+      "total_duration_ms": 10267,
+      "criteria": [
+        {"id": "admission_preemption", "weight": 25, "passed": false, "duration_ms": 1566, "evidence": {"backlog_records": 225, "winner": "second_gc_candidate", "snapshot_calls": 210}},
+        {"id": "prune_batch_bound", "weight": 15, "passed": false, "duration_ms": 1566, "evidence": {"backlog_records": 225, "snapshot_calls": 210, "pruned_count": 210}},
+        {"id": "git_timeout_bound", "weight": 15, "passed": false, "duration_ms": null, "evidence": {"stand_in_started": true, "prepare_settled": false, "record_state": "creating"}},
+        {"id": "git_process_cleanup", "weight": 15, "passed": false, "duration_ms": null, "evidence": {"process_tree_gone_before_runner_cleanup": false, "pids_observed": 2}},
+        {"id": "abort_settling", "weight": 20, "passed": false, "duration_ms": null, "evidence": {"stand_in_started": true, "prepare_settled": false, "follow_up_settled": false, "record_state": "creating"}},
+        {"id": "disabled_plan_bypass", "weight": 10, "passed": false, "duration_ms": 969, "evidence": {"resolved_before_release": false}}
+      ]
+    },
+    "historical_reference": {
+      "score": 100,
+      "max_score": 100,
+      "total_duration_ms": 4554,
+      "criteria": [
+        {"id": "admission_preemption", "weight": 25, "passed": true, "duration_ms": 852, "evidence": {"backlog_records": 225, "winner": "admission", "snapshot_calls": 4}},
+        {"id": "prune_batch_bound", "weight": 15, "passed": true, "duration_ms": 852, "evidence": {"backlog_records": 225, "snapshot_calls": 4, "pruned_count": 4}},
+        {"id": "git_timeout_bound", "weight": 15, "passed": true, "duration_ms": 616, "evidence": {"stand_in_started": true, "error_code": "worktree_git_timeout", "process_tree_gone": true}},
+        {"id": "git_process_cleanup", "weight": 15, "passed": true, "duration_ms": 616, "evidence": {"process_tree_gone_before_runner_cleanup": true, "pids_observed": 2}},
+        {"id": "abort_settling", "weight": 20, "passed": true, "duration_ms": 531, "evidence": {"error_code": "worktree_cancelled", "git_exit_preceded_follow_up": true, "record_state": "failed", "record_error_code": "worktree_cancelled"}},
+        {"id": "disabled_plan_bypass", "weight": 10, "passed": true, "duration_ms": 726, "evidence": {"resolved_before_release": true, "state": "direct", "reason": "disabled"}}
+      ]
+    }
+  },
+  "interpretation": "The frozen implementation fails every targeted assertion; the historical reference passes all six. These are code calibration results from one local runtime, not measurements of any AI model and not production throughput claims."
+}
