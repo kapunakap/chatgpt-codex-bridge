@@ -70,6 +70,7 @@ fi
 
 readonly SOURCE_ROOT="${0:A:h:h}"
 readonly SOURCE_COMMIT="$(git -C "${SOURCE_ROOT}" rev-parse HEAD 2>/dev/null || print unknown)"
+source "${SOURCE_ROOT}/bin/local-codex-runtime.zsh"
 readonly TARGET_ROOT="${target_root:+${target_root:A}}"
 readonly RUNTIME_API_KEY_FILE="${runtime_api_key_file:A}"
 readonly USER_HOME="${HOME}"
@@ -94,6 +95,7 @@ readonly WATCH_NODE_PATH="${LIBEXEC_DIR}/local-codex-watch.mjs"
 readonly WATCH_RENDER_PATH="${LIBEXEC_DIR}/local-codex-watch-render.mjs"
 readonly DIAGNOSTICS_PATH="${LIBEXEC_DIR}/scripts/local-codex-diagnostics.mjs"
 readonly LAUNCHER_PATH="${BIN_DIR}/local-codex-tunnel"
+readonly RUNTIME_HELPER_PATH="${BIN_DIR}/local-codex-runtime.zsh"
 readonly WATCH_PATH="${BIN_DIR}/local-codex-watch"
 readonly DOCTOR_PATH="${BIN_DIR}/local-codex-doctor"
 readonly CANARY_PATH="${BIN_DIR}/local-codex-canary"
@@ -146,7 +148,7 @@ if [[ "${dry_run}" == "true" ]]; then
   exit 0
 fi
 
-for required_command in node tunnel-client curl openssl git; do
+for required_command in tunnel-client curl openssl git; do
   if ! command -v "${required_command}" >/dev/null 2>&1; then
     print -u2 "Required command is missing: ${required_command}"
     exit 1
@@ -158,11 +160,7 @@ if [[ ! -x "${RESOLVED_CODEX_BIN}" ]] && ! command -v "${RESOLVED_CODEX_BIN}" >/
   exit 1
 fi
 
-node_major=$(node -p 'Number(process.versions.node.split(".")[0])')
-if (( node_major < 22 )); then
-  print -u2 "Node.js 22 or newer is required."
-  exit 1
-fi
+RESOLVED_NODE_BIN="$(local_codex_resolve_node)"
 
 mkdir -p "${BIN_DIR}" "${LIBEXEC_DIR}" "${LIBEXEC_DIR}/bin" "${LIBEXEC_DIR}/scripts" "${PROFILE_DIR}"
 mkdir -p "${TUNNEL_STATE_DIR}/health" "${TUNNEL_STATE_DIR}/logs"
@@ -181,6 +179,7 @@ install -m 755 "${SOURCE_ROOT}/bin/local-codex-guard-proxy.mjs" "${GUARD_PROXY_P
 install -m 755 "${SOURCE_ROOT}/bin/local-codex-watch.mjs" "${WATCH_NODE_PATH}"
 install -m 644 "${SOURCE_ROOT}/bin/local-codex-watch-render.mjs" "${WATCH_RENDER_PATH}"
 install -m 755 "${SOURCE_ROOT}/scripts/local-codex-diagnostics.mjs" "${DIAGNOSTICS_PATH}"
+install -m 644 "${SOURCE_ROOT}/bin/local-codex-runtime.zsh" "${RUNTIME_HELPER_PATH}"
 install -m 755 "${SOURCE_ROOT}/bin/local-codex-tunnel" "${LAUNCHER_PATH}"
 install -m 755 "${SOURCE_ROOT}/bin/local-codex-watch" "${WATCH_PATH}"
 install -m 755 "${SOURCE_ROOT}/bin/local-codex-doctor" "${DOCTOR_PATH}"
@@ -209,6 +208,8 @@ config_tmp=$(mktemp "${STATE_DIR}/config.env.XXXXXX")
   printf 'LOCAL_CODEX_TRACE_LOG_MAX_BYTES=%q\n' "5242880"
   printf 'LOCAL_CODEX_TRACE_LOG_ROTATIONS=%q\n' "3"
   printf 'LOCAL_CODEX_BRIDGE_SOURCE_COMMIT=%q\n' "${SOURCE_COMMIT}"
+  printf 'LOCAL_CODEX_NODE_BIN=%q\n' "${RESOLVED_NODE_BIN}"
+  printf 'LOCAL_CODEX_ADAPTER_STARTUP_TIMEOUT_MS=%q\n' "60000"
   printf 'LOCAL_CODEX_JOBS_DIR=%q\n' "${STATE_DIR}/jobs"
   printf 'LOCAL_CODEX_WORKTREE_ROOT=%q\n' "${WORKTREE_ROOT}"
   printf 'LOCAL_CODEX_WORKTREE_RETENTION=%q\n' "15"
@@ -236,7 +237,7 @@ chmod 600 "${config_tmp}"
 mv "${config_tmp}" "${CONFIG_FILE}"
 
 profile_tmp=$(mktemp "${PROFILE_DIR}/${PROFILE_NAME}.yaml.XXXXXX")
-node "${SOURCE_ROOT}/scripts/render-profile.mjs" \
+"${RESOLVED_NODE_BIN}" "${SOURCE_ROOT}/scripts/render-profile.mjs" \
   "${profile_tmp}" \
   "${tunnel_id}" \
   "${RUNTIME_API_KEY_FILE}" \

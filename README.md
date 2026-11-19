@@ -156,6 +156,8 @@ The installer:
 - writes private local configuration under `~/Library/Application Support/local-codex-tunnel`;
 - writes `~/.config/tunnel-client/local-codex.yaml` without copying or printing the API key.
 
+The installer and launcher validate that Node runs and is version 22 or newer. At launch, the selected runtime's directory is prepended to PATH so adapter scripts use it even when launchd has an incomplete PATH. If PATH's `node` is broken, the launcher checks the installed Homebrew `node@24` and `node@22` runtimes. Adapter readiness waits up to 60 seconds by default; set `LOCAL_CODEX_ADAPTER_STARTUP_TIMEOUT_MS` in the local config to a value from 1000 to 120000 milliseconds to adjust it.
+
 Preview paths and validation without changing anything:
 
 ```bash

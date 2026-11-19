@@ -11,6 +11,9 @@ if [[ ! -r "${CONFIG_FILE}" ]]; then
 fi
 
 source "${CONFIG_FILE}"
+source "${0:A:h}/local-codex-runtime.zsh"
+RESOLVED_NODE_BIN="$(local_codex_resolve_node)"
+export PATH="${RESOLVED_NODE_BIN:h}:${PATH}"
 readonly BUNDLED_CODEX_CANDIDATE="${LOCAL_CODEX_BUNDLED_CODEX_CANDIDATE:-/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex}"
 configured="${LOCAL_CODEX_REAL_BIN:-}"
 if [[ ( -z "${configured}" || "${configured}" == codex ) && -x "${BUNDLED_CODEX_CANDIDATE}" ]]; then
@@ -35,6 +38,10 @@ readonly ADAPTER_HOST="${LOCAL_CODEX_ADAPTER_HOST:-127.0.0.1}"
 readonly ADAPTER_PORT="${LOCAL_CODEX_ADAPTER_PORT:-8766}"
 readonly PUBLIC_URL="http://${PUBLIC_HOST}:${PUBLIC_PORT}"
 readonly ADAPTER_URL="http://${ADAPTER_HOST}:${ADAPTER_PORT}"
+adapter_startup_attempts="$(local_codex_timeout_attempts "${LOCAL_CODEX_ADAPTER_STARTUP_TIMEOUT_MS:-60000}")" || {
+  print -u2 "LOCAL_CODEX_ADAPTER_STARTUP_TIMEOUT_MS must be between 1000 and 120000"
+  exit 1
+}
 
 if [[ ! -x "${LOCAL_CODEX_ADAPTER}" ]]; then
   print -u2 "Local Codex adapter is not installed: ${LOCAL_CODEX_ADAPTER}"
@@ -95,21 +102,7 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM HUP
 
-for _ in {1..50}; do
-  if /usr/bin/curl -fsS "${ADAPTER_URL}/readyz" >/dev/null 2>&1; then
-    break
-  fi
-  if ! kill -0 "${adapter_pid}" 2>/dev/null; then
-    print -u2 "Local Codex adapter stopped during startup"
-    exit 1
-  fi
-  sleep 0.1
-done
-
-if ! /usr/bin/curl -fsS "${ADAPTER_URL}/readyz" >/dev/null; then
-  print -u2 "Local Codex adapter did not become ready"
-  exit 1
-fi
+local_codex_wait_for_ready "${ADAPTER_URL}/readyz" "${adapter_startup_attempts}" "Local Codex adapter" "${adapter_pid}"
 
 LOCAL_CODEX_TOKEN_FILE="${LOCAL_CODEX_TOKEN_FILE}" \
 LOCAL_CODEX_STATE_FILE="${LOCAL_CODEX_STATE_FILE}" \
