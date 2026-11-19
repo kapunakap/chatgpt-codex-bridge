@@ -5,6 +5,7 @@ import { access } from "node:fs/promises";
 import { constants } from "node:fs";
 import { isAbsolute, resolve } from "node:path";
 import process from "node:process";
+import { appendStartupStderr, appServerTermination } from "../startup-diagnostics.mjs";
 import {
   createTraceStoreFromEnv,
   folderFingerprint,
@@ -17,9 +18,12 @@ await access(SECURE_BIN, constants.X_OK);
 
 const requestedArgs = process.argv.slice(2);
 const appServerMode = requestedArgs[0] === "app-server";
+const [secureCommand, secureArgs] = SECURE_BIN.endsWith(".mjs")
+  ? [process.execPath, [SECURE_BIN, ...requestedArgs]]
+  : [SECURE_BIN, requestedArgs];
 
 if (!appServerMode) {
-  const child = spawn(SECURE_BIN, requestedArgs, { stdio: "inherit", env: process.env, cwd: process.cwd() });
+  const child = spawn(secureCommand, secureArgs, { stdio: "inherit", env: process.env, cwd: process.cwd() });
   for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"]) {
     process.on(signal, () => { try { child.kill(signal); } catch {} });
   }
@@ -65,7 +69,7 @@ async function runInstrumented() {
     else writeEvent(record);
   }
 
-  const child = spawn(SECURE_BIN, requestedArgs, {
+  const child = spawn(secureCommand, secureArgs, {
     cwd: process.cwd(),
     env: process.env,
     stdio: ["pipe", "pipe", "pipe"],
@@ -76,6 +80,9 @@ async function runInstrumented() {
   let stdinBuffer = "";
   let stdoutBuffer = "";
   let turnCompleted = false;
+  let appServerFailureEmitted = false;
+  let appServerInitialized = false;
+  let startupStderr = "";
   let cleanupStarted = false;
 
   function inspectOutbound(line) {
@@ -100,6 +107,8 @@ async function runInstrumented() {
       const stageDurationMs = Date.now() - entry.startedAt;
       const failed = Boolean(message.error);
       if (entry.method === "initialize") {
+        appServerInitialized = !failed;
+        appServerFailureEmitted = failed;
         emit(failed ? "codex.app_server.failed" : "codex.app_server.ready", {
           stageDurationMs,
           ...(failed ? { errorCode: "app_server_start_failed" } : {}),
@@ -156,7 +165,9 @@ async function runInstrumented() {
       if (line) inspectInbound(line);
     }
   });
-  child.stderr.on("data", chunk => process.stderr.write(chunk));
+  child.stderr.on("data", chunk => {
+    if (!appServerInitialized) startupStderr = appendStartupStderr(startupStderr, chunk);
+  });
 
   for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"]) {
     process.on(signal, () => {
@@ -172,17 +183,39 @@ async function runInstrumented() {
     child.on("error", () => resolvePromise({ code: 1, signal: null, spawnError: true }));
     child.on("exit", (code, signal) => resolvePromise({ code, signal, spawnError: false }));
   });
+  if (exit.spawnError) process.stderr.write("LOCAL_CODEX_APP_SERVER_SPAWN_ERROR=1\n");
+  else if (exit.signal && /^SIG[A-Z0-9]{1,12}$/.test(exit.signal)) {
+    process.stderr.write(`LOCAL_CODEX_APP_SERVER_EXIT_SIGNAL=${exit.signal}\n`);
+  }
+  const termination = appServerTermination({ ...exit, stderr: startupStderr });
+  if (termination.startupDiagnostic === "missing_dynamic_library") {
+    process.stderr.write("LOCAL_CODEX_APP_SERVER_MISSING_DYNAMIC_LIBRARY=1\n");
+  }
   if (!cleanupStarted) {
     cleanupStarted = true;
     emit("job.cleanup.started", { detail: exit.spawnError ? "spawn_error" : "process_exit" });
   }
   emit("job.cleanup.completed", {
-    processExitCode: exit.code ?? undefined,
-    processSignal: exit.signal ?? undefined,
+    processState: termination.processState,
+    ...(Number.isInteger(exit.code) ? { processExitCode: exit.code } : {}),
+    ...(exit.signal ? { processSignal: termination.processSignal || "signal" } : {}),
+    ...(termination.startupDiagnostic ? { startupDiagnostic: termination.startupDiagnostic } : {}),
     ...(exit.spawnError ? { errorCode: "app_server_start_failed" } : {}),
     observed: true,
   });
-  if (!turnCompleted && exit.spawnError) emit("codex.app_server.failed", { errorCode: "app_server_start_failed" });
+  if (!turnCompleted && !appServerFailureEmitted) {
+    const errorCode = exit.spawnError ? "app_server_spawn_failed"
+      : termination.startupDiagnostic === "missing_dynamic_library" ? "app_server_missing_library"
+        : exit.signal ? "app_server_terminated"
+          : "app_server_exit";
+    emit("codex.app_server.failed", {
+      errorCode,
+      processState: termination.processState,
+      ...(Number.isInteger(exit.code) ? { processExitCode: exit.code } : {}),
+      ...(exit.signal ? { processSignal: termination.processSignal || "signal" } : {}),
+      ...(termination.startupDiagnostic ? { startupDiagnostic: termination.startupDiagnostic } : {}),
+    });
+  }
   await contextPromise;
   process.exit(exit.code ?? (exit.signal ? 1 : 0));
 }

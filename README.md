@@ -156,7 +156,9 @@ The installer:
 - writes private local configuration under `~/Library/Application Support/local-codex-tunnel`;
 - writes `~/.config/tunnel-client/local-codex.yaml` without copying or printing the API key.
 
-The installer and launcher validate that Node runs and is version 22 or newer. At launch, the selected runtime's directory is prepended to PATH so adapter scripts use it even when launchd has an incomplete PATH. If PATH's `node` is broken, the launcher checks the installed Homebrew `node@24` and `node@22` runtimes. Adapter readiness waits up to 60 seconds by default; set `LOCAL_CODEX_ADAPTER_STARTUP_TIMEOUT_MS` in the local config to a value from 1000 to 120000 milliseconds to adjust it.
+The installer and launcher validate that Node runs and is version 22 or newer. At launch, the selected runtime's directory is prepended to PATH so adapter scripts use it even when launchd has an incomplete PATH. If PATH's `node` is broken, the launcher checks the installed Homebrew `node@24` and `node@22` runtimes, then the standard Homebrew locations. Adapter readiness waits up to 60 seconds by default; set `LOCAL_CODEX_ADAPTER_STARTUP_TIMEOUT_MS` in the local config to a value from 1000 to 120000 milliseconds to adjust it.
+
+Startup failures record bounded, secret-free process diagnostics: `processState` (`spawn_error`, `signal`, `exit_code`, or `unknown_exit`), `processSignal`, `processExitCode`, and the allowlisted `startupDiagnostic` value `missing_dynamic_library`. Raw startup stderr and filesystem paths are never included in audit events or user-facing errors. The wrapper also emits safe nested process signal/spawn markers so the adapter can report the actual App Server termination.
 
 Preview paths and validation without changing anything:
 
@@ -236,6 +238,8 @@ v3.5.1 repairs local Git inside network-disabled macOS jobs. Normal jobs receive
 v3.5.2 makes the network-disabled macOS profile constant-size, intentionally broadens user-home reads to avoid recursive sibling enumeration, and sets zsh's `TMPPREFIX` to the authorized per-job scratch directory. The workspace write boundary, fixed credential denies, control-state deny, and temporary-tree denial remain in place.
 
 v3.5.3 fixes stale terminal worktree recovery; PR #19 fixes worktree-prune admission, GC preemption, bounded timeouts, and admission coalescing, eliminating ~120s admission stalls under large backlogs; PR #20 verifies bundles outside a repository cwd; PR #22 makes the zsh heredoc assertion macOS-only for CI portability; PR #23 adds model/reasoning ceilings; and issue #27 updates the defaults to gpt-6-luna/max.
+
+v3.6.4 adds safe App Server startup diagnostics: bounded stderr classification without raw secret-bearing output, distinct spawn/exit/signal status, and regression tests. This release also includes the Node.js startup recovery merged in PR #37, selecting a healthy Node 22+ installation when the first PATH candidate is broken.
 
 v3.6.3 enables Codex Fast Mode by default by sending App Server `serviceTier: "priority"` on new threads and every turn, including resumed replies, while keeping the default `gpt-6-luna` / max reasoning unchanged. Fast Mode remains independent of reasoning effort.
 

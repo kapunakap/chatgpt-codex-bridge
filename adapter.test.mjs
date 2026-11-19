@@ -51,6 +51,7 @@ async function fixture(t, options = {}) {
     LOCAL_CODEX_REASONING_CEILING: options.reasoningCeiling ?? "max",
     LOCAL_CODEX_MAX_CONCURRENCY: String(options.maxConcurrency ?? 10), LOCAL_CODEX_MAX_QUEUE: String(options.maxQueue ?? 100),
     FAKE_ROOT: root, TEST_DENY_GROUP_PROBE: options.deniedGroupProbe ? "1" : "0",
+    FAKE_STARTUP_FAILURE: options.startupFailure ?? "",
     ...(options.path ? { PATH: `${options.path}:${process.env.PATH}` } : {}),
   };
   async function start() {
@@ -116,7 +117,7 @@ test("discovery, authentication, schemas, and validation", async t => {
   assert.equal(discover.error.code, -32601);
   const initialized = await f.rpc({ jsonrpc: "2.0", id: "i", method: "initialize", params: { protocolVersion: "2025-11-25" } });
   assert.equal(initialized.result.protocolVersion, "2025-11-25");
-  assert.equal(initialized.result.serverInfo.version, "3.6.3");
+  assert.equal(initialized.result.serverInfo.version, "3.6.4");
   const listed = await f.rpc({ jsonrpc: "2.0", id: "l", method: "tools/list" });
   assert.deepEqual(listed.result.tools.map(t => t.name), ["codex", "codex-reply", "codex-status", "codex-cancel", "codex-browser-status", "codex-folders"]);
   const browserStatus = listed.result.tools.find(t => t.name === "codex-browser-status");
@@ -720,7 +721,7 @@ test("regular status polling keeps a job alive beyond one lease", async t => {
   assert.ok(result.elapsedMs > result.pollLeaseMs);
 });
 
-test("timeout, stubborn child cleanup, server failure, and missing executable", async t => {
+test("timeout, app-server exit diagnostics, recovery, and missing executable", async t => {
   const timeoutFixture = await fixture(t, { timeout: 250 });
   const held = await timeoutFixture.call("codex", { requestId: "t", prompt: "stubborn" });
   const timed = await timeoutFixture.finished(held.jobId);
@@ -730,8 +731,28 @@ test("timeout, stubborn child cleanup, server failure, and missing executable", 
   const f = await fixture(t);
   const crash = await f.finished((await f.call("codex", { requestId: "c", prompt: "crash" })).jobId);
   assert.equal(crash.status, "failed"); assert.equal(crash.errorCode, "server_exit");
+  assert.match(crash.message, /exited with code 9/);
   const ok = await f.finished((await f.call("codex", { requestId: "ok", prompt: "hello" })).jobId);
   assert.equal(ok.status, "completed");
+
+  for (const [startupFailure, pattern, state] of [
+    ["dyld", /missing dynamic library during startup/, /"startupDiagnostic":"missing_dynamic_library"/],
+    ["signal", /SIGABRT/, /"processSignal":"SIGABRT"/],
+    ["exit", /exited with code 23/, /"processExitCode":23/],
+  ]) {
+    const recovering = await fixture(t, { startupFailure });
+    const failed = await recovering.finished((await recovering.call("codex", { requestId: `startup-${startupFailure}`, prompt: "hello" })).jobId);
+    assert.equal(failed.status, "failed");
+    assert.equal(failed.errorCode, "server_exit");
+    assert.match(failed.message, pattern);
+    assert.doesNotMatch(failed.message, /PRIVATE_RUNTIME_SECRET|secret-runtime-path|RAW_STARTUP_SECRET/);
+    const auditLog = await readFile(join(recovering.root, "audit.log"), "utf8");
+    assert.match(auditLog, state);
+    assert.doesNotMatch(auditLog, /PRIVATE_RUNTIME_SECRET|secret-runtime-path|RAW_STARTUP_SECRET/);
+    const healthy = await recovering.finished((await recovering.call("codex", { requestId: `healthy-${startupFailure}`, prompt: "hello" })).jobId);
+    assert.equal(healthy.status, "completed");
+  }
+
   const missing = await fixture(t, { missingBin: true });
   const failed = await missing.finished((await missing.call("codex", { requestId: "missing", prompt: "hello" })).jobId);
   assert.equal(failed.status, "failed"); assert.equal(failed.errorCode, "spawn_failed");
@@ -949,7 +970,7 @@ test("native macOS sandbox enforces the command network toggle", {
 const fakeSource = String.raw`#!/usr/bin/env node
 import { createInterface } from 'node:readline';
 import { spawn } from 'node:child_process';
-import { appendFileSync, readFileSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 const root = process.env.FAKE_ROOT;
@@ -965,6 +986,22 @@ const catalog = [
  {model:'gpt-5.6-terra',supportedReasoningEfforts:[{reasoningEffort:'high'}]},
 ];
 log({event:'spawn',pid:process.pid,cwd:process.cwd(),args:process.argv.slice(2)});
+const startupMarker=join(root,'startup-failure-consumed');
+if(process.env.FAKE_STARTUP_FAILURE && !existsSync(startupMarker)){
+ writeFileSync(startupMarker,'used');
+ if(process.env.FAKE_STARTUP_FAILURE==='dyld'){
+  process.stderr.write('dyld[4242]: Library not loaded: /secret-runtime-path/PRIVATE_RUNTIME_SECRET/libsimdjson.34.dylib\\n');
+  process.exit(134);
+ }
+ if(process.env.FAKE_STARTUP_FAILURE==='signal'){
+  process.stderr.write('RAW_STARTUP_SECRET\\n');
+  process.kill(process.pid,'SIGABRT');
+ }
+ if(process.env.FAKE_STARTUP_FAILURE==='exit'){
+  process.stderr.write('RAW_STARTUP_SECRET\\n');
+  process.exit(23);
+ }
+}
 const input=createInterface({input:process.stdin});
 input.on('close',()=>process.exit(0));
 input.on('line',line=>{
