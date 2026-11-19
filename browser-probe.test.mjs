@@ -60,6 +60,22 @@ test("browser probe requires the trusted transport and successful runtime setup"
   assert.equal(failed.probeSupport.browserRuntimeSetup, "error");
 });
 
+test("browser probe startup failures report safe signal and missing-library diagnostics", async t => {
+  const cwd = await mkdtemp(join(tmpdir(), "local-codex-browser-probe-failure-"));
+  t.after(async () => { const { rm } = await import("node:fs/promises"); await rm(cwd, { recursive: true, force: true }); });
+  const launcher = join(cwd, "probe-codex");
+  await writeFile(launcher, `#!/usr/bin/env node\nprocess.stderr.write('dyld: Library not loaded: /secret/PRIVATE_RUNTIME_SECRET/libx.dylib\\n'); process.exit(23);\n`, { mode: 0o700 });
+  await assert.rejects(
+    probeBrowserBackend({ cwd, codexBin: launcher, adapterVersion: "test" }),
+    error => {
+      assert.match(error.message, /missing dynamic library during startup/);
+      assert.match(error.message, /code 23/);
+      assert.doesNotMatch(error.message, /PRIVATE_RUNTIME_SECRET|libx\.dylib|secret/);
+      return true;
+    },
+  );
+});
+
 test("browser probe permission profile is read-only and network-disabled", async () => {
   const cwd = "/tmp/local-codex-probe-workspace";
   const profile = probePermissionConfig(cwd);

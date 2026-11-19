@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { appendStartupStderr, appServerTermination } from "./startup-diagnostics.mjs";
 import { isAbsolute, resolve } from "node:path";
 import process from "node:process";
 
@@ -125,17 +126,27 @@ export function officialBrowserDynamicTools() {
 }
 
 export async function createOfficialBrowserBroker({ cwd, codexBin, adapterVersion, signal }) {
-  const child = spawn(codexBin, ["app-server", "--listen", "stdio://", "-c", probePermissionConfig(cwd)], {
+  const probeArgs = ["app-server", "--listen", "stdio://", "-c", probePermissionConfig(cwd)];
+  const [probeCommand, probeCommandArgs] = codexBin.endsWith(".mjs")
+    ? [process.execPath, [codexBin, ...probeArgs]]
+    : [codexBin, probeArgs];
+  const child = spawn(probeCommand, probeCommandArgs, {
     cwd,
     detached: process.platform !== "win32",
-    stdio: ["pipe", "pipe", "ignore"],
+    stdio: ["pipe", "pipe", "pipe"],
     env: { ...process.env, LOCAL_CODEX_PROBE_MODE: "browser-status" },
   });
   let buffer = "";
   let sequence = 0;
   let closed = false;
   let brokerThreadId = null;
+  let initialized = false;
+  let startupStderr = "";
   const pending = new Map();
+
+  child.stderr.on("data", chunk => {
+    if (!initialized) startupStderr = appendStartupStderr(startupStderr, chunk);
+  });
 
   child.stdout.on("data", chunk => {
     buffer += chunk.toString();
@@ -156,10 +167,14 @@ export async function createOfficialBrowserBroker({ cwd, codexBin, adapterVersio
       else entry.resolve(message.result);
     }
   });
-  child.on("error", () => failAll(brokerError("browser_runtime_unavailable", "Unable to start the official Browser broker")));
-  child.on("exit", () => {
+  child.on("error", () => {
+    const details = appServerTermination({ spawnError: true, stderr: startupStderr });
+    failAll(brokerError("browser_runtime_unavailable", details.message));
+  });
+  child.on("exit", (code, exitSignal) => {
     closed = true;
-    failAll(brokerError("browser_runtime_unavailable", "Official Browser broker exited unexpectedly"));
+    const details = appServerTermination({ code, signal: exitSignal, stderr: startupStderr });
+    failAll(brokerError("browser_runtime_unavailable", details.message));
   });
   child.stdin.on("error", () => failAll(brokerError("browser_runtime_unavailable", "Official Browser broker connection closed")));
   signal?.addEventListener("abort", () => { void close(); }, { once: true });
@@ -169,6 +184,7 @@ export async function createOfficialBrowserBroker({ cwd, codexBin, adapterVersio
       clientInfo: { name: "local_codex_browser_broker", title: "Local Codex Browser Broker", version: adapterVersion },
       capabilities: { experimentalApi: true },
     });
+    initialized = true;
     send({ method: "notifications/initialized", params: {} });
     const [requirements, plugins, mcpServers] = await Promise.all([
       request("configRequirements/read", undefined),
@@ -309,24 +325,39 @@ function brokerError(code, message) {
 
 export function probeBrowserBackend({ cwd, codexBin, adapterVersion, signal }) {
   return new Promise((resolvePromise, rejectPromise) => {
-    const child = spawn(codexBin, ["app-server", "--listen", "stdio://", "-c", probePermissionConfig(cwd)], {
+    const probeArgs = ["app-server", "--listen", "stdio://", "-c", probePermissionConfig(cwd)];
+    const [probeCommand, probeCommandArgs] = codexBin.endsWith(".mjs")
+      ? [process.execPath, [codexBin, ...probeArgs]]
+      : [codexBin, probeArgs];
+    const child = spawn(probeCommand, probeCommandArgs, {
       cwd,
       detached: process.platform !== "win32",
-      stdio: ["pipe", "pipe", "ignore"],
+      stdio: ["pipe", "pipe", "pipe"],
       env: { ...process.env, LOCAL_CODEX_PROBE_MODE: "browser-status" },
     });
     let settled = false;
     let exited = false;
+    let initialized = false;
+    let startupStderr = "";
     let stdoutBuffer = "";
     let requestSequence = 0;
     const pending = new Map();
+    child.stderr.on("data", chunk => {
+      if (!initialized) startupStderr = appendStartupStderr(startupStderr, chunk);
+    });
     const timer = setTimeout(() => finish(probeError("browser_probe_timeout", "Browser backend probe timed out")), PROBE_TIMEOUT_MS);
     timer.unref?.();
 
-    child.on("error", () => finish(probeError("browser_probe_spawn_failed", "Unable to start the Local Codex browser backend probe")));
-    child.on("exit", code => {
+    child.on("error", () => {
+      const details = appServerTermination({ spawnError: true, stderr: startupStderr });
+      finish(probeError("browser_probe_spawn_failed", details.message));
+    });
+    child.on("exit", (code, exitSignal) => {
       exited = true;
-      if (!settled) finish(probeError("browser_probe_exit", `Browser backend probe exited with code ${code}`));
+      if (!settled) {
+        const details = appServerTermination({ code, signal: exitSignal, stderr: startupStderr });
+        finish(probeError("browser_probe_exit", details.message.replace("Codex app-server", "Browser backend probe")));
+      }
     });
     child.stdin.on("error", () => finish(probeError("browser_probe_pipe", "Browser backend probe connection closed")));
     child.stdout.on("data", chunk => {
@@ -359,6 +390,7 @@ export function probeBrowserBackend({ cwd, codexBin, adapterVersion, signal }) {
           clientInfo: { name: "local_codex_browser_probe", title: "Local Codex Browser Probe", version: adapterVersion },
           capabilities: { experimentalApi: true },
         });
+        initialized = true;
         send({ method: "notifications/initialized", params: {} });
         const requirements = await optionalRequest("configRequirements/read", undefined);
         const plugins = await optionalRequest("plugin/installed", {

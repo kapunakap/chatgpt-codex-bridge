@@ -10,6 +10,7 @@ import { homedir } from "node:os";
 import { dirname, isAbsolute, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import process from "node:process";
+import { appendStartupStderr, appServerTermination } from "./startup-diagnostics.mjs";
 import {
   browserStatusTool,
   createOfficialBrowserBroker,
@@ -35,7 +36,7 @@ const WORKTREE_ROOT = process.env.LOCAL_CODEX_WORKTREE_ROOT || resolve(homedir()
 const WORKTREE_RETENTION = Number(process.env.LOCAL_CODEX_WORKTREE_RETENTION || "15");
 const WORKTREE_GIT_TIMEOUT_MS = Number(process.env.LOCAL_CODEX_WORKTREE_GIT_TIMEOUT_MS || "30000");
 const WORKTREE_PRUNE_BATCH_SIZE = Number(process.env.LOCAL_CODEX_WORKTREE_PRUNE_BATCH_SIZE || "4");
-const VERSION = "3.6.3";
+const VERSION = "3.6.4";
 const MODEL_ALIASES = new Map([
   ["luna", "gpt-6-luna"], ["terra", "gpt-5.6-terra"], ["sol", "gpt-5.6-sol"], ["astra", "gpt-6-astra"],
 ]);
@@ -1392,14 +1393,20 @@ async function runCodex(args, existingThreadId, audit) {
         "-c", `mcp_servers.local_codex_browser.args=${JSON.stringify([BROWSER_PROXY_PATH, "--socket", browserSession.socketPath, "--token", browserSession.token])}`,
       );
     }
-    const child = spawn(CODEX_BIN, appServerArgs, {
+    const [appServerCommand, appServerCommandArgs] = CODEX_BIN.endsWith(".mjs")
+      ? [process.execPath, [CODEX_BIN, ...appServerArgs]]
+      : [CODEX_BIN, appServerArgs];
+    const child = spawn(appServerCommand, appServerCommandArgs, {
       cwd,
       detached: process.platform !== "win32",
-      // Do not forward raw app-server stderr to the shared audit log.
-      stdio: ["pipe", "pipe", "ignore"],
+      // Keep a bounded startup tail for static classification only. Never log
+      // raw stderr, which can contain paths or other runtime values.
+      stdio: ["pipe", "pipe", "pipe"],
       env: { ...process.env },
     });
     let stdoutBuffer = "";
+    let startupStderr = "";
+    let appServerInitialized = false;
     let threadId = existingThreadId;
     let turnId = null;
     const messages = new Map();
@@ -1420,10 +1427,21 @@ async function runCodex(args, existingThreadId, audit) {
     }, CALL_TIMEOUT_MS);
     timer.unref();
 
-    child.on("error", () => finish(callError("spawn_failed", "Unable to start Codex app-server")));
-    child.on("exit", code => {
+    child.stderr.on("data", chunk => {
+      if (!appServerInitialized) startupStderr = appendStartupStderr(startupStderr, chunk);
+    });
+    child.on("error", () => {
+      const details = appServerTermination({ spawnError: true, stderr: startupStderr });
+      logCall("app_server_start_failed", audit, details.callCode, details);
+      finish(callError(details.callCode, details.message));
+    });
+    child.on("exit", (code, signal) => {
       exited = true;
-      if (!settled) finish(callError("server_exit", `Codex app-server exited with code ${code}`));
+      if (!settled) {
+        const details = appServerTermination({ code, signal, stderr: startupStderr });
+        logCall("app_server_start_failed", audit, details.callCode, details);
+        finish(callError(details.callCode, details.message));
+      }
     });
     child.stdin.on("error", () => finish(callError("server_pipe", "Codex connection closed")));
     child.stdout.on("data", chunk => {
@@ -1463,6 +1481,7 @@ async function runCodex(args, existingThreadId, audit) {
           clientInfo: { name: "local_codex_tunnel", title: "Local Codex Tunnel", version: VERSION },
           capabilities: { experimentalApi: true },
         });
+        appServerInitialized = true;
         send({ method: "initialized", params: {} });
         const models = await listModels();
         // Existing Codex history owns model/reasoning reply defaults. The
@@ -1982,7 +2001,7 @@ function callError(code, message) {
   return Object.assign(new Error(message), { callCode: code });
 }
 
-function logCall(event, audit, errorCode) {
+function logCall(event, audit, errorCode, diagnostics = {}) {
   // Only this explicit metadata allowlist reaches the shared log. Never pass
   // request arguments, upstream errors, prompts, output, or raw stderr here.
   const entry = {
@@ -1997,6 +2016,12 @@ function logCall(event, audit, errorCode) {
     settingsStatus: audit.settingsStatus,
     durationMs: Date.now() - audit.startedAt,
     ...(errorCode ? { errorCode } : {}),
+    ...(diagnostics.processState ? { processState: diagnostics.processState } : {}),
+    ...(Number.isInteger(diagnostics.processExitCode) ? { processExitCode: diagnostics.processExitCode } : {}),
+    ...(typeof diagnostics.processSignal === "string" ? { processSignal: diagnostics.processSignal } : {}),
+    ...(diagnostics.startupDiagnostic === "missing_dynamic_library"
+      ? { startupDiagnostic: diagnostics.startupDiagnostic }
+      : {}),
   };
   // One append per line, using O_APPEND just like tunnel-client. Reopen for
   // each event so rotation never leaves this writer on an old inode.
