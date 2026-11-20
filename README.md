@@ -239,6 +239,8 @@ v3.5.2 makes the network-disabled macOS profile constant-size, intentionally bro
 
 v3.5.3 fixes stale terminal worktree recovery; PR #19 fixes worktree-prune admission, GC preemption, bounded timeouts, and admission coalescing, eliminating ~120s admission stalls under large backlogs; PR #20 verifies bundles outside a repository cwd; PR #22 makes the zsh heredoc assertion macOS-only for CI portability; PR #23 adds model/reasoning ceilings; and issue #27 updates the defaults to gpt-6-luna/max.
 
+v3.6.5 fixes the installer bundle to include the startup diagnostics module required by v3.6.4. Fresh installs and upgrades now deploy that dependency, with regression coverage.
+
 v3.6.4 adds safe App Server startup diagnostics: bounded stderr classification without raw secret-bearing output, distinct spawn/exit/signal status, and regression tests. This release also includes the Node.js startup recovery merged in PR #37, selecting a healthy Node 22+ installation when the first PATH candidate is broken.
 
 v3.6.3 enables Codex Fast Mode by default by sending App Server `serviceTier: "priority"` on new threads and every turn, including resumed replies, while keeping the default `gpt-6-luna` / max reasoning unchanged. Fast Mode remains independent of reasoning effort.
