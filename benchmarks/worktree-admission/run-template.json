@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "benchmark_id": "chatgpt-codex-bridge.worktree-admission.v1",
+  "result_kind": "model_run",
+  "model_run": {
+    "status": "template_only",
+    "model": {"name": null, "provider": null, "version": null},
+    "parameters": {"temperature": null, "max_output_tokens": null},
+    "run_started_utc": null,
+    "run_completed_utc": null,
+    "operator": null,
+    "agent_runtime": {"name": null, "version": null},
+    "host_runtime": {"os": null, "architecture": null, "node": null, "git": null},
+    "task_source_commit": "0fdfa620d5d99ee5f40d3bc688d714f834fb2802",
+    "task_source_tree": "be26240abf23a476fb940ccf5b0a307b8c3535e0",
+    "task_archive_sha256": null,
+    "task_prompt_sha256": null,
+    "grader_version": "1",
+    "grader_bundle_sha256": null,
+    "exact_commands": [],
+    "network": {"egress_disabled": null, "credentials_available": null, "paid_services_used": null},
+    "prior_solution_exposure": null,
+    "score": null,
+    "raw_result_json_path": null,
+    "agent_diff_sha256": null,
+    "notes": "Fill only with an observed run. This file contains no model result."
+  }
+}

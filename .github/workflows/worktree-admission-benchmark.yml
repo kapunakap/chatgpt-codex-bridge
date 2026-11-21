@@ -1,0 +1,69 @@
+name: Worktree admission benchmark
+
+on:
+  pull_request:
+    paths:
+      - "benchmarks/worktree-admission/**"
+      - ".github/workflows/worktree-admission-benchmark.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  targeted-benchmark-calibration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check out benchmark change
+        uses: actions/checkout@v4
+        with:
+          path: repo
+          persist-credentials: false
+
+      - name: Check out frozen pre-fix source
+        uses: actions/checkout@v4
+        with:
+          repository: kapunakap/chatgpt-codex-bridge
+          ref: 0fdfa620d5d99ee5f40d3bc688d714f834fb2802
+          path: frozen-pre-fix
+          persist-credentials: false
+
+      - name: Check out historical reference
+        uses: actions/checkout@v4
+        with:
+          repository: kapunakap/chatgpt-codex-bridge
+          ref: c32868dfa120cde597a7cc097081c065988fc7ee
+          path: historical-reference
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Verify exact historical checkouts
+        working-directory: repo
+        run: |
+          test "$(git -C ../frozen-pre-fix rev-parse HEAD)" = "0fdfa620d5d99ee5f40d3bc688d714f834fb2802"
+          test "$(git -C ../historical-reference rev-parse HEAD)" = "c32868dfa120cde597a7cc097081c065988fc7ee"
+          test "$(git -C ../frozen-pre-fix rev-parse 'HEAD^{tree}')" = "be26240abf23a476fb940ccf5b0a307b8c3535e0"
+          test "$(git -C ../historical-reference rev-parse 'HEAD^{tree}')" = "4972815a1c363820905113a0a34a9b573ad0c60e"
+
+      - name: Test grader
+        working-directory: repo
+        run: node --test benchmarks/worktree-admission/grader.test.mjs
+
+      - name: Grade frozen pre-fix implementation
+        working-directory: repo
+        shell: bash
+        run: node benchmarks/worktree-admission/grade.mjs --candidate ../frozen-pre-fix --label frozen-pre-fix | tee "$RUNNER_TEMP/worktree-admission-baseline.json"
+
+      - name: Grade historical reference implementation
+        working-directory: repo
+        shell: bash
+        run: node benchmarks/worktree-admission/grade.mjs --candidate ../historical-reference --label historical-reference | tee "$RUNNER_TEMP/worktree-admission-reference.json"
+
+      - name: Check calibration proof
+        working-directory: repo
+        run: node benchmarks/worktree-admission/calibration-check.mjs "$RUNNER_TEMP/worktree-admission-baseline.json" "$RUNNER_TEMP/worktree-admission-reference.json"

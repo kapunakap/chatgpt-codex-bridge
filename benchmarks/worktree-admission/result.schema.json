@@ -1,0 +1,46 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/kapunakap/chatgpt-codex-bridge/benchmarks/worktree-admission/result.schema.json",
+  "title": "Worktree admission benchmark result",
+  "type": "object",
+  "required": ["schema_version", "benchmark_id", "result_kind", "candidate", "score", "max_score", "criteria", "commands", "runtime"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "benchmark_id": {"const": "chatgpt-codex-bridge.worktree-admission.v1"},
+    "result_kind": {"enum": ["implementation_calibration", "model_run"]},
+    "candidate": {
+      "type": "object",
+      "required": ["label", "commit", "worktree_manager_sha256"],
+      "properties": {
+        "label": {"type": "string"},
+        "commit": {"type": ["string", "null"]},
+        "worktree_manager_sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"}
+      },
+      "additionalProperties": false
+    },
+    "score": {"type": "integer", "minimum": 0, "maximum": 100},
+    "max_score": {"const": 100},
+    "criteria": {
+      "type": "array",
+      "minItems": 6,
+      "items": {
+        "type": "object",
+        "required": ["id", "weight", "earned", "passed", "assertion", "timeout_ms", "duration_ms", "evidence"],
+        "properties": {
+          "id": {"type": "string"},
+          "weight": {"type": "integer", "minimum": 1, "maximum": 100},
+          "earned": {"type": "integer", "minimum": 0, "maximum": 100},
+          "passed": {"type": "boolean"},
+          "assertion": {"type": "string"},
+          "timeout_ms": {"type": "integer", "minimum": 1},
+          "duration_ms": {"type": ["integer", "null"], "minimum": 0},
+          "evidence": {"type": "object"}
+        },
+        "additionalProperties": false
+      }
+    },
+    "commands": {"type": "array", "items": {"type": "object", "required": ["argv", "cwd", "timeout_ms"], "properties": {"argv": {"type": "array", "items": {"type": "string"}}, "cwd": {"type": "string"}, "timeout_ms": {"type": "integer", "minimum": 1}}, "additionalProperties": false}},
+    "runtime": {"type": "object", "required": ["node", "platform", "total_duration_ms"], "properties": {"node": {"type": "string"}, "platform": {"type": "string"}, "total_duration_ms": {"type": "integer", "minimum": 0}}, "additionalProperties": false}
+  },
+  "additionalProperties": false
+}

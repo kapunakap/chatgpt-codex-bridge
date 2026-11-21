@@ -1,0 +1,54 @@
+{
+  "date": "2026-10-10",
+  "benchmark": "chatgpt-codex-bridge.worktree-admission.v1",
+  "frozen_source_commit": "0fdfa620d5d99ee5f40d3bc688d714f834fb2802",
+  "reference_commit": "c32868dfa120cde597a7cc097081c065988fc7ee",
+  "rubric_fix_commit": "1eb27b960e9798bf097c563f94c800899fd4c587",
+  "calibration": {
+    "frozen": 0,
+    "reference": 100
+  },
+  "cross_model_comparison_valid": false,
+  "github_ci_verified": false,
+  "local_grader_self_tests_passed": 4,
+  "pilots": [
+    {
+      "label": "gpt-6-luna-high",
+      "model": "gpt-6-luna",
+      "reasoning_effort": "high",
+      "job_id": "1aeb13fe-75db-48e9-b5a0-69fd2ba32cf3",
+      "status": "completed",
+      "elapsed_ms": 330653,
+      "score": 65,
+      "score_kind": "completed-run",
+      "reproduced_by_patch_replay": true,
+      "source_only_protocol_breach": true,
+      "contamination": "agent read local Codex memory",
+      "patch": "luna-high-completed.patch",
+      "result": "luna-high-score.json"
+    },
+    {
+      "label": "gpt-6-luna-max",
+      "model": "gpt-6-luna",
+      "reasoning_effort": "max",
+      "job_id": "75125524-7344-4860-a1e0-7c7b72cdbd02",
+      "status": "cancelled",
+      "error_code": "polling_expired",
+      "elapsed_ms": 479395,
+      "score": 35,
+      "score_kind": "intermediate-snapshot-not-final",
+      "reproduced_by_patch_replay": true,
+      "source_only_protocol_breach": "not_independently_audited",
+      "patch": "luna-max-interrupted.patch",
+      "result": "luna-max-interrupted-score.json"
+    },
+    {
+      "label": "gpt-6-sol",
+      "model": "gpt-6-sol",
+      "reasoning_effort": "max",
+      "status": "rejected",
+      "error_code": "model_ceiling_exceeded",
+      "score": null
+    }
+  ]
+}
